@@ -1,0 +1,9 @@
+export const OMOIKANE_VERSION = "0.0.2";
+export const OPENAI_AGENTS_SDK_VERSION = "0.17.0";
+export const RUN_STATE_FORMAT_VERSION = 1.19;
+export const API_VERSION = 1;
+export const EVENT_SCHEMA_VERSION = 1;
+export const AGENT_DEFINITION_VERSION = "agentsdk/v1";
+export const COMPACTION_CHECKPOINT_VERSION = 3;
+export const MIGRATION_HEAD = "0001";
+export const DEFAULT_RUNTIME_GENERATION = `agents-ts-${OPENAI_AGENTS_SDK_VERSION}-state-${RUN_STATE_FORMAT_VERSION}`;

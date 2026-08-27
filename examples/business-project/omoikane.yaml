@@ -1,0 +1,11 @@
+apiVersion: omoikane.io/v1
+kind: Project
+project: example-business
+resources:
+  agents: ./agents
+  skills: ./skills
+  mcpServers: ./mcp/*.yaml
+  schemas: ./schemas
+release:
+  channel: stable
+  prune: false

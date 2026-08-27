@@ -1,0 +1,41 @@
+replicaCount:
+  api: 2
+  worker: 2
+  webhook: 1
+
+image:
+  repository: ghcr.io/codingformoney/omoikane
+  tag: "0.0.2"
+  digest: ""
+  pullPolicy: IfNotPresent
+
+runtimeGeneration: agents-ts-0.17.0-state-1.19
+environment: production
+
+service:
+  port: 8000
+
+database:
+  urlSecretName: omoikane-runtime-secrets
+  urlSecretKey: database-url
+
+runtimeSecret:
+  name: omoikane-runtime-secrets
+  key: run-state-secret
+
+redisUrl: redis://redis:6379/0
+artifact:
+  backend: s3
+  bucket: omoikane-artifacts
+  endpointUrl: ""
+  region: us-east-1
+
+sandbox:
+  hostRoot: /var/lib/omoikane/sandboxes
+  dockerSocket:
+    enabled: false
+
+resources:
+  api: {}
+  worker: {}
+  webhook: {}

@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "omoikane.fullname" . }}-worker
+  labels:
+    {{- include "omoikane.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount.worker }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "omoikane.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "omoikane.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: worker
+    spec:
+      containers:
+        - name: worker
+          image: {{ include "omoikane.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["node", "dist/bin/worker.js"]
+          env:
+            {{- include "omoikane.env" . | nindent 12 }}
+            {{- if .Values.sandbox.dockerSocket.enabled }}
+            - name: AGENT_SANDBOX_HOST_ROOT
+              value: {{ .Values.sandbox.hostRoot | quote }}
+            {{- end }}
+          {{- if .Values.sandbox.dockerSocket.enabled }}
+          volumeMounts:
+            - name: docker-socket
+              mountPath: /var/run/docker.sock
+            - name: sandbox-root
+              mountPath: /var/lib/omoikane/sandboxes
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources.worker | nindent 12 }}
+      {{- if .Values.sandbox.dockerSocket.enabled }}
+      volumes:
+        - name: docker-socket
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+        - name: sandbox-root
+          hostPath:
+            path: {{ .Values.sandbox.hostRoot }}
+            type: DirectoryOrCreate
+      {{- end }}

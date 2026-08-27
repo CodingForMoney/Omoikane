@@ -1,0 +1,16 @@
+slug: example-business-tools-v1
+name: Example Business Tools
+transport: stdio
+endpoint_config:
+  command: node
+  args:
+    - --import
+    - tsx
+    - examples/business-mcp/server.ts
+secret_refs: {}
+policy:
+  allowed_tools:
+    - get_account_summary
+    - create_review_request
+  approval_required:
+    - create_review_request

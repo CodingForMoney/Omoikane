@@ -1,0 +1,27 @@
+name: compatibility
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - uses: azure/setup-helm@v4
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run check:docs
+      - run: npm run build
+      - run: npm pack --dry-run
+      - run: helm lint deploy/helm/omoikane
+      - run: docker compose config --quiet
+        env:
+          AGENT_RUN_STATE_SECRET: ci-compose-secret-at-least-32-bytes
