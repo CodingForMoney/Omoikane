@@ -1,12 +1,18 @@
 import type { Database, SqlExecutor } from "./database.js";
 import { ConflictError, NotFoundError, required } from "./database.js";
 import { newId } from "./serialization.js";
+import {
+  decodePageCursor,
+  pageFromRows,
+  pageLimit,
+  type Page,
+  type PageOptions,
+} from "./pagination.js";
 
 export interface Resource<
   T extends Record<string, unknown> = Record<string, unknown>,
 > extends Record<string, unknown> {
   id: string;
-  tenant_id: string;
   kind: string;
   parent_id?: string;
   slug?: string;
@@ -19,7 +25,6 @@ export interface Resource<
 
 interface ResourceRow extends Record<string, unknown> {
   id: string;
-  tenant_id: string;
   kind: string;
   parent_id: string | null;
   slug: string | null;
@@ -35,7 +40,6 @@ export function publicResource<T extends Record<string, unknown>>(
 ): Resource<T> & T {
   const resource = {
     id: row.id,
-    tenant_id: row.tenant_id,
     kind: row.kind,
     ...(row.parent_id ? { parent_id: row.parent_id } : {}),
     ...(row.slug ? { slug: row.slug } : {}),
@@ -54,7 +58,6 @@ export class ResourceStore {
 
   async create<T extends Record<string, unknown>>(
     options: {
-      tenantId: string;
       kind: string;
       parentId?: string;
       slug?: string;
@@ -70,12 +73,11 @@ export class ResourceStore {
       const row = await required<ResourceRow>(
         executor,
         `
-        INSERT INTO resources(id, tenant_id, kind, parent_id, slug, name, status, data)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+        INSERT INTO resources(id, kind, parent_id, slug, name, status, data)
+        VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)
         RETURNING *`,
         [
           id,
-          options.tenantId,
           options.kind,
           options.parentId ?? null,
           options.slug ?? null,
@@ -97,39 +99,38 @@ export class ResourceStore {
   }
 
   async get<T extends Record<string, unknown>>(
-    tenantId: string,
     kind: string,
     id: string,
     executor: SqlExecutor = this.db,
   ): Promise<Resource<T> & T> {
     const row = await required<ResourceRow>(
       executor,
-      "SELECT * FROM resources WHERE id=$1 AND tenant_id=$2 AND kind=$3",
-      [id, tenantId, kind],
+      "SELECT * FROM resources WHERE id=$1 AND kind=$2",
+      [id, kind],
       `${kind} not found`,
     );
     return publicResource<T>(row);
   }
 
   async findBySlug<T extends Record<string, unknown>>(
-    tenantId: string,
     kind: string,
     slug: string,
+    executor: SqlExecutor = this.db,
   ): Promise<(Resource<T> & T) | undefined> {
-    const rows = await this.db.query<ResourceRow>(
-      "SELECT * FROM resources WHERE tenant_id=$1 AND kind=$2 AND slug=$3",
-      [tenantId, kind, slug],
+    const rows = await executor.query<ResourceRow>(
+      "SELECT * FROM resources WHERE kind=$1 AND slug=$2",
+      [kind, slug],
     );
     return rows.rows[0] ? publicResource<T>(rows.rows[0]) : undefined;
   }
 
   async list<T extends Record<string, unknown>>(
-    tenantId: string,
     kind: string,
     options: { parentId?: string; status?: string; limit?: number } = {},
+    executor: SqlExecutor = this.db,
   ): Promise<Array<Resource<T> & T>> {
-    const conditions = ["tenant_id=$1", "kind=$2"];
-    const params: unknown[] = [tenantId, kind];
+    const conditions = ["kind=$1"];
+    const params: unknown[] = [kind];
     if (options.parentId) {
       params.push(options.parentId);
       conditions.push(`parent_id=$${params.length}`);
@@ -139,7 +140,7 @@ export class ResourceStore {
       conditions.push(`status=$${params.length}`);
     }
     params.push(Math.min(options.limit ?? 500, 2000));
-    const rows = await this.db.query<ResourceRow>(
+    const rows = await executor.query<ResourceRow>(
       `SELECT * FROM resources WHERE ${conditions.join(" AND ")}
        ORDER BY created_at DESC LIMIT $${params.length}`,
       params,
@@ -147,8 +148,48 @@ export class ResourceStore {
     return rows.rows.map((row) => publicResource<T>(row));
   }
 
+  async page<T extends Record<string, unknown>>(
+    kind: string,
+    options: PageOptions & { parentId?: string; status?: string } = {},
+    executor: SqlExecutor = this.db,
+  ): Promise<Page<Resource<T> & T>> {
+    const limit = pageLimit(options.limit);
+    const scope = JSON.stringify([
+      "resources",
+      kind,
+      options.parentId ?? null,
+      options.status ?? null,
+    ]);
+    const cursor = decodePageCursor(options.cursor, scope);
+    const conditions = ["kind=$1"];
+    const params: unknown[] = [kind];
+    if (options.parentId) {
+      params.push(options.parentId);
+      conditions.push(`parent_id=$${params.length}`);
+    }
+    if (options.status) {
+      params.push(options.status);
+      conditions.push(`status=$${params.length}`);
+    }
+    if (cursor) {
+      params.push(cursor.createdAt);
+      const createdAtParameter = params.length;
+      params.push(cursor.id);
+      conditions.push(
+        `(created_at<$${createdAtParameter} OR (created_at=$${createdAtParameter} AND id<$${params.length}))`,
+      );
+    }
+    params.push(limit + 1);
+    const rows = await executor.query<ResourceRow>(
+      `SELECT * FROM resources WHERE ${conditions.join(" AND ")}
+       ORDER BY created_at DESC,id DESC LIMIT $${params.length}`,
+      params,
+    );
+    const page = pageFromRows(rows.rows, limit, scope);
+    return { ...page, data: page.data.map((row) => publicResource<T>(row)) };
+  }
+
   async update<T extends Record<string, unknown>>(
-    tenantId: string,
     kind: string,
     id: string,
     patch: Partial<{
@@ -159,16 +200,15 @@ export class ResourceStore {
     }>,
     executor: SqlExecutor = this.db,
   ): Promise<Resource<T> & T> {
-    const current = await this.get<T>(tenantId, kind, id, executor);
+    const current = await this.get<T>(kind, id, executor);
     const data = { ...current.data, ...(patch.data ?? {}) };
     const row = await required<ResourceRow>(
       executor,
       `
-      UPDATE resources SET slug=$4, name=$5, status=$6, data=$7::jsonb, updated_at=now()
-      WHERE id=$1 AND tenant_id=$2 AND kind=$3 RETURNING *`,
+      UPDATE resources SET slug=$3, name=$4, status=$5, data=$6::jsonb, updated_at=now()
+      WHERE id=$1 AND kind=$2 RETURNING *`,
       [
         id,
-        tenantId,
         kind,
         patch.slug ?? current.slug ?? null,
         patch.name ?? current.name ?? null,
@@ -179,10 +219,10 @@ export class ResourceStore {
     return publicResource<T>(row);
   }
 
-  async delete(tenantId: string, kind: string, id: string): Promise<void> {
+  async delete(kind: string, id: string): Promise<void> {
     const result = await this.db.query(
-      "DELETE FROM resources WHERE id=$1 AND tenant_id=$2 AND kind=$3",
-      [id, tenantId, kind],
+      "DELETE FROM resources WHERE id=$1 AND kind=$2",
+      [id, kind],
     );
     if (result.rowCount === 0) throw new NotFoundError(`${kind} not found`);
   }

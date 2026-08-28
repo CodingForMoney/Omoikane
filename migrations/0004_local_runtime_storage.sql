@@ -1,0 +1,3 @@
+ALTER TABLE run_states ADD COLUMN IF NOT EXISTS state_json JSONB;
+ALTER TABLE run_states ALTER COLUMN encrypted_state DROP NOT NULL;
+ALTER TABLE run_states ALTER COLUMN checksum DROP NOT NULL;

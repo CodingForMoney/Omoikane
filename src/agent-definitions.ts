@@ -1,9 +1,14 @@
 import { readFile } from "node:fs/promises";
 import YAML from "yaml";
 import type { Database } from "./database.js";
-import { ConflictError, ValidationError } from "./database.js";
+import { ValidationError } from "./database.js";
 import { ResourceStore } from "./resources.js";
 import { hashJson } from "./serialization.js";
+import type { SkillService } from "./skills.js";
+import type { ToolService } from "./tools.js";
+import { validateOutputSchemaDefinition } from "./structured-output.js";
+import { normalizeGuardrailConfiguration } from "./guardrails.js";
+import type { PageOptions } from "./pagination.js";
 
 export interface AgentDocument extends Record<string, unknown> {
   apiVersion?: string;
@@ -13,24 +18,18 @@ export interface AgentDocument extends Record<string, unknown> {
   instructions?: string;
 }
 
-const defaultSettings = {
+const defaultCompilationSettings = {
   global_instructions: "",
   defaults: {
     model_settings: {},
     runtime_policy: { max_turns: 20, max_tool_calls: 50, max_handoffs: 20 },
-    memory: {
-      enabled: true,
-      read_scopes: ["agent", "global"],
-      max_retrieved_items: 8,
-      write_mode: "candidates",
-    },
     compaction: {
       enabled: true,
+      strategy: "auto",
       high_watermark_ratio: 0.82,
       low_watermark_ratio: 0.55,
       preserve_recent_tokens: 16_000,
     },
-    tracing: { enabled: true },
     sandbox: { enabled: false },
   },
   policy: {
@@ -40,11 +39,66 @@ const defaultSettings = {
     max_duration_seconds: 7200,
     allow_provider_override: false,
   },
-  revision: 1,
-  defaults_revision: 1,
-  policy_revision: 1,
-  updated_by: "system",
 };
+
+function assertUsageOnlyConfiguration(
+  value: Record<string, unknown>,
+  location: string,
+) {
+  if (Object.hasOwn(value, "pricing"))
+    throw new ValidationError(
+      `${location}.pricing is not supported; Provider billing belongs to the Provider or business system`,
+    );
+  if (Object.hasOwn(value, "max_cost_usd"))
+    throw new ValidationError(
+      `${location}.max_cost_usd is not supported; use token Usage and Provider-side financial limits`,
+    );
+  const runtimePolicy = value.runtime_policy as
+    Record<string, unknown> | undefined;
+  if (runtimePolicy && Object.hasOwn(runtimePolicy, "max_cost_usd"))
+    throw new ValidationError(
+      `${location}.runtime_policy.max_cost_usd is not supported; use token Usage and Provider-side financial limits`,
+    );
+}
+
+function assertNoAgentTracing(
+  value: Record<string, unknown>,
+  location: string,
+) {
+  if (Object.hasOwn(value, "tracing"))
+    throw new ValidationError(
+      `${location}.tracing is not supported; tracing is configured once for the Runtime with OMOIKANE_TRACING_EXPORTER`,
+    );
+}
+
+function assertMcpReferences(value: unknown) {
+  if (value === undefined) return;
+  if (!Array.isArray(value))
+    throw new ValidationError("spec.mcp_servers must be an array");
+  for (const [index, reference] of value.entries()) {
+    if (typeof reference === "string") {
+      if (!reference.trim())
+        throw new ValidationError(`spec.mcp_servers[${index}] is empty`);
+      continue;
+    }
+    if (!reference || typeof reference !== "object" || Array.isArray(reference))
+      throw new ValidationError(
+        `spec.mcp_servers[${index}] must be a server ID or reference object`,
+      );
+    const record = reference as Record<string, unknown>;
+    const unknown = Object.keys(record).filter(
+      (key) => !["server_id", "id", "slug", "policy_override"].includes(key),
+    );
+    if (unknown.length)
+      throw new ValidationError(
+        `spec.mcp_servers[${index}] contains unsupported fields: ${unknown.join(", ")}`,
+      );
+    if (!record.server_id && !record.id && !record.slug)
+      throw new ValidationError(
+        `spec.mcp_servers[${index}] requires server_id`,
+      );
+  }
+}
 
 function deepMerge(
   base: Record<string, unknown>,
@@ -93,64 +147,27 @@ export function parseAgentMarkdown(source: string): AgentDocument {
 
 export class AgentDefinitionService {
   private readonly store: ResourceStore;
-  constructor(private readonly db: Database) {
+  constructor(
+    private readonly db: Database,
+    private readonly skills: SkillService,
+    private readonly tools: ToolService,
+  ) {
     this.store = new ResourceStore(db);
   }
 
-  async settings(tenantId: string) {
-    const existing = await this.store.findBySlug<Record<string, unknown>>(
-      tenantId,
-      "agent_settings",
-      "global",
-    );
-    if (existing) return existing;
-    return this.store.create({
-      tenantId,
-      kind: "agent_settings",
-      slug: "global",
-      name: "Global agent settings",
-      data: defaultSettings,
-    });
-  }
-
-  async updateSettings(
-    tenantId: string,
-    input: Record<string, unknown>,
-    actorId: string,
-  ) {
-    const current = await this.settings(tenantId);
-    const revision = Number(current.revision ?? 1) + 1;
-    return this.store.update(tenantId, "agent_settings", current.id, {
-      data: {
-        ...(input.global_instructions !== undefined
-          ? { global_instructions: String(input.global_instructions) }
-          : {}),
-        ...(input.defaults
-          ? {
-              defaults: deepMerge(
-                current.defaults as Record<string, unknown>,
-                input.defaults as Record<string, unknown>,
-              ),
-              defaults_revision: Number(current.defaults_revision) + 1,
-            }
-          : {}),
-        ...(input.policy
-          ? {
-              policy: deepMerge(
-                current.policy as Record<string, unknown>,
-                input.policy as Record<string, unknown>,
-              ),
-              policy_revision: Number(current.policy_revision) + 1,
-            }
-          : {}),
-        revision,
-        updated_by: actorId,
-      },
+  private async validateSkillBindings(config: Record<string, unknown>) {
+    if (config.skills === undefined) return;
+    if (!Array.isArray(config.tools ?? []))
+      throw new ValidationError("tools must be an array");
+    const tools = await this.tools.resolve((config.tools ?? []) as unknown[]);
+    await this.skills.validateBindings(config.skills, {
+      toolNames: new Set(tools.map((tool) => String(tool.name))),
+      sandboxConfig: (config.sandbox ?? {}) as Record<string, unknown>,
     });
   }
 
   validate(document: AgentDocument): AgentDocument {
-    const spec = (document.spec ?? {}) as Record<string, unknown>;
+    const spec = { ...((document.spec ?? {}) as Record<string, unknown>) };
     const metadata = document.metadata ?? {};
     if ((document.apiVersion ?? "agentsdk/v1") !== "agentsdk/v1")
       throw new ValidationError("unsupported agent apiVersion");
@@ -162,6 +179,16 @@ export class AgentDefinitionService {
       throw new ValidationError("invalid agent slug");
     if (spec.reasoning_effort !== undefined)
       throw new ValidationError("reasoning_effort belongs in model_settings");
+    if (Object.hasOwn(spec, "memory"))
+      throw new ValidationError(
+        "memory is not supported by the Runtime; provide business context through Run context, Function Tools, or MCP",
+      );
+    validateOutputSchemaDefinition(spec.output_schema);
+    assertMcpReferences(spec.mcp_servers);
+    assertUsageOnlyConfiguration(spec, "spec");
+    assertNoAgentTracing(spec, "spec");
+    if (spec.guardrails !== undefined)
+      spec.guardrails = normalizeGuardrailConfiguration(spec.guardrails);
     return {
       apiVersion: "agentsdk/v1",
       kind: "Agent",
@@ -172,18 +199,38 @@ export class AgentDefinitionService {
   }
 
   async compile(
-    tenantId: string,
     document: AgentDocument,
     overrides: Record<string, unknown> = {},
+    compilationSettings: Record<string, unknown> = {},
   ) {
+    if (Object.hasOwn(overrides, "memory"))
+      throw new ValidationError("memory cannot be supplied as an override");
+    assertUsageOnlyConfiguration(overrides, "overrides");
+    assertNoAgentTracing(overrides, "overrides");
     const validated = this.validate(document);
-    const settings = await this.settings(tenantId);
+    const settings = deepMerge(
+      defaultCompilationSettings as Record<string, unknown>,
+      compilationSettings,
+    );
+    const defaults = (settings.defaults ?? {}) as Record<string, unknown>;
+    if (Object.hasOwn(defaults, "memory"))
+      throw new ValidationError("memory is not a Runtime setting");
+    assertUsageOnlyConfiguration(defaults, "compilation_settings.defaults");
+    assertNoAgentTracing(defaults, "compilation_settings.defaults");
+    assertUsageOnlyConfiguration(
+      (settings.policy ?? {}) as Record<string, unknown>,
+      "compilation_settings.policy",
+    );
     const spec = validated.spec ?? {};
     const instructions = [settings.global_instructions, validated.instructions]
       .filter(Boolean)
       .join("\n\n");
-    let config = deepMerge(settings.defaults as Record<string, unknown>, spec);
+    let config = deepMerge(defaults, spec);
     config = deepMerge(config, overrides);
+    assertMcpReferences(config.mcp_servers);
+    validateOutputSchemaDefinition(config.output_schema);
+    if (config.guardrails !== undefined)
+      config.guardrails = normalizeGuardrailConfiguration(config.guardrails);
     config.instructions = instructions;
     config.name =
       validated.metadata?.name ?? validated.metadata?.slug ?? "Agent";
@@ -208,124 +255,75 @@ export class AgentDefinitionService {
       config,
       config_hash: hashJson(config),
       document: validated,
-      global_defaults_revision: Number(settings.defaults_revision),
-      platform_policy_revision: Number(settings.policy_revision),
     };
   }
 
-  async createAgent(
-    tenantId: string,
-    input: { slug: string; name: string; description?: string },
-  ) {
-    if (!/^[a-z0-9][a-z0-9_-]{1,127}$/.test(input.slug))
-      throw new ValidationError("invalid agent slug");
-    return this.store.create({
-      tenantId,
-      kind: "agent",
-      slug: input.slug,
-      name: input.name,
-      data: { description: input.description ?? "" },
-    });
-  }
-
-  async listAgents(tenantId: string) {
-    return this.store.list(tenantId, "agent");
-  }
-  async getAgent(tenantId: string, id: string) {
-    return this.store.get(tenantId, "agent", id);
-  }
-
-  async createVersion(
-    tenantId: string,
-    agentId: string,
-    config: Record<string, unknown>,
-    definition?: AgentDocument,
-    overrides: Record<string, unknown> = {},
-  ) {
-    await this.getAgent(tenantId, agentId);
-    const versions = await this.store.list<Record<string, unknown>>(
-      tenantId,
-      "agent_version",
-      { parentId: agentId },
-    );
-    const version =
-      Math.max(0, ...versions.map((item) => Number(item.version))) + 1;
-    const compiled = definition
-      ? await this.compile(tenantId, definition, overrides)
+  async deploy(input: {
+    document?: AgentDocument;
+    config?: Record<string, unknown>;
+    overrides?: Record<string, unknown>;
+    compilationSettings?: Record<string, unknown>;
+    source?: string;
+  }) {
+    const overrides = input.overrides ?? {};
+    if (!input.document && !input.config)
+      throw new ValidationError("document or config is required");
+    if (input.config && Object.hasOwn(input.config, "memory"))
+      throw new ValidationError("memory is not supported in Agent deployments");
+    if (input.config)
+      assertUsageOnlyConfiguration(input.config, "deployment.config");
+    if (input.config) assertNoAgentTracing(input.config, "deployment.config");
+    if (input.config) assertMcpReferences(input.config.mcp_servers);
+    if (input.config)
+      validateOutputSchemaDefinition(input.config.output_schema);
+    const normalizedConfig = input.config
+      ? {
+          ...input.config,
+          ...(input.config.guardrails === undefined
+            ? {}
+            : {
+                guardrails: normalizeGuardrailConfiguration(
+                  input.config.guardrails,
+                ),
+              }),
+        }
+      : undefined;
+    const compiled = input.document
+      ? await this.compile(input.document, overrides, input.compilationSettings)
       : {
-          config,
-          config_hash: hashJson(config),
+          config: normalizedConfig!,
+          config_hash: hashJson(normalizedConfig),
           document: {},
-          global_defaults_revision: 0,
-          platform_policy_revision: 0,
         };
+    const deploymentConfig = compiled.config as Record<string, unknown>;
+    await this.validateSkillBindings(deploymentConfig);
+    const metadata = input.document?.metadata ?? {};
     return this.store.create({
-      tenantId,
-      kind: "agent_version",
-      parentId: agentId,
-      name: `v${version}`,
-      status: "draft",
+      kind: "agent_deployment",
+      name: metadata.name ?? String(deploymentConfig.name ?? "Agent"),
+      status: "active",
       data: {
-        version,
-        config: compiled.config,
+        config: deploymentConfig,
         config_hash: compiled.config_hash,
-        definition_format: definition ? "agent_markdown" : "legacy_json",
-        definition_source: definition?.instructions ?? null,
+        definition_format: input.document ? "agent_markdown" : "json",
+        definition_source: input.source ?? null,
         definition_json: compiled.document,
         overrides,
-        global_defaults_revision: compiled.global_defaults_revision,
-        platform_policy_revision: compiled.platform_policy_revision,
-        published_at: null,
+        deployed_at: new Date().toISOString(),
       },
     });
   }
 
-  async createFromDefinition(
-    tenantId: string,
-    document: AgentDocument,
-    overrides: Record<string, unknown> = {},
-  ) {
-    const validated = this.validate(document);
-    const metadata = validated.metadata ?? {};
-    if (!metadata.slug || !metadata.name)
-      throw new ValidationError("metadata.slug and metadata.name are required");
-    let agent = await this.store.findBySlug(tenantId, "agent", metadata.slug);
-    if (!agent)
-      agent = await this.createAgent(tenantId, {
-        slug: metadata.slug,
-        name: metadata.name,
-        description: metadata.description,
-      });
-    const version = await this.createVersion(
-      tenantId,
-      agent.id,
-      {},
-      validated,
-      overrides,
-    );
-    return { agent, version };
+  async listDeployments() {
+    return this.store.list("agent_deployment");
   }
 
-  async version(tenantId: string, id: string) {
-    return this.store.get<Record<string, unknown>>(
-      tenantId,
-      "agent_version",
-      id,
-    );
+  async pageDeployments(options: PageOptions & { status?: string } = {}) {
+    return this.store.page("agent_deployment", options);
   }
-  async versions(tenantId: string, agentId: string) {
-    await this.getAgent(tenantId, agentId);
-    return this.store.list(tenantId, "agent_version", { parentId: agentId });
-  }
-  async publish(tenantId: string, agentId: string, versionNumber: number) {
-    const version = (await this.versions(tenantId, agentId)).find(
-      (item) => Number(item.version) === versionNumber,
-    );
-    if (!version) throw new ValidationError("agent version not found");
-    return this.store.update(tenantId, "agent_version", version.id, {
-      status: "published",
-      data: { published_at: new Date().toISOString() },
-    });
+
+  async deployment(id: string) {
+    return this.store.get<Record<string, unknown>>("agent_deployment", id);
   }
 
   async readDocument(path: string) {

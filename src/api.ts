@@ -1,8 +1,13 @@
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import multipart from "@fastify/multipart";
+import { z } from "zod";
 import { parseAgentMarkdown } from "./agent-definitions.js";
 import type { Container } from "./container.js";
-import { BudgetExceeded } from "./costs.js";
+import {
+  API_CONTRACTS,
+  EmptyObjectSchema,
+  type ApiRouteContract,
+} from "./contracts.js";
 import {
   ConflictError,
   NotFoundError,
@@ -10,6 +15,7 @@ import {
   required,
 } from "./database.js";
 import { encodeSse, publicEvent } from "./events.js";
+import { OPENAPI_DOCUMENT } from "./openapi.js";
 import {
   AGENT_DEFINITION_VERSION,
   API_VERSION,
@@ -20,19 +26,106 @@ import {
   OPENAI_AGENTS_SDK_VERSION,
   RUN_STATE_FORMAT_VERSION,
 } from "./runtime-versions.js";
+import { safeErrorType } from "./observability.js";
 
 type Dict = Record<string, unknown>;
-const body = (request: FastifyRequest) => (request.body ?? {}) as Dict;
-const params = (request: FastifyRequest) => request.params as Dict;
-const query = (request: FastifyRequest) => request.query as Dict;
-const identity = (request: FastifyRequest) => ({
-  tenantId: String(request.headers["x-tenant-id"] ?? "default"),
-  actorId: String(request.headers["x-actor-id"] ?? "development-user"),
+
+class SseCapacityError extends Error {
+  readonly statusCode = 429;
+  constructor() {
+    super("SSE connection capacity is temporarily exhausted");
+  }
+}
+
+async function writeSseChunk(
+  response: NodeJS.WritableStream & { destroyed?: boolean },
+  chunk: string,
+): Promise<boolean> {
+  if (response.destroyed) return false;
+  if (response.write(chunk)) return true;
+  await new Promise<void>((resolve) => {
+    const finish = () => {
+      response.removeListener("drain", finish);
+      response.removeListener("close", finish);
+      response.removeListener("error", finish);
+      resolve();
+    };
+    response.once("drain", finish);
+    response.once("close", finish);
+    response.once("error", finish);
+  });
+  return !response.destroyed;
+}
+type Contracts = typeof API_CONTRACTS;
+type ContractSchemaKey = "body" | "params" | "query" | "headers";
+type ContractNameWith<Key extends ContractSchemaKey> = {
+  [Name in keyof Contracts]: Contracts[Name] extends Record<Key, z.ZodType>
+    ? Name
+    : never;
+}[keyof Contracts];
+type ContractSchema<
+  Name extends keyof Contracts,
+  Key extends ContractSchemaKey,
+> =
+  Contracts[Name] extends Record<Key, infer Schema extends z.ZodType>
+    ? Schema
+    : never;
+const parsePart = <Schema extends z.ZodType>(
+  schema: Schema,
+  value: unknown,
+): z.output<Schema> => schema.parse(value ?? {});
+const requestBody = <Name extends ContractNameWith<"body">>(
+  request: FastifyRequest,
+  name: Name,
+): z.output<ContractSchema<Name, "body">> =>
+  parsePart(
+    (
+      API_CONTRACTS[name] as unknown as {
+        body: ContractSchema<Name, "body">;
+      }
+    ).body,
+    request.body,
+  );
+const requestParams = <Name extends ContractNameWith<"params">>(
+  request: FastifyRequest,
+  name: Name,
+): z.output<ContractSchema<Name, "params">> =>
+  parsePart(
+    (
+      API_CONTRACTS[name] as unknown as {
+        params: ContractSchema<Name, "params">;
+      }
+    ).params,
+    request.params,
+  );
+const requestQuery = <Name extends ContractNameWith<"query">>(
+  request: FastifyRequest,
+  name: Name,
+): z.output<ContractSchema<Name, "query">> =>
+  parsePart(
+    (
+      API_CONTRACTS[name] as unknown as {
+        query: ContractSchema<Name, "query">;
+      }
+    ).query,
+    request.query,
+  );
+const requestHeaders = <Name extends ContractNameWith<"headers">>(
+  request: FastifyRequest,
+  name: Name,
+): z.output<ContractSchema<Name, "headers">> =>
+  parsePart(
+    (
+      API_CONTRACTS[name] as unknown as {
+        headers: ContractSchema<Name, "headers">;
+      }
+    ).headers,
+    request.headers,
+  );
+const pagination = (query: { limit?: string; cursor?: string }) => ({
+  limit: query.limit === undefined ? undefined : Number(query.limit),
+  cursor: query.cursor,
 });
-const integer = (value: unknown, fallback: number) => {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? Math.floor(parsed) : fallback;
-};
 const publicConnection = (record: Dict) => {
   const {
     api_key_ciphertext: _cipher,
@@ -53,56 +146,159 @@ export async function createApp(
   container: Container,
 ): Promise<FastifyInstance> {
   const app = Fastify({
-    logger: true,
-    bodyLimit: 100_000_000,
+    logger:
+      container.settings.logLevel === "silent"
+        ? false
+        : { level: container.settings.logLevel },
+    bodyLimit: Math.max(
+      100_000_000,
+      container.settings.artifactMaxFileBytes + 1_000_000,
+    ),
     requestIdHeader: "x-request-id",
     genReqId: () => crypto.randomUUID(),
   });
+  let activeSseConnections = 0;
+  const activeSseByRun = new Map<string, number>();
+  const acquireSse = (runId: string): (() => void) | undefined => {
+    const activeForRun = activeSseByRun.get(runId) ?? 0;
+    if (
+      activeSseConnections >= container.settings.sseMaxConnections ||
+      activeForRun >= container.settings.sseMaxConnectionsPerRun
+    )
+      return undefined;
+    activeSseConnections += 1;
+    activeSseByRun.set(runId, activeForRun + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      activeSseConnections = Math.max(0, activeSseConnections - 1);
+      const remaining = Math.max(0, (activeSseByRun.get(runId) ?? 1) - 1);
+      if (remaining) activeSseByRun.set(runId, remaining);
+      else activeSseByRun.delete(runId);
+    };
+  };
   await app.register(multipart, {
-    limits: { fileSize: 100_000_000, files: 1 },
+    // The service owns the exact limit and typed error. One additional byte
+    // lets its streaming meter detect overflow before multipart truncates it.
+    limits: {
+      fileSize: container.settings.artifactMaxFileBytes + 1,
+      files: 1,
+    },
   });
+  const contractsByRoute = new Map(
+    Object.values(API_CONTRACTS).map((contract) => [
+      `${contract.method.toUpperCase()} ${contract.path}`,
+      contract as ApiRouteContract,
+    ]),
+  );
   app.addHook("onRequest", async (request, reply) => {
-    reply.header(
-      "Access-Control-Allow-Origin",
-      String(request.headers.origin ?? "*"),
-    );
+    const origin = request.headers.origin;
+    if (origin && container.settings.corsOrigins.includes(origin)) {
+      reply.header("Access-Control-Allow-Origin", origin);
+      reply.header("Vary", "Origin");
+    }
     reply.header(
       "Access-Control-Allow-Headers",
-      "Content-Type, Authorization, X-Tenant-ID, X-Actor-ID, X-Request-ID, Idempotency-Key, Last-Event-ID",
+      "Content-Type, X-Request-ID, Idempotency-Key, Last-Event-ID",
     );
     reply.header(
       "Access-Control-Allow-Methods",
       "GET,POST,PUT,PATCH,DELETE,OPTIONS",
     );
   });
+  app.addHook("preValidation", async (request) => {
+    const contract = contractsByRoute.get(
+      `${request.method} ${request.routeOptions.url}`,
+    );
+    if (!contract) return;
+    parsePart(contract.params ?? EmptyObjectSchema, request.params);
+    parsePart(contract.query ?? EmptyObjectSchema, request.query);
+    if (contract.headers) parsePart(contract.headers, request.headers);
+    if (contract.body) parsePart(contract.body, request.body);
+    else if (
+      ["POST", "PUT", "PATCH", "DELETE"].includes(request.method) &&
+      contract.requestContentType !== "multipart/form-data"
+    )
+      parsePart(EmptyObjectSchema, request.body);
+  });
   app.options("*", async (_request, reply) => reply.code(204).send());
   app.setErrorHandler((error, request, reply) => {
+    const schemaError = error instanceof z.ZodError;
+    const malformedJson =
+      error instanceof SyntaxError ||
+      (error as { code?: string }).code === "FST_ERR_CTP_INVALID_JSON_BODY";
     const status =
       error instanceof NotFoundError
         ? 404
         : error instanceof ConflictError
           ? 409
-          : error instanceof BudgetExceeded
-            ? 429
-            : error instanceof ValidationError || error instanceof SyntaxError
-              ? 422
-              : ((error as { statusCode?: number }).statusCode ?? 500);
-    request.log.error(error);
+          : error instanceof ValidationError || malformedJson || schemaError
+            ? 422
+            : ((error as { statusCode?: number }).statusCode ?? 500);
+    if (schemaError || malformedJson)
+      request.log.warn(
+        {
+          request_id: request.id,
+          issue_count: schemaError ? error.issues.length : 1,
+        },
+        "request contract validation failed",
+      );
+    else {
+      const fields = {
+        request_id: request.id,
+        status,
+        error_type: safeErrorType(error),
+      };
+      if (status >= 500 && status !== 507)
+        request.log.error(fields, "request failed");
+      else request.log.warn(fields, "request rejected");
+    }
+    const runtimeErrorCode = (error as { errorCode?: unknown }).errorCode;
     reply.code(status).send({
       error: {
         code:
-          error instanceof BudgetExceeded
-            ? "budget_exceeded"
-            : error instanceof ConflictError
-              ? "conflict"
-              : error instanceof NotFoundError
-                ? "not_found"
-                : status === 500
-                  ? "internal_error"
-                  : "invalid_request",
-        message: error instanceof Error ? error.message : String(error),
+          typeof runtimeErrorCode === "string"
+            ? runtimeErrorCode
+            : (error as { code?: string }).code === "FST_REQ_FILE_TOO_LARGE"
+              ? "artifact_too_large"
+              : error instanceof ConflictError
+                ? "conflict"
+                : error instanceof NotFoundError
+                  ? "not_found"
+                  : status === 429
+                    ? "too_many_requests"
+                    : status === 500
+                      ? "internal_error"
+                      : "invalid_request",
+        message:
+          schemaError || malformedJson
+            ? "request validation failed"
+            : status === 500
+              ? "internal runtime error"
+              : error instanceof Error
+                ? error.message
+                : String(error),
         request_id: request.id,
-        details: {},
+        details: schemaError
+          ? {
+              issues: error.issues.map((issue) => ({
+                path: issue.path.length ? issue.path.join(".") : "$",
+                code: issue.code,
+                message: issue.message,
+              })),
+            }
+          : malformedJson
+            ? {
+                issues: [
+                  {
+                    path: "$",
+                    code: "invalid_json",
+                    message: "malformed JSON request body",
+                  },
+                ],
+              }
+            : {},
       },
     });
   });
@@ -113,7 +309,6 @@ export async function createApp(
       status: "ok",
       version: OMOIKANE_VERSION,
       sdk_version: OPENAI_AGENTS_SDK_VERSION,
-      runtime_generation: container.settings.runtimeGeneration,
     };
   });
   app.get("/version", async () => ({
@@ -125,801 +320,511 @@ export async function createApp(
     api_version: API_VERSION,
     event_schema_version: EVENT_SCHEMA_VERSION,
     migration_head: MIGRATION_HEAD,
-    runtime_generation: container.settings.runtimeGeneration,
     openai_agents_sdk_version: OPENAI_AGENTS_SDK_VERSION,
   }));
+  app.get("/v1/runtime/status", async () => ({
+    ...(await container.runner.runtimeStatus()),
+    artifacts: await container.artifacts.usage(),
+    sse_connections: {
+      active: activeSseConnections,
+      maximum: container.settings.sseMaxConnections,
+      maximum_per_run: container.settings.sseMaxConnectionsPerRun,
+    },
+  }));
+  app.get("/openapi.json", async () => OPENAPI_DOCUMENT);
   app.get("/v1/capabilities", async () => ({
     api_versions: [API_VERSION],
     event_schema_versions: [EVENT_SCHEMA_VERSION],
     run_state_format_versions: [RUN_STATE_FORMAT_VERSION],
     agent_definition_versions: [AGENT_DEFINITION_VERSION],
-    compaction_checkpoint_versions: [COMPACTION_CHECKPOINT_VERSION],
-    runtime_generation: container.settings.runtimeGeneration,
+    compaction_checkpoint_versions: [3, COMPACTION_CHECKPOINT_VERSION],
     features: {
-      sessions: true,
+      durable_runs: true,
+      durable_execution_checkpoints: true,
+      external_conversation_state: true,
       sse: true,
       approvals: true,
+      input_output_guardrails: true,
+      pluggable_guardrails: true,
+      buffered_output_guardrails: true,
       function_tools: true,
       mcp: true,
+      runtime_managed_mcp_tools: true,
+      mcp_streamable_http: true,
+      mcp_sse_compatibility: true,
+      mcp_resources: false,
+      provider_hosted_mcp: false,
       structured_output: true,
       skill_bundles: true,
-      long_term_memory: true,
+      skill_workspaces: false,
+      skill_requirement_validation: false,
       context_compaction: true,
-      artifacts: true,
-      database_storage: true,
+      native_context_compaction: true,
+      temporary_run_artifacts: true,
+      artifact_listing: true,
+      artifact_integrity_verification: true,
+      artifact_lifecycle_recovery: true,
+      durable_execution_storage: true,
       multi_agent: true,
-      sandbox: true,
+      sandbox: false,
       tracing: true,
-      usage_and_cost: true,
-      project_releases: true,
-      release_channels: true,
-      reliable_webhooks: true,
-      runtime_generation_routing: true,
+      metadata_only_tracing: true,
+      explicit_trace_exporters: true,
+      runtime_status: true,
+      run_listing: true,
+      cursor_pagination: true,
+      bounded_sse: true,
+      post_commit_event_wakeup: true,
+      run_usage: true,
+      resource_limits: true,
     },
   }));
-  app.get("/v1/runtime-generations", async (request) => {
-    const { tenantId } = identity(request);
-    const rows = await container.db.query<{
-      runtime_generation: string;
-      status: string;
-      count: number;
-    }>(
-      "SELECT runtime_generation,status,count(*)::int count FROM runs WHERE tenant_id=$1 GROUP BY runtime_generation,status",
-      [tenantId],
-    );
-    const generations: Record<string, Record<string, number>> = {};
-    for (const row of rows.rows)
-      (generations[row.runtime_generation] ??= {})[row.status] = Number(
-        row.count,
-      );
-    return { current: container.settings.runtimeGeneration, generations };
-  });
 
   app.get("/v1/provider-definitions", async () => ({
     data: container.providers.catalog(),
   }));
   app.post("/v1/provider-connections", async (request, reply) => {
-    const { tenantId } = identity(request);
-    let record = await container.providers.create(tenantId, body(request));
+    const data = requestBody(request, "createProvider");
+    const q = requestQuery(request, "createProvider");
+    let record = await container.providers.create(data);
     let sync: unknown = null;
-    if (query(request).sync_models !== "false") {
-      sync = await container.providers.validate(tenantId, record.id);
-      record = await container.providers.get(tenantId, record.id);
+    if (q.sync_models !== "false") {
+      sync = await container.providers.validate(record.id);
+      record = await container.providers.get(record.id);
     }
     return reply
       .code(201)
       .send({ ...publicConnection(record), model_sync: sync });
   });
-  app.get("/v1/provider-connections", async (request) => ({
-    data: (await container.providers.list(identity(request).tenantId)).map(
-      publicConnection,
-    ),
-  }));
-  app.get("/v1/provider-connections/:connectionId", async (request) =>
-    publicConnection(
-      await container.providers.get(
-        identity(request).tenantId,
-        String(params(request).connectionId),
-      ),
-    ),
-  );
-  app.patch("/v1/provider-connections/:connectionId", async (request) =>
-    publicConnection(
+  app.get("/v1/provider-connections", async (request) => {
+    const q = requestQuery(request, "listProviders");
+    const page = await container.providers.page({
+      ...pagination(q),
+      status: q.status,
+    });
+    return { ...page, data: page.data.map(publicConnection) };
+  });
+  app.get("/v1/provider-connections/:connectionId", async (request) => {
+    const { connectionId } = requestParams(request, "getProvider");
+    return publicConnection(await container.providers.get(connectionId));
+  });
+  app.patch("/v1/provider-connections/:connectionId", async (request) => {
+    const { connectionId } = requestParams(request, "updateProvider");
+    return publicConnection(
       await container.providers.update(
-        identity(request).tenantId,
-        String(params(request).connectionId),
-        body(request),
+        connectionId,
+        requestBody(request, "updateProvider"),
       ),
-    ),
+    );
+  });
+  app.post(
+    "/v1/provider-connections/:connectionId/validate",
+    async (request) => {
+      const { connectionId } = requestParams(request, "validateProvider");
+      requestBody(request, "validateProvider");
+      return container.providers.validate(connectionId);
+    },
   );
-  app.post("/v1/provider-connections/:connectionId/validate", async (request) =>
-    container.providers.validate(
-      identity(request).tenantId,
-      String(params(request).connectionId),
-    ),
-  );
-  app.get("/v1/provider-connections/:connectionId/models", async (request) => ({
-    data: await container.providers.listModels(
-      identity(request).tenantId,
-      String(params(request).connectionId),
-    ),
-  }));
+  app.get("/v1/provider-connections/:connectionId/models", async (request) => {
+    const { connectionId } = requestParams(request, "listProviderModels");
+    const q = requestQuery(request, "listProviderModels");
+    return container.providers.pageModels(connectionId, pagination(q));
+  });
   app.post(
     "/v1/provider-connections/:connectionId/models",
-    async (request, reply) =>
-      reply
+    async (request, reply) => {
+      const { connectionId } = requestParams(request, "createProviderModel");
+      return reply
         .code(201)
         .send(
           await container.providers.addModel(
-            identity(request).tenantId,
-            String(params(request).connectionId),
-            body(request),
+            connectionId,
+            requestBody(request, "createProviderModel"),
           ),
-        ),
+        );
+    },
   );
 
-  app.post("/v1/agents", async (request, reply) => {
-    const data = body(request);
+  app.post("/v1/agent-definitions/validate", async (request) => {
+    const data = requestBody(request, "validateAgentDefinition");
+    const document = parseAgentMarkdown(data.document);
+    return container.definitions.compile(
+      document,
+      data.overrides ?? {},
+      data.compilation_settings ?? {},
+    );
+  });
+  app.post("/v1/deployments", async (request, reply) => {
+    const data = requestBody(request, "createDeployment");
     return reply.code(201).send(
-      await container.definitions.createAgent(identity(request).tenantId, {
-        slug: String(data.slug),
-        name: String(data.name),
-        description: data.description ? String(data.description) : undefined,
+      await container.definitions.deploy({
+        ...(data.document
+          ? {
+              document: parseAgentMarkdown(data.document),
+              source: data.document,
+            }
+          : { config: data.config ?? {} }),
+        overrides: data.overrides ?? {},
+        compilationSettings: data.compilation_settings ?? {},
       }),
     );
   });
-  app.get("/v1/agents", async (request) => ({
-    data: await container.definitions.listAgents(identity(request).tenantId),
-  }));
-  app.get("/v1/agents/:agentId", async (request) =>
-    container.definitions.getAgent(
-      identity(request).tenantId,
-      String(params(request).agentId),
-    ),
-  );
-  app.get("/v1/agent-settings", async (request) =>
-    container.definitions.settings(identity(request).tenantId),
-  );
-  app.put("/v1/agent-settings", async (request) => {
-    const who = identity(request);
-    return container.definitions.updateSettings(
-      who.tenantId,
-      body(request),
-      who.actorId,
-    );
-  });
-  app.post("/v1/agent-definitions/validate", async (request) => {
-    const data = body(request);
-    const document = parseAgentMarkdown(String(data.document));
-    return container.definitions.compile(
-      identity(request).tenantId,
-      document,
-      (data.overrides ?? {}) as Dict,
-    );
-  });
-  app.post("/v1/agents/from-definition", async (request, reply) => {
-    const data = body(request);
-    const who = identity(request);
-    const created = await container.definitions.createFromDefinition(
-      who.tenantId,
-      parseAgentMarkdown(String(data.document)),
-      (data.overrides ?? {}) as Dict,
-    );
-    const version =
-      data.publish === false
-        ? created.version
-        : await container.definitions.publish(
-            who.tenantId,
-            created.agent.id,
-            Number(created.version.version),
-          );
-    return reply.code(201).send({ agent: created.agent, version });
-  });
-  app.post(
-    "/v1/agents/:agentId/versions/from-definition",
-    async (request, reply) => {
-      const data = body(request);
-      const who = identity(request);
-      const agentId = String(params(request).agentId);
-      const version = await container.definitions.createVersion(
-        who.tenantId,
-        agentId,
-        {},
-        parseAgentMarkdown(String(data.document)),
-        (data.overrides ?? {}) as Dict,
-      );
-      return reply.code(201).send({
-        agent: await container.definitions.getAgent(who.tenantId, agentId),
-        version:
-          data.publish === false
-            ? version
-            : await container.definitions.publish(
-                who.tenantId,
-                agentId,
-                Number(version.version),
-              ),
-      });
-    },
-  );
-  app.post("/v1/agents/:agentId/versions", async (request, reply) =>
-    reply
-      .code(201)
-      .send(
-        await container.definitions.createVersion(
-          identity(request).tenantId,
-          String(params(request).agentId),
-          (body(request).config ?? {}) as Dict,
-        ),
-      ),
-  );
-  app.get("/v1/agents/:agentId/versions", async (request) => ({
-    data: await container.definitions.versions(
-      identity(request).tenantId,
-      String(params(request).agentId),
-    ),
-  }));
-  app.post("/v1/agents/:agentId/versions/:version/publish", async (request) =>
-    container.definitions.publish(
-      identity(request).tenantId,
-      String(params(request).agentId),
-      integer(params(request).version, 0),
-    ),
-  );
-  app.get(
-    "/v1/agents/:agentId/versions/:version/definition",
-    async (request) => {
-      const versions = await container.definitions.versions(
-        identity(request).tenantId,
-        String(params(request).agentId),
-      );
-      const version = versions.find(
-        (item) => Number(item.version) === integer(params(request).version, 0),
-      );
-      if (!version) throw new NotFoundError("agent version not found");
-      return {
-        format: version.definition_format,
-        document: version.definition_source,
-        definition: version.definition_json,
-        overrides: version.overrides,
-        effective_config: version.config,
-        global_defaults_revision: version.global_defaults_revision,
-        platform_policy_revision: version.platform_policy_revision,
-        config_hash: version.config_hash,
-      };
-    },
-  );
-
-  app.post("/v1/sessions", async (request, reply) =>
-    reply
-      .code(201)
-      .send(
-        await container.sessions.create(
-          identity(request).tenantId,
-          (body(request).scope ?? {}) as Dict,
-        ),
-      ),
-  );
-  app.get("/v1/sessions", async (request) => {
-    const q = query(request);
-    const rows = await container.sessions.list(
-      identity(request).tenantId,
-      integer(q.limit, 100),
-      integer(q.offset, 0),
-    );
-    const data = [];
-    for (const row of rows) {
-      const chats = await container.sessions.chatMessages(row.id);
-      data.push({
-        ...row,
-        agent_version_id: row.scope.agent_version_id,
-        agent_id: row.scope.agent_id,
-        title: String(
-          row.scope.title ??
-            chats.find((m) => m.role === "user")?.content ??
-            "New conversation",
-        ).slice(0, 80),
-      });
-    }
-    return { data, limit: integer(q.limit, 100), offset: integer(q.offset, 0) };
-  });
-  app.get("/v1/sessions/:sessionId", async (request) =>
-    container.sessions.get(
-      identity(request).tenantId,
-      String(params(request).sessionId),
-    ),
-  );
-  app.get("/v1/sessions/:sessionId/messages", async (request) => {
-    const id = String(params(request).sessionId);
-    await container.sessions.get(identity(request).tenantId, id);
-    if (String(query(request).include_compacted) === "true")
-      return {
-        view: "canonical_transcript",
-        data: await container.sessions.rawItems(id),
-      };
-    return {
-      view: "model_projection",
-      data: (await container.sessions.effectiveItems(id)).map(
-        (item_json, position) => ({ position, item_json }),
-      ),
-    };
-  });
-  app.get("/v1/sessions/:sessionId/chat-messages", async (request) => {
-    const id = String(params(request).sessionId);
-    await container.sessions.get(identity(request).tenantId, id);
-    return {
-      view: "canonical_chat",
-      data: await container.sessions.chatMessages(id),
-    };
-  });
-  const sessionConfig = async (
-    tenantId: string,
-    sessionId: string,
-    agentVersionId?: string,
-  ) => {
-    const session = await container.sessions.get(tenantId, sessionId);
-    let id = agentVersionId ?? String(session.scope.agent_version_id ?? "");
-    if (!id) {
-      const recent = (
-        await container.db.query<{ agent_version_id: string }>(
-          "SELECT agent_version_id FROM runs WHERE tenant_id=$1 AND session_id=$2 ORDER BY created_at DESC LIMIT 1",
-          [tenantId, sessionId],
-        )
-      ).rows[0];
-      id = recent?.agent_version_id ?? "";
-    }
-    if (!id) throw new ValidationError("agent_version_id is required");
-    const version = await container.definitions.version(tenantId, id);
-    return container.providers.resolveConfig(tenantId, {
-      ...((version.config ?? {}) as Dict),
+  app.get("/v1/deployments", async (request) => {
+    const q = requestQuery(request, "listDeployments");
+    return container.definitions.pageDeployments({
+      ...pagination(q),
+      status: q.status,
     });
-  };
-  app.post("/v1/sessions/:sessionId/compact", async (request) => {
-    const data = body(request),
-      who = identity(request),
-      sessionId = String(params(request).sessionId);
-    const config = await sessionConfig(
-      who.tenantId,
-      sessionId,
-      data.agent_version_id ? String(data.agent_version_id) : undefined,
-    );
-    const result = await container.compaction.compact(
-      who.tenantId,
-      sessionId,
-      config,
-      {
-        strategy: String(data.strategy ?? "auto"),
-        focus: data.focus ? String(data.focus) : undefined,
-        dryRun: Boolean(data.dry_run),
-        force: data.force === undefined ? false : Boolean(data.force),
-        trigger: "manual",
-      },
-    );
-    return {
-      compacted: (result as Dict).status !== "skipped",
-      compaction: result,
-    };
   });
-  app.get("/v1/sessions/:sessionId/compactions", async (request) => ({
-    data: await container.compaction.list(
-      identity(request).tenantId,
-      String(params(request).sessionId),
-    ),
-  }));
-  app.get(
-    "/v1/sessions/:sessionId/compactions/:compactionId",
-    async (request) =>
-      container.compaction.get(
-        identity(request).tenantId,
-        String(params(request).sessionId),
-        String(params(request).compactionId),
-      ),
-  );
-  app.post(
-    "/v1/sessions/:sessionId/compactions/:compactionId/restore",
-    async (request) =>
-      container.compaction.restore(
-        identity(request).tenantId,
-        String(params(request).sessionId),
-        String(params(request).compactionId),
-      ),
-  );
-  app.get("/v1/sessions/:sessionId/context-preview", async (request) =>
-    container.compaction.preview(
-      identity(request).tenantId,
-      String(params(request).sessionId),
-    ),
-  );
+  app.get("/v1/deployments/:deploymentId", async (request) => {
+    const { deploymentId } = requestParams(request, "getDeployment");
+    return container.definitions.deployment(deploymentId);
+  });
+  app.post("/v1/context/compact", async (request) => {
+    const data = requestBody(request, "compactContext");
+    const deployment = await container.definitions.deployment(
+      data.deployment_id,
+    );
+    const config = await container.providers.resolveConfig({
+      ...((deployment.config ?? {}) as Dict),
+    });
+    const projection = data.projection as Record<string, unknown> | undefined;
+    if (projection) container.compaction.validateProjection(projection, config);
+    const items = (data.items ?? projection?.items ?? []) as never[];
+    return container.compaction.compact(items, config, {
+      strategy: data.strategy ?? "auto",
+      focus: data.focus,
+      dryRun: data.dry_run ?? false,
+      force: data.force ?? false,
+      currentInput: data.current_input,
+      trigger: "external",
+      sourceProjection: projection,
+    });
+  });
 
+  app.get("/v1/runs", async (request) => {
+    const q = requestQuery(request, "listRuns");
+    return container.runner.list({
+      ...pagination(q),
+      status: q.status,
+      deploymentId: q.deployment_id,
+      externalSessionId: q.external_session_id,
+      parentRunId: q.parent_run_id,
+    });
+  });
   app.post("/v1/runs", async (request, reply) => {
-    const data = body(request),
-      who = identity(request);
+    const data = requestBody(request, "createRun");
+    const headers = requestHeaders(request, "createRun");
     return reply.code(202).send(
       await container.runner.create({
-        tenantId: who.tenantId,
-        agentVersionId: String(data.agent_version_id),
+        deploymentId: data.deployment_id,
         input: data.input as never,
-        sessionId: data.session_id ? String(data.session_id) : undefined,
-        context: (data.context ?? {}) as Dict,
-        limits: (data.limits ?? {}) as Dict,
-        idempotencyKey: request.headers["idempotency-key"]
-          ? String(request.headers["idempotency-key"])
-          : undefined,
-        parentRunId: data.parent_run_id
-          ? String(data.parent_run_id)
-          : undefined,
+        conversation: (data.conversation ?? []) as never[],
+        projection: data.projection,
+        externalSessionId: data.external_session_id,
+        context: data.context ?? {},
+        limits: data.limits ?? {},
+        idempotencyKey: headers["idempotency-key"],
+        parentRunId: data.parent_run_id,
       }),
     );
   });
-  app.get("/v1/runs/:runId", async (request) =>
-    container.runner.get(
-      identity(request).tenantId,
-      String(params(request).runId),
-    ),
-  );
-  app.post("/v1/runs/:runId/cancel", async (request) =>
-    container.runner.cancel(
-      identity(request).tenantId,
-      String(params(request).runId),
-    ),
-  );
+  app.get("/v1/runs/:runId", async (request) => {
+    const { runId } = requestParams(request, "getRun");
+    return container.runner.publicRun(runId);
+  });
+  app.post("/v1/runs/:runId/cancel", async (request) => {
+    const { runId } = requestParams(request, "cancelRun");
+    requestBody(request, "cancelRun");
+    await container.runner.cancel(runId);
+    return container.runner.publicRun(runId);
+  });
   app.get("/v1/runs/:runId/events", async (request) => {
-    const id = String(params(request).runId);
-    await container.runner.get(identity(request).tenantId, id);
+    const { runId } = requestParams(request, "listRunEvents");
+    const q = requestQuery(request, "listRunEvents");
+    await container.runner.get(runId);
     return {
       data: (
         await container.events.list(
-          id,
-          integer(query(request).after, 0),
-          integer(query(request).limit, 500),
+          runId,
+          Number(q.after ?? 0),
+          Math.min(Number(q.limit ?? 500), 10_000),
         )
       ).map(publicEvent),
     };
   });
   app.get("/v1/runs/:runId/tool-executions", async (request) => {
-    const id = String(params(request).runId);
-    await container.runner.get(identity(request).tenantId, id);
+    const { runId } = requestParams(request, "listToolExecutions");
+    await container.runner.get(runId);
     return {
-      data: await container.tools.executions(identity(request).tenantId, id),
+      data: await container.tools.executions(runId),
     };
   });
-  app.post("/v1/tool-executions/:executionId/resolve", async (request) =>
-    container.tools.resolveExecution(
-      identity(request).tenantId,
-      String(params(request).executionId),
-      body(request),
-      identity(request).actorId,
-    ),
-  );
+  app.get("/v1/runs/:runId/usage", async (request) => {
+    const { runId } = requestParams(request, "runUsage");
+    await container.runner.get(runId);
+    return {
+      data: await container.usage.forRun(runId),
+    };
+  });
+  app.post("/v1/tool-executions/:executionId/resolve", async (request) => {
+    const { executionId } = requestParams(request, "resolveToolExecution");
+    return container.tools.resolveExecution(
+      executionId,
+      requestBody(request, "resolveToolExecution"),
+    );
+  });
   app.get("/v1/runs/:runId/stream", async (request, reply) => {
-    const who = identity(request),
-      runId = String(params(request).runId);
-    await container.runner.get(who.tenantId, runId);
-    let cursor = integer(request.headers["last-event-id"], 0);
-    reply.hijack();
-    reply.raw.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-      "Access-Control-Allow-Origin": String(request.headers.origin ?? "*"),
-    });
-    let lastWrite = Date.now();
-    while (!reply.raw.destroyed) {
-      const events = await container.events.list(runId, cursor, 1000);
-      for (const event of events) {
-        cursor = Number(event.seq);
-        reply.raw.write(encodeSse(publicEvent(event)));
-        lastWrite = Date.now();
+    const { runId } = requestParams(request, "streamRun");
+    const headers = requestHeaders(request, "streamRun");
+    await container.runner.get(runId);
+    const release = acquireSse(runId);
+    if (!release) {
+      reply.header("Retry-After", "1");
+      throw new SseCapacityError();
+    }
+    let cursor = Number(headers["last-event-id"] ?? 0);
+    const disconnected = new AbortController();
+    const onClose = () => disconnected.abort();
+    try {
+      reply.hijack();
+      const streamHeaders: Record<string, string> = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      };
+      const origin = request.headers.origin;
+      if (origin && container.settings.corsOrigins.includes(origin)) {
+        streamHeaders["Access-Control-Allow-Origin"] = origin;
+        streamHeaders.Vary = "Origin";
       }
-      const run = await container.runner.get(who.tenantId, runId);
-      if (
-        [
+      reply.raw.once("close", onClose);
+      reply.raw.writeHead(200, streamHeaders);
+      let lastWrite = Date.now();
+      while (!reply.raw.destroyed && !disconnected.signal.aborted) {
+        const revision = container.events.revision(runId);
+        const events = await container.events.list(runId, cursor, 1000);
+        for (const event of events) {
+          try {
+            await container.faults.hit("sse.before_event", {
+              run_id: runId,
+              seq: Number(event.seq),
+            });
+          } catch {
+            reply.raw.destroy();
+            return;
+          }
+          if (!(await writeSseChunk(reply.raw, encodeSse(publicEvent(event)))))
+            return;
+          cursor = Number(event.seq);
+          lastWrite = Date.now();
+        }
+        if (events.length >= 1000) continue;
+        const run = await container.runner.get(runId);
+        const closing = [
           "completed",
           "failed",
           "cancelled",
           "waiting_approval",
           "waiting_reconciliation",
-        ].includes(run.status) &&
-        !events.length
-      )
-        break;
-      if (
-        Date.now() - lastWrite >=
-        container.settings.sseHeartbeatSeconds * 1000
-      ) {
-        reply.raw.write(": heartbeat\n\n");
-        lastWrite = Date.now();
+        ].includes(run.status);
+        if (closing) {
+          // The terminal/interruption status and its matching Event commit
+          // atomically, but they can commit between the list above and this
+          // status read. Drain once more before ending so SSE never reports a
+          // terminal cursor that omits the corresponding Event.
+          if ((await container.events.list(runId, cursor, 1)).length) continue;
+
+          // Sandbox cleanup is intentionally post-terminal because destroying
+          // the external process/container cannot join the database
+          // transaction. Keep this stream open long enough to include the
+          // durable cleanup Event when a handle is still attached.
+          const cleanupPending =
+            ["completed", "failed", "cancelled"].includes(run.status) &&
+            Boolean(run.context_json?.sandbox);
+          if (cleanupPending) {
+            const changed = await container.events.waitForChange(
+              runId,
+              revision,
+              container.settings.ssePollFallbackMs,
+              disconnected.signal,
+            );
+            if (changed) continue;
+          }
+          await writeSseChunk(
+            reply.raw,
+            `event: stream.end\ndata: ${JSON.stringify({ status: run.status, cursor })}\n\n`,
+          );
+          break;
+        }
+        if (
+          Date.now() - lastWrite >=
+          container.settings.sseHeartbeatSeconds * 1000
+        ) {
+          if (!(await writeSseChunk(reply.raw, ": heartbeat\n\n"))) return;
+          lastWrite = Date.now();
+        }
+        await container.events.waitForChange(
+          runId,
+          revision,
+          container.settings.ssePollFallbackMs,
+          disconnected.signal,
+        );
       }
-      await new Promise((resolve) => setTimeout(resolve, 250));
+    } finally {
+      reply.raw.removeListener("close", onClose);
+      release();
+      if (!reply.raw.destroyed) reply.raw.end();
     }
-    reply.raw.end();
   });
 
   app.get("/v1/approvals", async (request) => {
-    const q = query(request),
-      who = identity(request);
-    const values: unknown[] = [who.tenantId];
-    const condition = q.status ? (values.push(q.status), " AND status=$2") : "";
-    return {
-      data: (
-        await container.db.query(
-          `SELECT * FROM approvals WHERE tenant_id=$1${condition} ORDER BY created_at DESC`,
-          values,
-        )
-      ).rows,
-    };
+    const q = requestQuery(request, "listApprovals");
+    return container.runner.listApprovals({
+      ...pagination(q),
+      status: q.status,
+    });
   });
-  app.get("/v1/approvals/:approvalId", async (request) =>
-    required(
+  app.get("/v1/approvals/:approvalId", async (request) => {
+    const { approvalId } = requestParams(request, "getApproval");
+    return required(
       container.db,
-      "SELECT * FROM approvals WHERE id=$1 AND tenant_id=$2",
-      [params(request).approvalId, identity(request).tenantId],
+      "SELECT * FROM approvals WHERE id=$1",
+      [approvalId],
       "approval not found",
-    ),
-  );
-  app.post("/v1/approvals/:approvalId/approve", async (request) => {
-    const who = identity(request);
-    return container.runner.decideApproval(
-      who.tenantId,
-      String(params(request).approvalId),
-      "approved",
-      who.actorId,
-      body(request).reason ? String(body(request).reason) : undefined,
     );
+  });
+  app.post("/v1/approvals/:approvalId/approve", async (request) => {
+    const { approvalId } = requestParams(request, "approve");
+    const data = requestBody(request, "approve");
+    return container.runner.decideApproval(approvalId, "approved", data.reason);
   });
   app.post("/v1/approvals/:approvalId/reject", async (request) => {
-    const who = identity(request);
-    return container.runner.decideApproval(
-      who.tenantId,
-      String(params(request).approvalId),
-      "rejected",
-      who.actorId,
-      body(request).reason ? String(body(request).reason) : undefined,
-    );
+    const { approvalId } = requestParams(request, "reject");
+    const data = requestBody(request, "reject");
+    return container.runner.decideApproval(approvalId, "rejected", data.reason);
   });
 
   app.post("/v1/tools", async (request, reply) =>
     reply
       .code(201)
+      .send(await container.tools.create(requestBody(request, "createTool"))),
+  );
+  app.get("/v1/tools", async (request) => {
+    const q = requestQuery(request, "listTools");
+    return container.tools.page({ ...pagination(q), status: q.status });
+  });
+  app.post("/v1/mcp-servers", async (request, reply) =>
+    reply
+      .code(201)
       .send(
-        await container.tools.create(identity(request).tenantId, body(request)),
+        await container.mcp.create(requestBody(request, "createMcpServer")),
       ),
   );
-  app.get("/v1/tools", async (request) => ({
-    data: await container.tools.list(identity(request).tenantId),
-  }));
-  app.post("/v1/mcp-servers", async (request, reply) => {
-    const data = body(request);
-    return reply.code(201).send(
-      await container.resources.create({
-        tenantId: identity(request).tenantId,
-        kind: "mcp_server",
-        slug: String(data.slug),
-        name: String(data.name),
-        data: {
-          transport: data.transport,
-          endpoint_config: data.endpoint_config ?? {},
-          secret_refs: data.secret_refs ?? {},
-          policy: data.policy ?? {},
-        },
-      }),
+  app.get("/v1/mcp-servers", async (request) => {
+    const q = requestQuery(request, "listMcpServers");
+    return container.mcp.page({ ...pagination(q), status: q.status });
+  });
+  app.get("/v1/mcp-servers/:serverId", async (request) => {
+    const { serverId } = requestParams(request, "getMcpServer");
+    return container.mcp.get(serverId);
+  });
+  app.patch("/v1/mcp-servers/:serverId", async (request) => {
+    const { serverId } = requestParams(request, "updateMcpServer");
+    return container.mcp.update(
+      serverId,
+      requestBody(request, "updateMcpServer"),
     );
   });
-  app.get("/v1/mcp-servers", async (request) => ({
-    data: await container.resources.list(
-      identity(request).tenantId,
-      "mcp_server",
-    ),
-  }));
+  app.delete("/v1/mcp-servers/:serverId", async (request, reply) => {
+    const { serverId } = requestParams(request, "deleteMcpServer");
+    await container.mcp.delete(serverId);
+    return reply.code(204).send();
+  });
   app.post("/v1/mcp-servers/:serverId/health", async (request) => {
-    const server = await container.factory.mcpServer(
-      identity(request).tenantId,
-      String(params(request).serverId),
-    );
-    try {
-      await server.connect();
-      const tools = await server.listTools();
-      return {
-        status: "ok",
-        tool_count: tools.length,
-        tools: tools.map((tool) => tool.name),
-      };
-    } finally {
-      await server.close();
-    }
+    const { serverId } = requestParams(request, "mcpHealth");
+    requestBody(request, "mcpHealth");
+    return container.mcp.health(serverId);
   });
+  app.get("/v1/mcp-servers/:serverId/tools", async (request) => {
+    const { serverId } = requestParams(request, "mcpTools");
+    return container.mcp.inspectTools(serverId);
+  });
+  app.post(
+    "/v1/mcp-servers/:serverId/tools/:toolName/call",
+    async (request) => {
+      const { serverId, toolName } = requestParams(request, "callMcpTool");
+      const data = requestBody(request, "callMcpTool");
+      return container.mcp.testCall(serverId, toolName, data.arguments ?? {});
+    },
+  );
   app.post("/v1/skills/import", async (request, reply) =>
     reply
       .code(201)
       .send(
         await container.skills.importPath(
-          identity(request).tenantId,
-          String(body(request).path),
+          requestBody(request, "importSkill").path,
         ),
       ),
   );
   app.post("/v1/skills/bundles", async (request, reply) =>
-    reply.code(201).send(
-      await container.skills.importBundle(
-        identity(request).tenantId,
-        (body(request).files ?? []) as Array<{
-          path: string;
-          content_base64: string;
-        }>,
-      ),
-    ),
-  );
-  app.get("/v1/skills", async (request) => ({
-    data: await container.skills.list(identity(request).tenantId),
-  }));
-  app.get("/v1/skills/:skillId/versions", async (request) => ({
-    data: await container.skills.versions(
-      identity(request).tenantId,
-      String(params(request).skillId),
-    ),
-  }));
-
-  app.post("/v1/project-releases/validate", async (request) =>
-    container.releases.validate(
-      identity(request).tenantId,
-      (body(request).manifest ?? {}) as Dict,
-    ),
-  );
-  app.post("/v1/project-releases", async (request, reply) => {
-    const who = identity(request);
-    return reply
-      .code(201)
-      .send(
-        await container.releases.create(
-          who.tenantId,
-          (body(request).manifest ?? {}) as Dict,
-          who.actorId,
-        ),
-      );
-  });
-  app.get("/v1/project-releases", async (request) => ({
-    data: await container.releases.list(
-      identity(request).tenantId,
-      query(request).project ? String(query(request).project) : undefined,
-    ),
-  }));
-  app.get("/v1/project-releases/:releaseId", async (request) =>
-    container.releases.get(
-      identity(request).tenantId,
-      String(params(request).releaseId),
-    ),
-  );
-  app.put("/v1/projects/:project/channels/:channel", async (request) => {
-    const who = identity(request),
-      data = body(request);
-    return container.releases.setChannel(
-      who.tenantId,
-      String(params(request).project),
-      String(params(request).channel),
-      String(data.release_id),
-      data.expected_revision === undefined
-        ? undefined
-        : Number(data.expected_revision),
-      who.actorId,
-    );
-  });
-  app.get("/v1/projects/:project/channels/:channel", async (request) =>
-    container.releases.channel(
-      identity(request).tenantId,
-      String(params(request).project),
-      String(params(request).channel),
-    ),
-  );
-
-  app.post("/v1/webhook-subscriptions", async (request, reply) =>
     reply
       .code(201)
       .send(
-        await container.webhooks.create(
-          identity(request).tenantId,
-          body(request),
+        await container.skills.importBundle(
+          requestBody(request, "importSkillBundle").files,
         ),
       ),
   );
-  app.get("/v1/webhook-subscriptions", async (request) => ({
-    data: await container.webhooks.list(identity(request).tenantId),
-  }));
-  app.patch("/v1/webhook-subscriptions/:subscriptionId", async (request) =>
-    container.webhooks.patch(
-      identity(request).tenantId,
-      String(params(request).subscriptionId),
-      body(request),
-    ),
-  );
-  app.get("/v1/webhook-deliveries", async (request) => ({
-    data: await container.webhooks.deliveries(
-      identity(request).tenantId,
-      query(request).status ? String(query(request).status) : undefined,
-    ),
-  }));
-  app.post("/v1/webhook-deliveries/:deliveryId/replay", async (request) =>
-    container.webhooks.replay(
-      identity(request).tenantId,
-      String(params(request).deliveryId),
-    ),
-  );
-  app.post("/v1/memories", async (request, reply) => {
-    const who = identity(request);
+  app.get("/v1/skills", async (request) => {
+    const q = requestQuery(request, "listSkills");
+    return container.skills.page({ ...pagination(q), status: q.status });
+  });
+  app.get("/v1/skills/:skillId/versions", async (request) => {
+    const { skillId } = requestParams(request, "listSkillVersions");
+    const q = requestQuery(request, "listSkillVersions");
+    return container.skills.versionsPage(skillId, pagination(q));
+  });
+
+  app.get("/v1/artifacts", async (request) => {
+    const q = requestQuery(request, "listArtifacts");
+    return container.artifacts.page({
+      ...pagination(q),
+      runId: q.run_id,
+      status: q.status,
+    });
+  });
+
+  app.post("/v1/artifacts", async (request, reply) => {
+    const { run_id: runId } = requestQuery(request, "createArtifact");
+    const part = await request.file();
+    if (!part) throw new ValidationError("multipart file is required");
     return reply.code(201).send(
-      await container.memory.create(who.tenantId, body(request), {
-        actor_id: who.actorId,
+      await container.artifacts.createStream(part.filename, part.file, {
+        runId,
+        mimeType: part.mimetype,
       }),
     );
   });
-  app.get("/v1/memories", async (request) => ({
-    data: await container.memory.list(
-      identity(request).tenantId,
-      query(request),
-    ),
-  }));
-  app.patch("/v1/memories/:memoryId", async (request) =>
-    container.memory.patch(
-      identity(request).tenantId,
-      String(params(request).memoryId),
-      body(request),
-    ),
-  );
-  app.delete("/v1/memories/:memoryId", async (request, reply) => {
-    await container.memory.patch(
-      identity(request).tenantId,
-      String(params(request).memoryId),
-      { enabled: false },
-    );
-    return reply.code(204).send();
+  app.get("/v1/artifacts/:artifactId", async (request) => {
+    const { artifactId } = requestParams(request, "getArtifact");
+    return container.artifacts.get(artifactId);
   });
-  app.post("/v1/artifacts", async (request, reply) => {
-    const part = await request.file();
-    if (!part) throw new ValidationError("multipart file is required");
-    const data = await part.toBuffer();
-    return reply.code(201).send(
-      await container.artifacts.create(
-        identity(request).tenantId,
-        part.filename,
-        data,
-        {
-          runId: query(request).run_id
-            ? String(query(request).run_id)
-            : undefined,
-          mimeType: part.mimetype,
-        },
-      ),
-    );
-  });
-  app.get("/v1/artifacts/:artifactId", async (request) =>
-    container.artifacts.get(
-      identity(request).tenantId,
-      String(params(request).artifactId),
-    ),
-  );
   app.get("/v1/artifacts/:artifactId/download", async (request, reply) => {
-    const row = await container.artifacts.get(
-      identity(request).tenantId,
-      String(params(request).artifactId),
-    );
+    const { artifactId } = requestParams(request, "downloadArtifact");
+    const row = await container.artifacts.get(artifactId);
     reply
       .type(row.mime_type)
       .header(
         "Content-Disposition",
-        `attachment; filename="${row.filename.replace(/"/g, "")}"`,
+        `attachment; filename="${row.filename.replace(/["\r\n]/g, "")}"`,
       );
-    return reply.send(
-      Buffer.from(
-        await container.artifacts.bytes(identity(request).tenantId, row.id),
-      ),
-    );
+    return reply.send(Buffer.from(await container.artifacts.bytes(row.id)));
   });
   app.delete("/v1/artifacts/:artifactId", async (request, reply) => {
-    await container.artifacts.remove(
-      identity(request).tenantId,
-      String(params(request).artifactId),
-    );
+    const { artifactId } = requestParams(request, "deleteArtifact");
+    await container.artifacts.remove(artifactId);
     return reply.code(204).send();
-  });
-  app.post("/v1/prices", async (request, reply) =>
-    reply.code(201).send(await container.costs.createPrice(body(request))),
-  );
-  app.get("/v1/usage", async (request) => ({
-    data: await container.costs.usage(
-      identity(request).tenantId,
-      query(request).run_id ? String(query(request).run_id) : undefined,
-    ),
-  }));
-  app.get("/v1/costs", async (request) => {
-    const data = await container.costs.costs(
-      identity(request).tenantId,
-      query(request).run_id ? String(query(request).run_id) : undefined,
-    );
-    return {
-      data,
-      tenant_total: data.reduce(
-        (sum, row) => sum + Number((row as Dict).amount),
-        0,
-      ),
-    };
   });
   return app;
 }

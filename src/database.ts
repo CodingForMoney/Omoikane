@@ -17,10 +17,14 @@ export interface SqlExecutor {
     sql: string,
     params?: unknown[],
   ): Promise<QueryResult<T>>;
+  afterCommit?(callback: () => void): void;
 }
 
 class PGliteExecutor implements SqlExecutor {
-  constructor(private readonly client: PGlite | PGliteTransaction) {}
+  constructor(
+    private readonly client: PGlite | PGliteTransaction,
+    private readonly registerAfterCommit?: (callback: () => void) => void,
+  ) {}
 
   async query<T extends Record<string, unknown>>(
     sql: string,
@@ -32,10 +36,16 @@ class PGliteExecutor implements SqlExecutor {
       rowCount: result.affectedRows ?? result.rows.length,
     };
   }
+  afterCommit(callback: () => void) {
+    this.registerAfterCommit?.(callback);
+  }
 }
 
 class PgExecutor implements SqlExecutor {
-  constructor(private readonly client: pg.Pool | pg.PoolClient) {}
+  constructor(
+    private readonly client: pg.Pool | pg.PoolClient,
+    private readonly registerAfterCommit?: (callback: () => void) => void,
+  ) {}
 
   async query<T extends Record<string, unknown>>(
     sql: string,
@@ -44,7 +54,20 @@ class PgExecutor implements SqlExecutor {
     const result = await this.client.query(sql, params);
     return { rows: result.rows as T[], rowCount: result.rowCount ?? 0 };
   }
+  afterCommit(callback: () => void) {
+    this.registerAfterCommit?.(callback);
+  }
 }
+
+const runAfterCommit = (callbacks: Array<() => void>) => {
+  for (const callback of callbacks)
+    try {
+      callback();
+    } catch {
+      // A local wake-up optimization must never turn a committed transaction
+      // into an application-visible failure.
+    }
+};
 
 export class Database implements SqlExecutor {
   private constructor(
@@ -95,14 +118,23 @@ export class Database implements SqlExecutor {
 
   async transaction<T>(callback: (tx: SqlExecutor) => Promise<T>): Promise<T> {
     if (this.pglite) {
-      return this.pglite.transaction((tx) => callback(new PGliteExecutor(tx)));
+      const afterCommit: Array<() => void> = [];
+      const result = await this.pglite.transaction((tx) =>
+        callback(new PGliteExecutor(tx, (hook) => afterCommit.push(hook))),
+      );
+      runAfterCommit(afterCommit);
+      return result;
     }
     if (!this.pool) throw new Error("database is closed");
     const client = await this.pool.connect();
+    const afterCommit: Array<() => void> = [];
     try {
       await client.query("BEGIN");
-      const result = await callback(new PgExecutor(client));
+      const result = await callback(
+        new PgExecutor(client, (hook) => afterCommit.push(hook)),
+      );
       await client.query("COMMIT");
+      runAfterCommit(afterCommit);
       return result;
     } catch (error) {
       await client.query("ROLLBACK");

@@ -1,112 +1,24 @@
 name: omoikane
 
-x-app-environment: &app-environment
-  AGENT_ENVIRONMENT: production
-  AGENT_HOST: 0.0.0.0
-  AGENT_AUTO_MIGRATE: "false"
-  AGENT_DATABASE_URL: postgresql://agent:agent@postgres:5432/agent_system
-  AGENT_REDIS_URL: redis://redis:6379/0
-  AGENT_ARTIFACT_BACKEND: s3
-  AGENT_S3_BUCKET: agent-artifacts
-  AGENT_S3_ENDPOINT_URL: http://minio:9000
-  AGENT_S3_REGION: us-east-1
-  AWS_ACCESS_KEY_ID: agent-minio
-  AWS_SECRET_ACCESS_KEY: agent-minio-development
-  AGENT_RUN_STATE_SECRET: ${AGENT_RUN_STATE_SECRET:?set AGENT_RUN_STATE_SECRET}
-  AGENT_SANDBOX_ROOT: /var/lib/omoikane/sandboxes
-  AGENT_SANDBOX_HOST_ROOT: ${OMOIKANE_SANDBOX_HOST_ROOT:-/tmp/omoikane-sandboxes}
-  AGENT_RUNTIME_GENERATION: ${AGENT_RUNTIME_GENERATION:-agents-ts-0.17.0-state-1.19}
-
 services:
-  postgres:
-    image: pgvector/pgvector:pg16
-    environment:
-      POSTGRES_USER: agent
-      POSTGRES_PASSWORD: agent
-      POSTGRES_DB: agent_system
-    volumes: [postgres-data:/var/lib/postgresql/data]
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U agent -d agent_system"]
-      interval: 3s
-      timeout: 3s
-      retries: 20
-
-  redis:
-    image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes"]
-    volumes: [redis-data:/data]
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 3s
-      timeout: 3s
-      retries: 20
-
-  minio:
-    image: minio/minio:latest
-    command: ["server", "/data", "--console-address", ":9001"]
-    environment:
-      MINIO_ROOT_USER: agent-minio
-      MINIO_ROOT_PASSWORD: agent-minio-development
-    volumes: [minio-data:/data]
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 3s
-      timeout: 3s
-      retries: 20
-
-  minio-init:
-    image: minio/mc:latest
-    depends_on:
-      minio: { condition: service_healthy }
-    entrypoint:
-      - /bin/sh
-      - -c
-      - >-
-        mc alias set local http://minio:9000 agent-minio agent-minio-development &&
-        mc mb --ignore-existing local/agent-artifacts
-
-  migrate:
-    build: .
-    command: ["node", "dist/bin/migrate.js"]
-    environment: *app-environment
-    depends_on:
-      postgres: { condition: service_healthy }
-
-  api:
+  runtime:
     build: .
     command: ["node", "dist/bin/runtime.js"]
     environment:
-      <<: *app-environment
-      AGENT_EMBEDDED_WORKER: "false"
-    ports: ["8000:8000"]
-    depends_on:
-      migrate: { condition: service_completed_successfully }
-      redis: { condition: service_healthy }
-      minio-init: { condition: service_completed_successfully }
+      OMOIKANE_DATA_DIR: /data
+      OMOIKANE_HOST: 0.0.0.0
+      OMOIKANE_ALLOW_REMOTE: "true"
+      OMOIKANE_RUN_CONCURRENCY: ${OMOIKANE_RUN_CONCURRENCY:-4}
+      OMOIKANE_CORS_ORIGINS: ${OMOIKANE_CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - omoikane-data:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
       interval: 5s
       timeout: 3s
       retries: 20
 
-  worker:
-    build: .
-    command: ["node", "dist/bin/worker.js"]
-    environment: *app-environment
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ${OMOIKANE_SANDBOX_HOST_ROOT:-/tmp/omoikane-sandboxes}:/var/lib/omoikane/sandboxes
-    depends_on:
-      api: { condition: service_healthy }
-
-  webhook-worker:
-    build: .
-    command: ["node", "dist/bin/webhook-worker.js"]
-    environment: *app-environment
-    depends_on:
-      api: { condition: service_healthy }
-
 volumes:
-  postgres-data:
-  redis-data:
-  minio-data:
+  omoikane-data:

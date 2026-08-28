@@ -1,16 +1,129 @@
 export { Agent } from "@openai/agents";
 export { Container } from "./container.js";
 export { createApp } from "./api.js";
-export { getSettings, type Settings } from "./config.js";
+export { API_CONTRACTS } from "./contracts.js";
+export { OPENAPI_DOCUMENT, createOpenApiDocument } from "./openapi.js";
+export {
+  configuredCredentialSecret,
+  getSettings,
+  type Settings,
+} from "./config.js";
 export { Database } from "./database.js";
-export { migrate } from "./migrations.js";
+export {
+  assertMigrationCompatible,
+  migrate,
+  preflightMigrations,
+  MigrationCompatibilityError,
+  MIGRATION_FILES,
+  MIGRATION_VERSIONS,
+  TARGET_MIGRATION_VERSION,
+  type MigrationPreflight,
+} from "./migrations.js";
+export {
+  createPgliteBackup,
+  defaultBackupPath,
+  restorePgliteBackup,
+  verifyBackup,
+  type BackupFile,
+  type BackupManifest,
+  type BackupVerification,
+} from "./backup.js";
+export {
+  preflightUpgrade,
+  safeUpgrade,
+  type PostgreSqlBackupEvidence,
+  type UpgradeResult,
+} from "./upgrade.js";
+export {
+  DeterministicFaultInjector,
+  FAILURE_POINTS,
+  InjectedProcessCrash,
+  safeModelRetryPolicy,
+  type FailureContext,
+  type FailurePoint,
+  type FaultInjector,
+} from "./recovery.js";
+export {
+  CompactionService,
+  type CompactionDecision,
+  type CompactionOptions,
+  type CompactionProjectionV4,
+  type CompactionResult,
+  type CompactionRuntimeState,
+  type CompactionStrategy,
+  type PortableCheckpointV4,
+  type SemanticCheckpoint,
+  DEFAULT_COMPACTION_EVALUATION_THRESHOLDS,
+  buildCompactionEvaluationConversation,
+  compactionEvaluationOutputSchema,
+  compactionSemanticRisk,
+  qualifyCompactionEvaluationReports,
+  renderCompactionEvaluationPrompt,
+  scoreCompactionEvaluation,
+  validateCompactionEvaluationCorpus,
+  type CompactionEvaluationCase,
+  type CompactionEvaluationCorpus,
+  type CompactionEvaluationMetrics,
+  type CompactionEvaluationProbe,
+  type CompactionEvaluationReport,
+  type CompactionEvaluationSubject,
+  type CompactionEvaluationSuiteReport,
+  type CompactionEvaluationThresholds,
+  type CompactionProbeScore,
+  type CompactionSemanticRisk,
+} from "./compaction.js";
 export {
   OmoikaneClient,
   OmoikaneError,
   type ClientOptions,
+  type ArtifactListOptions,
+  type ListPageOptions,
+  type RunListOptions,
   type RuntimeEvent,
   type RunCreate,
+  type RunLimits,
+  type UsageRecord,
+  type UsageReportingStatus,
+  type McpServerInput,
+  type McpTransport,
+  type McpApprovalMode,
+  type ApprovalRecord,
+  type ArtifactRecord,
+  type CapabilitiesResponse,
+  type CompactionResponse,
+  type ContextCompact,
+  type DeploymentCreate,
+  type DeploymentRecord,
+  type HealthResponse,
+  type JsonObject,
+  type McpCallResponse,
+  type McpHealth,
+  type McpServerRecord,
+  type McpServerUpdate,
+  type McpToolsResponse,
+  type ProviderConnection,
+  type ProviderConnectionCreate,
+  type ProviderConnectionUpdate,
+  type ProviderModel,
+  type ProviderModelCreate,
+  type ProviderValidation,
+  type PageResponse,
+  type ResourceRecord,
+  type RunRecord,
+  type RunSummary,
+  type RuntimeStatusResponse,
+  type SkillBundle,
+  type SkillImport,
+  type SkillImportResponse,
+  type VersionResponse,
 } from "./client/index.js";
+export {
+  registerTraceExporter,
+  unregisterTraceExporter,
+  type TraceExporterFactory,
+  type TracingRuntimeStatus,
+} from "./observability.js";
+export { MCP_DEFAULTS } from "./mcp.js";
 export {
   registerToolImplementation,
   unregisterToolImplementation,
@@ -18,7 +131,20 @@ export {
   type RuntimeContext,
 } from "./tools.js";
 export {
+  registerGuardrailImplementation,
+  unregisterGuardrailImplementation,
+  normalizeGuardrailConfiguration,
+  type GuardrailBinding,
+  type GuardrailConfiguration,
+  type GuardrailDecision,
+  type GuardrailExecutionContext,
+  type GuardrailFailurePolicy,
+  type GuardrailImplementation,
+  type GuardrailStage,
+} from "./guardrails.js";
+export {
   PROVIDER_CATALOG,
+  type ContextCompactionCapability,
   type ProviderDefinition,
   type ModelCapability,
 } from "./providers.js";

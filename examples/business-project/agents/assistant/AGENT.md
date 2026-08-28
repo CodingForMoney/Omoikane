@@ -4,7 +4,7 @@ kind: Agent
 metadata:
   slug: example-assistant
   name: Example Business Assistant
-  description: Demonstrates a remotely published business Agent.
+  description: Demonstrates a local business-system Agent deployment.
 spec:
   provider:
     connection_id: replace-with-provider-connection-id

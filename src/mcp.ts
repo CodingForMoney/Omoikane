@@ -1,0 +1,1017 @@
+import { createHash } from "node:crypto";
+import {
+  MCPServerSSE,
+  MCPServerStdio,
+  MCPServerStreamableHttp,
+  mcpToFunctionTool,
+  type FunctionTool,
+  type MCPServer,
+  type RunContext,
+} from "@openai/agents";
+import type { Database } from "./database.js";
+import {
+  ConflictError,
+  NotFoundError,
+  ValidationError,
+  required,
+} from "./database.js";
+import { ResourceStore, type Resource } from "./resources.js";
+import { canonicalJson, hashJson, newId } from "./serialization.js";
+import type { RuntimeContext } from "./tools.js";
+import type { FaultInjector } from "./recovery.js";
+import type { PageOptions } from "./pagination.js";
+
+type McpTool = Awaited<ReturnType<MCPServer["listTools"]>>[number];
+type McpToolCallDetails = Parameters<
+  FunctionTool<RuntimeContext, any, any>["invoke"]
+>[2];
+
+export type McpTransport = "stdio" | "streamable_http" | "sse";
+export type McpApprovalMode = "never" | "selected" | "always";
+
+export interface McpApprovalPolicy {
+  mode: McpApprovalMode;
+  tools: string[];
+}
+
+export interface McpPolicy extends Record<string, unknown> {
+  allowed_tools?: string[];
+  approval: McpApprovalPolicy;
+  side_effecting_tools: string[];
+  connect_timeout_ms: number;
+  call_timeout_ms: number;
+  max_output_bytes: number;
+}
+
+export interface McpServerData extends Record<string, unknown> {
+  transport: McpTransport;
+  endpoint_config: Record<string, unknown>;
+  secret_refs: Record<string, string>;
+  policy: McpPolicy;
+}
+
+export interface McpReference extends Record<string, unknown> {
+  server_id?: string;
+  id?: string;
+  slug?: string;
+  policy_override?: Record<string, unknown>;
+}
+
+export interface McpBuiltTools {
+  tools: FunctionTool<RuntimeContext, any, any>[];
+  close(): Promise<void>;
+}
+
+const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
+const DEFAULT_CALL_TIMEOUT_MS = 60_000;
+const DEFAULT_MAX_OUTPUT_BYTES = 262_144;
+const TOOL_NAME = /^[A-Za-z0-9_-]{1,64}$/;
+
+const asRecord = (value: unknown, label: string): Record<string, unknown> => {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new ValidationError(`${label} must be an object`);
+  return value as Record<string, unknown>;
+};
+
+const assertKeys = (
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  label: string,
+) => {
+  const unknown = Object.keys(value).filter((key) => !allowed.includes(key));
+  if (unknown.length)
+    throw new ValidationError(
+      `${label} contains unsupported fields: ${unknown.join(", ")}`,
+    );
+};
+
+const stringList = (value: unknown, label: string): string[] => {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string"))
+    throw new ValidationError(`${label} must be an array of strings`);
+  return [...new Set(value as string[])];
+};
+
+const positiveInteger = (value: unknown, fallback: number, label: string) => {
+  if (value === undefined) return fallback;
+  const result = Number(value);
+  if (!Number.isSafeInteger(result) || result <= 0)
+    throw new ValidationError(`${label} must be a positive integer`);
+  return result;
+};
+
+const stringRecord = (
+  value: unknown,
+  label: string,
+): Record<string, string> => {
+  if (value === undefined) return {};
+  const record = asRecord(value, label);
+  if (Object.values(record).some((item) => typeof item !== "string"))
+    throw new ValidationError(`${label} values must be strings`);
+  return record as Record<string, string>;
+};
+
+function normalizeApproval(
+  value: unknown,
+  legacySelected: unknown,
+  label: string,
+): McpApprovalPolicy {
+  if (value === undefined && legacySelected !== undefined) {
+    const tools = stringList(legacySelected, `${label}.approval_required`);
+    return { mode: tools.length ? "selected" : "never", tools };
+  }
+  if (value === undefined) return { mode: "never", tools: [] };
+  const approval = asRecord(value, `${label}.approval`);
+  assertKeys(approval, ["mode", "tools"], `${label}.approval`);
+  const mode = String(approval.mode ?? "never") as McpApprovalMode;
+  if (!["never", "selected", "always"].includes(mode))
+    throw new ValidationError(
+      `${label}.approval.mode must be never, selected, or always`,
+    );
+  const tools = stringList(approval.tools, `${label}.approval.tools`);
+  if (mode === "selected" && !tools.length)
+    throw new ValidationError(
+      `${label}.approval.tools is required when mode is selected`,
+    );
+  return { mode, tools: mode === "selected" ? tools : [] };
+}
+
+function normalizePolicy(
+  value: unknown,
+  label = "policy",
+  defaults?: McpPolicy,
+): McpPolicy {
+  const policy = value === undefined ? {} : asRecord(value, label);
+  assertKeys(
+    policy,
+    [
+      "allowed_tools",
+      "approval",
+      "approval_required",
+      "side_effecting_tools",
+      "connect_timeout_ms",
+      "call_timeout_ms",
+      "max_output_bytes",
+    ],
+    label,
+  );
+  const allowed =
+    policy.allowed_tools === undefined
+      ? defaults?.allowed_tools
+      : stringList(policy.allowed_tools, `${label}.allowed_tools`);
+  return {
+    ...(allowed === undefined ? {} : { allowed_tools: allowed }),
+    approval:
+      policy.approval === undefined && policy.approval_required === undefined
+        ? (defaults?.approval ?? { mode: "never", tools: [] })
+        : normalizeApproval(policy.approval, policy.approval_required, label),
+    side_effecting_tools:
+      policy.side_effecting_tools === undefined
+        ? (defaults?.side_effecting_tools ?? [])
+        : stringList(
+            policy.side_effecting_tools,
+            `${label}.side_effecting_tools`,
+          ),
+    connect_timeout_ms: positiveInteger(
+      policy.connect_timeout_ms,
+      defaults?.connect_timeout_ms ?? DEFAULT_CONNECT_TIMEOUT_MS,
+      `${label}.connect_timeout_ms`,
+    ),
+    call_timeout_ms: positiveInteger(
+      policy.call_timeout_ms,
+      defaults?.call_timeout_ms ?? DEFAULT_CALL_TIMEOUT_MS,
+      `${label}.call_timeout_ms`,
+    ),
+    max_output_bytes: positiveInteger(
+      policy.max_output_bytes,
+      defaults?.max_output_bytes ?? DEFAULT_MAX_OUTPUT_BYTES,
+      `${label}.max_output_bytes`,
+    ),
+  };
+}
+
+function normalizeInput(
+  input: Record<string, unknown>,
+  current?: Resource<McpServerData> & McpServerData,
+) {
+  const isDocument = input.spec !== undefined || input.kind === "McpServer";
+  if (isDocument) {
+    assertKeys(
+      input,
+      ["apiVersion", "kind", "metadata", "spec"],
+      "MCP document",
+    );
+    if ((input.apiVersion ?? "omoikane/v1") !== "omoikane/v1")
+      throw new ValidationError("unsupported MCP apiVersion");
+    if ((input.kind ?? "McpServer") !== "McpServer")
+      throw new ValidationError("MCP kind must be McpServer");
+  } else {
+    assertKeys(
+      input,
+      [
+        "slug",
+        "name",
+        "transport",
+        "endpoint",
+        "endpoint_config",
+        "secret_refs",
+        "policy",
+        "execution_mode",
+        "status",
+      ],
+      "MCP server",
+    );
+  }
+  const metadata = isDocument
+    ? asRecord(input.metadata ?? {}, "metadata")
+    : input;
+  if (isDocument) assertKeys(metadata, ["slug", "name"], "metadata");
+  const spec = isDocument ? asRecord(input.spec ?? {}, "spec") : input;
+  if (isDocument)
+    assertKeys(
+      spec,
+      ["transport", "endpoint", "secret_refs", "policy", "execution_mode"],
+      "spec",
+    );
+  if (spec.execution_mode !== undefined && spec.execution_mode !== "runtime")
+    throw new ValidationError(
+      "only Runtime-managed MCP execution_mode is supported",
+    );
+  const slug = String(metadata.slug ?? current?.slug ?? "").trim();
+  const name = String(metadata.name ?? current?.name ?? "").trim();
+  if (!/^[a-z0-9][a-z0-9_-]{1,127}$/.test(slug))
+    throw new ValidationError("invalid MCP server slug");
+  if (!name) throw new ValidationError("MCP server name is required");
+  const status = String(input.status ?? current?.status ?? "active");
+  if (!["active", "disabled"].includes(status))
+    throw new ValidationError("MCP server status must be active or disabled");
+  const transport = String(
+    spec.transport ?? current?.transport ?? "",
+  ) as McpTransport;
+  if (!["stdio", "streamable_http", "sse"].includes(transport))
+    throw new ValidationError(
+      "MCP transport must be stdio, streamable_http, or sse",
+    );
+  const rawEndpoint =
+    spec.endpoint ?? spec.endpoint_config ?? current?.endpoint_config ?? {};
+  const endpoint = asRecord(rawEndpoint, "MCP endpoint");
+  if (transport === "stdio") {
+    assertKeys(endpoint, ["command", "args", "cwd", "env"], "MCP endpoint");
+    if (!String(endpoint.command ?? "").trim())
+      throw new ValidationError("stdio MCP endpoint.command is required");
+    if (
+      endpoint.args !== undefined &&
+      (!Array.isArray(endpoint.args) ||
+        endpoint.args.some((item) => typeof item !== "string"))
+    )
+      throw new ValidationError("stdio MCP endpoint.args must be strings");
+    stringRecord(endpoint.env, "MCP endpoint.env");
+  } else {
+    assertKeys(endpoint, ["url", "headers"], "MCP endpoint");
+    let url: URL;
+    try {
+      url = new URL(String(endpoint.url ?? ""));
+    } catch {
+      throw new ValidationError("HTTP MCP endpoint.url must be a valid URL");
+    }
+    if (!["http:", "https:"].includes(url.protocol))
+      throw new ValidationError("HTTP MCP endpoint.url must use http or https");
+    stringRecord(endpoint.headers, "MCP endpoint.headers");
+  }
+  const secretRefs = stringRecord(
+    spec.secret_refs ?? current?.secret_refs,
+    "MCP secret_refs",
+  );
+  for (const [target, environmentName] of Object.entries(secretRefs)) {
+    const validTarget =
+      transport === "stdio"
+        ? target.startsWith("env.") || !target.includes(".")
+        : target.startsWith("headers.") || !target.includes(".");
+    if (!validTarget)
+      throw new ValidationError(
+        `invalid MCP secret target ${target} for ${transport}`,
+      );
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(environmentName))
+      throw new ValidationError(
+        `MCP secret ref ${target} must name an environment variable`,
+      );
+  }
+  return {
+    slug,
+    name,
+    status,
+    data: {
+      transport,
+      endpoint_config: endpoint,
+      secret_refs: secretRefs,
+      policy: normalizePolicy(spec.policy, "MCP policy", current?.policy),
+    } satisfies McpServerData,
+  };
+}
+
+function mergePolicy(base: McpPolicy, override: unknown): McpPolicy {
+  if (override === undefined) return base;
+  const narrowed = normalizePolicy(override, "MCP policy_override", base);
+  const allowed =
+    base.allowed_tools === undefined
+      ? narrowed.allowed_tools
+      : narrowed.allowed_tools === undefined
+        ? base.allowed_tools
+        : base.allowed_tools.filter((name) =>
+            narrowed.allowed_tools!.includes(name),
+          );
+  const rank = { never: 0, selected: 1, always: 2 } as const;
+  let approval: McpApprovalPolicy;
+  if (base.approval.mode === "always" || narrowed.approval.mode === "always")
+    approval = { mode: "always", tools: [] };
+  else {
+    const tools = [
+      ...(base.approval.mode === "selected" ? base.approval.tools : []),
+      ...(narrowed.approval.mode === "selected" ? narrowed.approval.tools : []),
+    ];
+    approval = tools.length
+      ? { mode: "selected", tools: [...new Set(tools)] }
+      : { mode: "never", tools: [] };
+    if (rank[narrowed.approval.mode] < rank[base.approval.mode])
+      approval = base.approval;
+  }
+  return {
+    ...(allowed === undefined ? {} : { allowed_tools: allowed }),
+    approval,
+    side_effecting_tools: [
+      ...new Set([
+        ...base.side_effecting_tools,
+        ...narrowed.side_effecting_tools,
+      ]),
+    ],
+    connect_timeout_ms: Math.min(
+      base.connect_timeout_ms,
+      narrowed.connect_timeout_ms,
+    ),
+    call_timeout_ms: Math.min(base.call_timeout_ms, narrowed.call_timeout_ms),
+    max_output_bytes: Math.min(
+      base.max_output_bytes,
+      narrowed.max_output_bytes,
+    ),
+  };
+}
+
+function approvalRequired(policy: McpPolicy, toolName: string): boolean {
+  return (
+    policy.side_effecting_tools.includes(toolName) ||
+    policy.approval.mode === "always" ||
+    (policy.approval.mode === "selected" &&
+      policy.approval.tools.includes(toolName))
+  );
+}
+
+function validateTool(raw: McpTool): McpTool {
+  if (!TOOL_NAME.test(String(raw.name)))
+    throw new ValidationError(
+      `MCP tool name is not OpenAI-compatible: ${String(raw.name)}`,
+    );
+  const schema = asRecord(raw.inputSchema ?? {}, `MCP tool ${raw.name} schema`);
+  if (schema.type !== undefined && schema.type !== "object")
+    throw new ValidationError(`MCP tool ${raw.name} schema must be an object`);
+  if (
+    schema.properties !== undefined &&
+    (!schema.properties ||
+      typeof schema.properties !== "object" ||
+      Array.isArray(schema.properties))
+  )
+    throw new ValidationError(
+      `MCP tool ${raw.name} schema.properties must be an object`,
+    );
+  return {
+    name: String(raw.name),
+    ...(raw.description ? { description: String(raw.description) } : {}),
+    inputSchema: {
+      ...schema,
+      type: "object",
+      properties: (schema.properties ?? {}) as Record<string, unknown>,
+      required: Array.isArray(schema.required)
+        ? schema.required.map(String)
+        : [],
+      ...(typeof schema.additionalProperties === "boolean"
+        ? { additionalProperties: schema.additionalProperties }
+        : {}),
+    },
+  } as McpTool;
+}
+
+const referenceId = (reference: unknown): string =>
+  typeof reference === "string"
+    ? reference
+    : String(
+        (reference as McpReference).server_id ??
+          (reference as McpReference).id ??
+          (reference as McpReference).slug ??
+          "",
+      );
+
+const referenceOverride = (reference: unknown): unknown =>
+  typeof reference === "string"
+    ? undefined
+    : (reference as McpReference).policy_override;
+
+class McpCallTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`MCP tool call timed out after ${timeoutMs}ms`);
+    this.name = "McpCallTimeoutError";
+  }
+}
+
+class McpOutputTooLargeError extends Error {
+  constructor(
+    readonly size: number,
+    readonly limit: number,
+    readonly sha256: string,
+  ) {
+    super(`MCP tool output is ${size} bytes; limit is ${limit} bytes`);
+    this.name = "McpOutputTooLargeError";
+  }
+}
+
+function serializedOutput(output: unknown) {
+  const serialized = canonicalJson(output ?? null);
+  return {
+    serialized,
+    size: Buffer.byteLength(serialized, "utf8"),
+    sha256: createHash("sha256").update(serialized).digest("hex"),
+  };
+}
+
+function redact(value: unknown, secrets: string[]) {
+  let message = value instanceof Error ? value.message : String(value);
+  for (const secret of secrets)
+    if (secret) message = message.split(secret).join("[REDACTED]");
+  return message.slice(0, 4_000);
+}
+
+async function timed<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  parent?: AbortSignal,
+): Promise<T> {
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(new McpCallTimeoutError(timeoutMs)),
+    timeoutMs,
+  );
+  const signal = parent
+    ? AbortSignal.any([parent, controller.signal])
+    : controller.signal;
+  try {
+    return await operation(signal);
+  } catch (error) {
+    if (controller.signal.aborted)
+      throw controller.signal.reason instanceof Error
+        ? controller.signal.reason
+        : new McpCallTimeoutError(timeoutMs);
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export class McpService {
+  private readonly store: ResourceStore;
+  constructor(
+    private readonly db: Database,
+    private readonly faults: FaultInjector,
+  ) {
+    this.store = new ResourceStore(db);
+  }
+
+  async create(input: Record<string, unknown>) {
+    const normalized = normalizeInput(input);
+    return this.store.create<McpServerData>({
+      kind: "mcp_server",
+      slug: normalized.slug,
+      name: normalized.name,
+      status: normalized.status,
+      data: normalized.data,
+    });
+  }
+
+  async list() {
+    return this.store.list<McpServerData>("mcp_server");
+  }
+
+  async page(options: PageOptions & { status?: string } = {}) {
+    return this.store.page<McpServerData>("mcp_server", options);
+  }
+
+  async get(id: string) {
+    let direct;
+    try {
+      direct = await this.store.get<McpServerData>("mcp_server", id);
+    } catch (error) {
+      if (!(error instanceof NotFoundError)) throw error;
+      direct = await this.store.findBySlug<McpServerData>("mcp_server", id);
+    }
+    if (!direct) throw new ValidationError(`MCP server not found: ${id}`);
+    return direct;
+  }
+
+  async update(id: string, input: Record<string, unknown>) {
+    const current = await this.get(id);
+    const normalized = normalizeInput(input, current);
+    return this.store.update<McpServerData>("mcp_server", current.id, {
+      slug: normalized.slug,
+      name: normalized.name,
+      status: normalized.status,
+      data: normalized.data,
+    });
+  }
+
+  async delete(id: string) {
+    const current = await this.get(id);
+    await this.store.delete("mcp_server", current.id);
+  }
+
+  private async server(record: Resource<McpServerData> & McpServerData) {
+    const endpoint = record.endpoint_config;
+    const resolved: Record<string, string> = {};
+    const secretValues: string[] = [];
+    for (const [target, environmentName] of Object.entries(
+      record.secret_refs,
+    )) {
+      const value = process.env[environmentName];
+      if (!value)
+        throw new ValidationError(
+          `MCP secret environment variable is missing: ${environmentName}`,
+        );
+      resolved[target] = value;
+      secretValues.push(value);
+    }
+    if (record.transport === "stdio") {
+      const secrets = Object.fromEntries(
+        Object.entries(resolved).map(([target, value]) => [
+          target.startsWith("env.") ? target.slice(4) : target,
+          value,
+        ]),
+      );
+      return {
+        server: new MCPServerStdio({
+          name: String(record.name),
+          command: String(endpoint.command),
+          args: Array.isArray(endpoint.args) ? endpoint.args.map(String) : [],
+          cwd: endpoint.cwd ? String(endpoint.cwd) : undefined,
+          env: {
+            PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+            LANG: process.env.LANG ?? "C.UTF-8",
+            ...stringRecord(endpoint.env, "MCP endpoint.env"),
+            ...secrets,
+          },
+          cacheToolsList: true,
+          clientSessionTimeoutSeconds: Math.ceil(
+            record.policy.call_timeout_ms / 1000,
+          ),
+          errorFunction: null,
+        }),
+        secretValues,
+      };
+    }
+    const secrets = Object.fromEntries(
+      Object.entries(resolved).map(([target, value]) => [
+        target.startsWith("headers.") ? target.slice(8) : target,
+        value,
+      ]),
+    );
+    const options = {
+      name: String(record.name),
+      url: String(endpoint.url),
+      requestInit: {
+        headers: {
+          ...stringRecord(endpoint.headers, "MCP endpoint.headers"),
+          ...secrets,
+        },
+      },
+      cacheToolsList: true,
+      clientSessionTimeoutSeconds: Math.ceil(
+        record.policy.call_timeout_ms / 1000,
+      ),
+      errorFunction: null,
+    };
+    return {
+      server:
+        record.transport === "sse"
+          ? new MCPServerSSE(options)
+          : new MCPServerStreamableHttp(options),
+      secretValues,
+    };
+  }
+
+  private async connected(record: Resource<McpServerData> & McpServerData) {
+    const built = await this.server(record);
+    try {
+      await timed(async () => {
+        await built.server.connect();
+      }, record.policy.connect_timeout_ms);
+      return built;
+    } catch (error) {
+      await built.server.close().catch(() => undefined);
+      throw new ValidationError(redact(error, built.secretValues));
+    }
+  }
+
+  private effectiveTools(tools: McpTool[], policy: McpPolicy) {
+    const discovered: McpTool[] = [];
+    const blocked: Array<{ name: string; reason: string }> = [];
+    const names = new Set<string>();
+    for (const raw of tools) {
+      try {
+        const tool = validateTool(raw);
+        if (names.has(tool.name))
+          throw new ValidationError(`duplicate MCP tool name: ${tool.name}`);
+        names.add(tool.name);
+        discovered.push(tool);
+      } catch (error) {
+        blocked.push({ name: String(raw.name), reason: String(error) });
+      }
+    }
+    const effective = discovered.filter((tool) => {
+      const allowed =
+        policy.allowed_tools === undefined ||
+        policy.allowed_tools.includes(tool.name);
+      if (!allowed) blocked.push({ name: tool.name, reason: "not allowed" });
+      return allowed;
+    });
+    return { discovered, effective, blocked };
+  }
+
+  async health(id: string) {
+    const record = await this.get(id);
+    const built = await this.connected(record);
+    try {
+      const listed = await timed(
+        () => built.server.listTools(),
+        record.policy.connect_timeout_ms,
+      );
+      const tools = this.effectiveTools(listed, record.policy);
+      return {
+        status: tools.blocked.some((item) => item.reason !== "not allowed")
+          ? "degraded"
+          : "ok",
+        server_id: record.id,
+        server_slug: record.slug,
+        transport: record.transport,
+        fingerprint: hashJson({
+          tools: tools.effective,
+          policy: record.policy,
+        }),
+        discovered_tool_count: tools.discovered.length,
+        effective_tool_count: tools.effective.length,
+        tools: tools.effective.map((tool) => tool.name),
+        discovered_tools: tools.discovered,
+        effective_tools: tools.effective,
+        blocked_tools: tools.blocked,
+      };
+    } catch (error) {
+      throw new ValidationError(redact(error, built.secretValues));
+    } finally {
+      await built.server.close().catch(() => undefined);
+    }
+  }
+
+  async inspectTools(id: string) {
+    const health = await this.health(id);
+    return {
+      server_id: health.server_id,
+      fingerprint: health.fingerprint,
+      data: health.effective_tools,
+      blocked: health.blocked_tools,
+    };
+  }
+
+  private async binding(
+    runId: string,
+    record: Resource<McpServerData> & McpServerData,
+    server: MCPServer,
+    policy: McpPolicy,
+  ): Promise<{ tools: McpTool[]; policy: McpPolicy; fingerprint: string }> {
+    const existing = (
+      await this.db.query<{
+        tools_json: McpTool[];
+        policy_json: McpPolicy;
+        fingerprint: string;
+      }>(
+        "SELECT tools_json,policy_json,fingerprint FROM mcp_run_bindings WHERE run_id=$1 AND server_id=$2",
+        [runId, record.id],
+      )
+    ).rows[0];
+    if (existing)
+      return {
+        tools: existing.tools_json.map(validateTool),
+        policy: normalizePolicy(existing.policy_json),
+        fingerprint: existing.fingerprint,
+      };
+    const listed = await timed(
+      () => server.listTools(),
+      policy.connect_timeout_ms,
+    );
+    const effective = this.effectiveTools(listed, policy);
+    if (effective.blocked.some((item) => item.reason !== "not allowed"))
+      throw new ValidationError(
+        `MCP server ${record.slug} exposes invalid tools: ${effective.blocked
+          .filter((item) => item.reason !== "not allowed")
+          .map((item) => `${item.name}: ${item.reason}`)
+          .join("; ")}`,
+      );
+    const fingerprint = hashJson({ tools: effective.effective, policy });
+    await this.db.query(
+      `INSERT INTO mcp_run_bindings(run_id,server_id,server_slug,fingerprint,tools_json,policy_json)
+       VALUES($1,$2,$3,$4,$5::jsonb,$6::jsonb)
+       ON CONFLICT(run_id,server_id) DO NOTHING`,
+      [
+        runId,
+        record.id,
+        record.slug,
+        fingerprint,
+        JSON.stringify(effective.effective),
+        JSON.stringify(policy),
+      ],
+    );
+    const persisted = await required<{
+      tools_json: McpTool[];
+      policy_json: McpPolicy;
+      fingerprint: string;
+    }>(
+      this.db,
+      "SELECT tools_json,policy_json,fingerprint FROM mcp_run_bindings WHERE run_id=$1 AND server_id=$2",
+      [runId, record.id],
+    );
+    return {
+      tools: persisted.tools_json.map(validateTool),
+      policy: normalizePolicy(persisted.policy_json),
+      fingerprint: persisted.fingerprint,
+    };
+  }
+
+  private wrappedTool(
+    record: Resource<McpServerData> & McpServerData,
+    server: MCPServer,
+    secrets: string[],
+    definition: McpTool,
+    policy: McpPolicy,
+  ): FunctionTool<RuntimeContext, any, any> {
+    const base = mcpToFunctionTool(definition, server, false, {
+      errorFunction: null,
+    }) as FunctionTool<RuntimeContext, any, any>;
+    const sideEffecting = policy.side_effecting_tools.includes(definition.name);
+    const invoke = async (
+      runContext: RunContext<RuntimeContext>,
+      input: string,
+      details?: McpToolCallDetails,
+    ) => {
+      if (
+        policy.allowed_tools !== undefined &&
+        !policy.allowed_tools.includes(definition.name)
+      )
+        throw new ValidationError(
+          `MCP tool is blocked by policy: ${definition.name}`,
+        );
+      let args: unknown = input;
+      try {
+        args = JSON.parse(input);
+      } catch {
+        // The SDK performs input validation; preserve the exact raw input for hashing.
+      }
+      const call = details?.toolCall as Record<string, unknown> | undefined;
+      const callId = String(call?.callId ?? call?.call_id ?? newId());
+      const idempotencyKey = hashJson({
+        run_id: runContext.context.run_id,
+        call_id: callId,
+        server_id: record.id,
+        tool: definition.name,
+      });
+      const existing = (
+        await this.db.query<Record<string, unknown>>(
+          "SELECT * FROM tool_executions WHERE idempotency_key=$1",
+          [idempotencyKey],
+        )
+      ).rows[0];
+      if (existing?.status === "completed") return existing.output_json;
+      if (
+        existing &&
+        (["running", "unknown"].includes(String(existing.status)) ||
+          (sideEffecting &&
+            existing.status === "failed" &&
+            !existing.resolution_reason))
+      )
+        throw new ConflictError("MCP tool execution outcome is unresolved");
+      const executionId = String(existing?.id ?? newId());
+      if (existing) {
+        await this.db.query(
+          "UPDATE tool_executions SET status='running',attempt_count=attempt_count+1,error_json=NULL,lease_expires_at=now()+($2 || ' milliseconds')::interval,updated_at=now() WHERE id=$1",
+          [executionId, policy.call_timeout_ms + 5_000],
+        );
+      } else {
+        await this.db.query(
+          `INSERT INTO tool_executions(
+             id,run_id,tool_call_id,tool_name,implementation_key,idempotency_key,arguments_hash,
+             lease_expires_at,source_type,source_id,side_effecting)
+           VALUES($1,$2,$3,$4,$5,$6,$7,now()+($8 || ' milliseconds')::interval,'mcp',$9,$10)`,
+          [
+            executionId,
+            runContext.context.run_id,
+            callId,
+            definition.name,
+            `mcp.${record.slug}.${definition.name}`,
+            idempotencyKey,
+            hashJson(args),
+            policy.call_timeout_ms + 5_000,
+            record.id,
+            sideEffecting,
+          ],
+        );
+      }
+      let returned = false;
+      try {
+        const output = await timed(
+          (signal) =>
+            base.invoke(runContext, input, {
+              ...details,
+              signal,
+            } as NonNullable<McpToolCallDetails>),
+          policy.call_timeout_ms,
+          details?.signal,
+        );
+        returned = true;
+        const measured = serializedOutput(output);
+        if (measured.size > policy.max_output_bytes)
+          throw new McpOutputTooLargeError(
+            measured.size,
+            policy.max_output_bytes,
+            measured.sha256,
+          );
+        await this.faults.hit("tool.after_effect_before_commit", {
+          run_id: runContext.context.run_id,
+          execution_id: executionId,
+          tool_name: definition.name,
+          side_effecting: sideEffecting,
+          source: "mcp",
+        });
+        await this.db.query(
+          `UPDATE tool_executions SET status='completed',output_json=$2::jsonb,
+           output_size=$3,output_sha256=$4,completed_at=now(),lease_expires_at=NULL,updated_at=now()
+           WHERE id=$1`,
+          [
+            executionId,
+            JSON.stringify(output ?? null),
+            measured.size,
+            measured.sha256,
+          ],
+        );
+        return output;
+      } catch (error) {
+        const oversized = error instanceof McpOutputTooLargeError;
+        const status = sideEffecting ? "unknown" : "failed";
+        await this.db
+          .query(
+            `UPDATE tool_executions SET status=$2,error_json=$3::jsonb,
+             output_size=$4,output_sha256=$5,completed_at=now(),lease_expires_at=NULL,updated_at=now()
+             WHERE id=$1`,
+            [
+              executionId,
+              status,
+              JSON.stringify({
+                code: error instanceof Error ? error.name : "Error",
+                message: redact(error, secrets),
+                ...(oversized
+                  ? { limit: error.limit, actual: error.size }
+                  : {}),
+                ...(returned ? { provider_returned: true } : {}),
+              }),
+              oversized ? error.size : null,
+              oversized ? error.sha256 : null,
+            ],
+          )
+          .catch(() => undefined);
+        throw error;
+      }
+    };
+    return {
+      ...base,
+      invoke,
+      needsApproval: async () => approvalRequired(policy, definition.name),
+      timeoutMs: policy.call_timeout_ms + 1_000,
+      timeoutBehavior: "raise_exception",
+      isEnabled: async () => true,
+    };
+  }
+
+  async toolsForRun(
+    references: unknown[],
+    context: RuntimeContext,
+    reservedNames: Set<string>,
+  ): Promise<McpBuiltTools> {
+    const opened: MCPServer[] = [];
+    const tools: FunctionTool<RuntimeContext, any, any>[] = [];
+    const names = new Set(reservedNames);
+    try {
+      for (const reference of references) {
+        const id = referenceId(reference);
+        if (!id) throw new ValidationError("MCP server reference is required");
+        const record = await this.get(id);
+        if (record.status !== "active")
+          throw new ValidationError(`MCP server is not active: ${id}`);
+        const policy = mergePolicy(
+          normalizePolicy(record.policy),
+          referenceOverride(reference),
+        );
+        const built = await this.connected({ ...record, policy });
+        opened.push(built.server);
+        const binding = await this.binding(
+          context.run_id,
+          record,
+          built.server,
+          policy,
+        );
+        for (const definition of binding.tools) {
+          if (names.has(definition.name))
+            throw new ValidationError(
+              `tool name collision while attaching MCP server ${record.slug}: ${definition.name}`,
+            );
+          names.add(definition.name);
+          tools.push(
+            this.wrappedTool(
+              record,
+              built.server,
+              built.secretValues,
+              definition,
+              binding.policy,
+            ),
+          );
+        }
+      }
+      return {
+        tools,
+        close: async () => {
+          await Promise.allSettled(opened.map((server) => server.close()));
+        },
+      };
+    } catch (error) {
+      await Promise.allSettled(opened.map((server) => server.close()));
+      throw error;
+    }
+  }
+
+  async testCall(id: string, toolName: string, args: Record<string, unknown>) {
+    const record = await this.get(id);
+    const policy = normalizePolicy(record.policy);
+    if (
+      policy.allowed_tools !== undefined &&
+      !policy.allowed_tools.includes(toolName)
+    )
+      throw new ValidationError(`MCP tool is blocked by policy: ${toolName}`);
+    if (
+      approvalRequired(policy, toolName) ||
+      policy.side_effecting_tools.includes(toolName)
+    )
+      throw new ValidationError(
+        "approval-required or side-effecting MCP tools must be invoked through an Agent Run",
+      );
+    const built = await this.connected(record);
+    try {
+      const listed = this.effectiveTools(
+        await timed(() => built.server.listTools(), policy.connect_timeout_ms),
+        policy,
+      );
+      const definition = listed.effective.find(
+        (tool) => tool.name === toolName,
+      );
+      if (!definition)
+        throw new ValidationError(
+          `MCP tool not found or not allowed: ${toolName}`,
+        );
+      const output = await timed(
+        (signal) => built.server.callTool(toolName, args, null, { signal }),
+        policy.call_timeout_ms,
+      );
+      const measured = serializedOutput(output);
+      if (measured.size > policy.max_output_bytes)
+        throw new McpOutputTooLargeError(
+          measured.size,
+          policy.max_output_bytes,
+          measured.sha256,
+        );
+      return {
+        output,
+        output_size: measured.size,
+        output_sha256: measured.sha256,
+      };
+    } catch (error) {
+      throw new ValidationError(redact(error, built.secretValues));
+    } finally {
+      await built.server.close().catch(() => undefined);
+    }
+  }
+}
+
+export const MCP_DEFAULTS = {
+  connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
+  call_timeout_ms: DEFAULT_CALL_TIMEOUT_MS,
+  max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+} as const;

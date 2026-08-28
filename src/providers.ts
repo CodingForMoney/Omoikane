@@ -4,35 +4,34 @@ import { aisdk } from "@openai/agents-extensions/ai-sdk";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import type { Model } from "@openai/agents";
-import type { Database } from "./database.js";
-import { StateCipher, checksum } from "./crypto.js";
-import { ConflictError, ValidationError } from "./database.js";
+import type { Database, SqlExecutor } from "./database.js";
+import { CredentialCipher } from "./crypto.js";
+import { ValidationError } from "./database.js";
+import {
+  ModelCapabilityOverrideSchema,
+  ModelCapabilitySchema,
+  ProviderSettingsSchema,
+  mergeModelCapabilities,
+  type ContextCompactionCapability,
+  type ModelCapability,
+  type ReasoningCapability,
+} from "./provider-capabilities.js";
 import { ResourceStore, type Resource } from "./resources.js";
+import { hashJson } from "./serialization.js";
+import type { PageOptions } from "./pagination.js";
 
 export type ProviderProtocol =
   "responses" | "chat_completions" | "anthropic" | "google_gemini";
-export interface ReasoningCapability {
-  supported: boolean;
-  effort_values: string[];
-  adapter?: "reasoning_effort";
-  value_map?: Record<string, string>;
-}
-export interface ModelCapability {
-  streaming: boolean;
-  tools: boolean;
-  vision: boolean;
-  structured_output: "native" | "prompt";
-  context_window?: number;
-  max_input_tokens?: number;
-  max_output_tokens?: number;
-  context_window_type: "total" | "input";
-  capability_source: "catalog" | "remote" | "user";
-  reasoning: ReasoningCapability;
-}
+export type {
+  ContextCompactionCapability,
+  ModelCapability,
+  ReasoningCapability,
+} from "./provider-capabilities.js";
 export interface ProviderModelDefinition {
   id: string;
   display_name: string;
   capabilities: ModelCapability;
+  capability_reviewed_at: string;
 }
 export interface ProviderDefinition {
   id: string;
@@ -47,9 +46,128 @@ export interface ProviderDefinition {
   models: ProviderModelDefinition[];
 }
 
+type ModelDiscoveryStatus = "succeeded" | "empty" | "unsupported" | "failed";
+interface ModelDiscoveryState {
+  status: ModelDiscoveryStatus;
+  source: "remote" | "catalog_fallback" | "none";
+  remote_model_count: number;
+  effective_model_count: number;
+  attempted_at: string;
+}
+interface ProviderOperationError {
+  category:
+    | "authentication"
+    | "rate_limit"
+    | "endpoint_unsupported"
+    | "provider_unavailable"
+    | "network"
+    | "invalid_response"
+    | "configuration"
+    | "unknown";
+  operation: "model_discovery";
+  retryable: boolean;
+  observed_at: string;
+  http_status?: number;
+  message: string;
+}
+
+const CATALOG_REVIEWED_AT = "2026-08-28";
+const DEFAULT_DISCOVERY_TIMEOUT_MS = 15_000;
+const DEFAULT_DISCOVERY_MAX_RETRIES = 2;
+const MAX_DISCOVERY_PAGES = 100;
+const PROVIDER_PROTOCOLS = new Set<ProviderProtocol>([
+  "responses",
+  "chat_completions",
+  "anthropic",
+  "google_gemini",
+]);
+
+class ProviderDiscoveryError extends Error {
+  constructor(
+    message: string,
+    readonly category: ProviderOperationError["category"],
+    readonly statusCode?: number,
+    readonly retryable = false,
+    readonly retryAfterMs?: number,
+  ) {
+    super(message);
+    this.name = "ProviderDiscoveryError";
+  }
+}
+
+function validatedProviderSettings(value: unknown): Record<string, unknown> {
+  const result = ProviderSettingsSchema.safeParse(value ?? {});
+  if (!result.success)
+    throw new ValidationError(
+      `invalid Provider settings: ${result.error.issues[0]?.message ?? "invalid value"}`,
+    );
+  return result.data;
+}
+
+function validatedCapabilityOverride(value: unknown): Record<string, unknown> {
+  const result = ModelCapabilityOverrideSchema.safeParse(value ?? {});
+  if (!result.success)
+    throw new ValidationError(
+      `invalid model capabilities: ${result.error.issues[0]?.message ?? "invalid value"}`,
+    );
+  return result.data;
+}
+
+function validatedCapabilityMerge(
+  base: ModelCapability,
+  override: Record<string, unknown>,
+): ModelCapability {
+  try {
+    return mergeModelCapabilities(base, override);
+  } catch (error) {
+    const issues =
+      error && typeof error === "object" && "issues" in error
+        ? (error as { issues?: Array<{ message?: string }> }).issues
+        : undefined;
+    throw new ValidationError(
+      `invalid model capabilities: ${issues?.[0]?.message ?? "invalid effective capability"}`,
+    );
+  }
+}
+
+function validatedBaseUrl(value: unknown): string {
+  try {
+    const url = new URL(String(value));
+    if (
+      !["http:", "https:"].includes(url.protocol) ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash
+    )
+      throw new Error("unsupported URL");
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    throw new ValidationError(
+      "custom_base_url must be an HTTP(S) URL without credentials, query, or fragment",
+    );
+  }
+}
+
+function validatedProtocol(value: unknown): ProviderProtocol {
+  const protocol = String(value) as ProviderProtocol;
+  if (!PROVIDER_PROTOCOLS.has(protocol))
+    throw new ValidationError(
+      `unsupported Provider protocol: ${String(value)}`,
+    );
+  return protocol;
+}
+
 const noReasoning = (): ReasoningCapability => ({
   supported: false,
   effort_values: [],
+});
+const noContextCompaction = (): ContextCompactionCapability => ({
+  supported: false,
+});
+const responsesCompaction = (): ContextCompactionCapability => ({
+  supported: true,
+  method: "responses_compact",
 });
 const standard = (
   effort_values = ["none", "low", "medium", "high", "xhigh"],
@@ -62,10 +180,8 @@ const model = (
   id: string,
   context_window?: number,
   options: Partial<ModelCapability> = {},
-): ProviderModelDefinition => ({
-  id,
-  display_name: id,
-  capabilities: {
+): ProviderModelDefinition => {
+  const capabilities = ModelCapabilitySchema.parse({
     streaming: true,
     tools: true,
     vision: false,
@@ -73,10 +189,30 @@ const model = (
     context_window,
     context_window_type: "total",
     capability_source: "catalog",
+    capability_status: "catalog",
     reasoning: noReasoning(),
+    context_compaction: noContextCompaction(),
     ...options,
-  },
-});
+  });
+  return {
+    id,
+    display_name: id,
+    capabilities,
+    capability_reviewed_at: CATALOG_REVIEWED_AT,
+  };
+};
+const unknownModelCapabilities = (): ModelCapability =>
+  ModelCapabilitySchema.parse({
+    streaming: false,
+    tools: false,
+    vision: false,
+    structured_output: "prompt",
+    context_window_type: "total",
+    capability_source: "remote",
+    capability_status: "unknown",
+    reasoning: noReasoning(),
+    context_compaction: noContextCompaction(),
+  });
 const provider = (
   id: string,
   name: string,
@@ -112,6 +248,7 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
             max_output_tokens: 128_000,
             vision: true,
             structured_output: "native",
+            context_compaction: responsesCompaction(),
             reasoning: standard([
               "none",
               "low",
@@ -125,6 +262,7 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
             max_output_tokens: 128_000,
             vision: true,
             structured_output: "native",
+            context_compaction: responsesCompaction(),
             reasoning: standard([
               "none",
               "low",
@@ -138,6 +276,7 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
             max_output_tokens: 128_000,
             vision: true,
             structured_output: "native",
+            context_compaction: responsesCompaction(),
             reasoning: standard([
               "none",
               "low",
@@ -151,12 +290,14 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
             max_output_tokens: 128_000,
             vision: true,
             structured_output: "native",
+            context_compaction: responsesCompaction(),
             reasoning: standard(),
           }),
           model("gpt-5.4-mini", 400_000, {
             max_output_tokens: 128_000,
             vision: true,
             structured_output: "native",
+            context_compaction: responsesCompaction(),
             reasoning: standard(),
           }),
         ],
@@ -172,6 +313,7 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
             max_output_tokens: 128_000,
             vision: true,
             structured_output: "native",
+            context_compaction: responsesCompaction(),
             reasoning: standard([
               "none",
               "low",
@@ -185,6 +327,7 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
             max_output_tokens: 128_000,
             vision: true,
             structured_output: "native",
+            context_compaction: responsesCompaction(),
             reasoning: standard([
               "none",
               "low",
@@ -571,19 +714,47 @@ export interface ConnectionData extends Record<string, unknown> {
   key_hint?: string;
   last_validated_at?: string;
   last_error?: string;
+  last_error_details?: ProviderOperationError;
+  model_discovery?: ModelDiscoveryState;
   settings: Record<string, unknown>;
   default_model?: string;
+  default_model_status?: "available" | "unavailable" | "unset";
+}
+
+interface ProviderModelData extends Record<string, unknown> {
+  model_id: string;
+  display_name: string;
+  source: string;
+  capabilities: ModelCapability;
+  catalog_capabilities?: ModelCapability;
+  user_capability_overrides?: Record<string, unknown>;
+  manually_added?: boolean;
+  last_seen_at?: string;
+  last_sync_at?: string;
+  remote_presence?: "visible" | "not_listed" | "unknown";
+  capability_provenance: {
+    source: "catalog" | "conservative_unknown" | "user";
+    catalog_reviewed_at?: string;
+    remote_model_id_seen_at?: string;
+    user_overridden_at?: string;
+  };
+}
+
+interface DiscoveryResult {
+  ids: string[];
+  status: "succeeded" | "empty";
+  attemptedAt: string;
 }
 
 export class ProviderService {
   private readonly store: ResourceStore;
-  private readonly cipher: StateCipher;
+  private readonly cipher: CredentialCipher;
   constructor(
     private readonly db: Database,
     secret: string,
   ) {
     this.store = new ResourceStore(db);
-    this.cipher = new StateCipher(secret);
+    this.cipher = new CredentialCipher(secret);
   }
 
   catalog(): ProviderDefinition[] {
@@ -599,7 +770,6 @@ export class ProviderService {
   }
 
   async create(
-    tenantId: string,
     input: Record<string, unknown>,
   ): Promise<Resource<ConnectionData> & ConnectionData> {
     const definition = this.definition(String(input.provider));
@@ -608,19 +778,32 @@ export class ProviderService {
     );
     const profile = definition.profiles[endpointProfile];
     const custom = definition.id === "custom_openai_compatible";
-    const baseUrl = String(
-      input.custom_base_url ?? profile?.base_url ?? "",
-    ).replace(/\/$/, "");
-    const protocol = (input.custom_protocol ?? profile?.protocol) as
-      ProviderProtocol | undefined;
-    if (!baseUrl || !protocol)
+    if (!custom && (input.custom_base_url || input.custom_protocol))
+      throw new ValidationError(
+        "custom_base_url and custom_protocol are only valid for custom_openai_compatible",
+      );
+    if (!custom && !profile)
+      throw new ValidationError(
+        `unknown endpoint profile ${endpointProfile} for provider ${definition.id}`,
+      );
+    if (custom && (!input.custom_base_url || !input.custom_protocol))
       throw new ValidationError(
         "custom_base_url and custom_protocol are required",
       );
+    const baseUrl = custom
+      ? validatedBaseUrl(input.custom_base_url)
+      : profile!.base_url;
+    const protocol = custom
+      ? validatedProtocol(input.custom_protocol)
+      : profile!.protocol;
     const apiKey = input.api_key ? String(input.api_key) : undefined;
     const apiKeyEnv = input.api_key_env ? String(input.api_key_env) : undefined;
     if (!apiKey && !apiKeyEnv)
       throw new ValidationError("api_key or api_key_env is required");
+    if (apiKey && apiKeyEnv)
+      throw new ValidationError(
+        "api_key and api_key_env are mutually exclusive",
+      );
     const encrypted = apiKey ? this.cipher.encrypt(apiKey) : undefined;
     const data: ConnectionData = {
       provider: definition.id,
@@ -633,10 +816,10 @@ export class ProviderService {
       key_hint: apiKey
         ? `${apiKey.slice(0, 3)}…${apiKey.slice(-4)}`
         : undefined,
-      settings: (input.settings as Record<string, unknown>) ?? {},
+      settings: validatedProviderSettings(input.settings),
+      default_model_status: "unset",
     };
     return this.store.create({
-      tenantId,
       kind: "provider_connection",
       name: String(input.name),
       data,
@@ -644,30 +827,74 @@ export class ProviderService {
     });
   }
 
-  async list(tenantId: string) {
-    return this.store.list<ConnectionData>(tenantId, "provider_connection");
+  async list() {
+    return this.store.list<ConnectionData>("provider_connection");
   }
-  async get(tenantId: string, id: string) {
-    return this.store.get<ConnectionData>(tenantId, "provider_connection", id);
+  async page(options: PageOptions & { status?: string } = {}) {
+    return this.store.page<ConnectionData>("provider_connection", options);
+  }
+  async get(id: string) {
+    return this.store.get<ConnectionData>("provider_connection", id);
   }
 
-  async update(tenantId: string, id: string, input: Record<string, unknown>) {
-    const current = await this.get(tenantId, id);
+  async verifyStoredCredentialEncryption(): Promise<number> {
+    const connections = (
+      await this.db.query<{ id: string; data: ConnectionData }>(
+        "SELECT id,data FROM resources WHERE kind='provider_connection'",
+      )
+    ).rows.map((row) => ({ id: row.id, ...row.data }));
+    let verified = 0;
+    for (const connection of connections) {
+      const hasCiphertext = Boolean(connection.api_key_ciphertext);
+      const hasChecksum = Boolean(connection.api_key_checksum);
+      if (hasCiphertext !== hasChecksum)
+        throw new ValidationError(
+          `provider ${connection.id} has an incomplete encrypted credential`,
+        );
+      if (!hasCiphertext) continue;
+      this.cipher.decrypt(
+        Buffer.from(connection.api_key_ciphertext!, "base64"),
+        connection.api_key_checksum!,
+      );
+      verified += 1;
+    }
+    return verified;
+  }
+
+  async update(id: string, input: Record<string, unknown>) {
+    const current = await this.get(id);
+    if (input.api_key && input.api_key_env)
+      throw new ValidationError(
+        "api_key and api_key_env are mutually exclusive",
+      );
     const definition = this.definition(current.provider);
     const profileName = String(
       input.endpoint_profile ?? current.endpoint_profile,
     );
     const profile = definition.profiles[profileName];
+    const custom = definition.id === "custom_openai_compatible";
+    if (!custom && (input.custom_base_url || input.custom_protocol))
+      throw new ValidationError(
+        "custom_base_url and custom_protocol are only valid for custom_openai_compatible",
+      );
+    if (custom && input.endpoint_profile)
+      throw new ValidationError(
+        "custom_openai_compatible does not use endpoint profiles",
+      );
+    if (!custom && input.endpoint_profile && !profile)
+      throw new ValidationError(
+        `unknown endpoint profile ${profileName} for provider ${definition.id}`,
+      );
     const patch: Partial<ConnectionData> = {};
     if (input.endpoint_profile) {
       patch.endpoint_profile = profileName;
-      patch.base_url = profile?.base_url;
-      patch.protocol = profile?.protocol;
+      patch.base_url = profile!.base_url;
+      patch.protocol = profile!.protocol;
     }
     if (input.custom_base_url)
-      patch.base_url = String(input.custom_base_url).replace(/\/$/, "");
+      patch.base_url = validatedBaseUrl(input.custom_base_url);
     if (input.custom_protocol)
-      patch.protocol = input.custom_protocol as ProviderProtocol;
+      patch.protocol = validatedProtocol(input.custom_protocol);
     if (input.api_key) {
       const key = String(input.api_key);
       const encrypted = this.cipher.encrypt(key);
@@ -681,22 +908,27 @@ export class ProviderService {
       patch.api_key_ciphertext = undefined;
       patch.api_key_checksum = undefined;
     }
-    if (input.default_model) patch.default_model = String(input.default_model);
-    if (input.settings)
-      patch.settings = {
+    if (input.default_model) {
+      const modelId = String(input.default_model);
+      const active = await this.listModels(id);
+      if (!active.some((item) => item.model_id === modelId))
+        throw new ValidationError(
+          `default model ${modelId} is not active for Provider connection ${id}`,
+        );
+      patch.default_model = modelId;
+      patch.default_model_status = "available";
+    }
+    if (input.settings) {
+      patch.settings = validatedProviderSettings({
         ...current.settings,
         ...(input.settings as Record<string, unknown>),
-      };
-    return this.store.update<ConnectionData>(
-      tenantId,
-      "provider_connection",
-      id,
-      {
-        name: input.name ? String(input.name) : undefined,
-        status: input.status ? String(input.status) : undefined,
-        data: patch,
-      },
-    );
+      });
+    }
+    return this.store.update<ConnectionData>("provider_connection", id, {
+      name: input.name ? String(input.name) : undefined,
+      status: input.status ? String(input.status) : undefined,
+      data: patch,
+    });
   }
 
   private key(connection: ConnectionData): string {
@@ -718,176 +950,747 @@ export class ProviderService {
       .toString();
   }
 
-  async syncModels(
-    tenantId: string,
-    id: string,
-  ): Promise<
-    Array<Resource<Record<string, unknown>> & Record<string, unknown>>
-  > {
-    const connection = await this.get(tenantId, id);
-    const key = this.key(connection);
-    const definition = this.definition(connection.provider);
-    let ids: string[] = [];
-    if (connection.protocol === "anthropic") {
-      const response = await fetch(`${connection.base_url}/models`, {
-        headers: { "x-api-key": key, "anthropic-version": "2023-06-01" },
-      });
-      if (!response.ok)
-        throw new ValidationError(
-          `provider model discovery failed: HTTP ${response.status}`,
-        );
-      const body = (await response.json()) as { data?: Array<{ id: string }> };
-      ids = (body.data ?? []).map((item) => item.id);
-    } else if (connection.protocol === "google_gemini") {
-      const response = await fetch(
-        `${connection.base_url}/models?key=${encodeURIComponent(key)}`,
-      );
-      if (!response.ok)
-        throw new ValidationError(
-          `provider model discovery failed: HTTP ${response.status}`,
-        );
-      const body = (await response.json()) as {
-        models?: Array<{ name: string }>;
-      };
-      ids = (body.models ?? []).map((item) =>
-        item.name.replace(/^models\//, ""),
-      );
-    } else {
-      const client = new OpenAI({ apiKey: key, baseURL: connection.base_url });
-      for await (const item of client.models.list()) ids.push(item.id);
-    }
-    if (!ids.length) ids = definition.models.map((item) => item.id);
-    const existing = await this.store.list<Record<string, unknown>>(
-      tenantId,
-      "provider_model",
-      { parentId: id },
-    );
-    const byModel = new Map(
-      existing.map((item) => [String(item.model_id), item]),
-    );
-    const output = [];
-    for (const modelId of [...new Set(ids)]) {
-      const known = definition.models.find((item) => item.id === modelId);
-      const data = {
-        model_id: modelId,
-        display_name: known?.display_name ?? modelId,
-        source: known ? "catalog+remote" : "remote",
-        capabilities: known?.capabilities ?? model(modelId).capabilities,
-        last_seen_at: new Date().toISOString(),
-      };
-      const current = byModel.get(modelId);
-      output.push(
-        current
-          ? await this.store.update<Record<string, unknown>>(
-              tenantId,
-              "provider_model",
-              current.id,
-              { status: "active", data },
-            )
-          : await this.store.create<Record<string, unknown>>({
-              tenantId,
-              kind: "provider_model",
-              parentId: id,
-              name: modelId,
-              data,
-            }),
-      );
-    }
-    await this.store.update<ConnectionData>(
-      tenantId,
-      "provider_connection",
-      id,
-      {
-        status: "active",
-        data: {
-          last_validated_at: new Date().toISOString(),
-          last_error: undefined,
-          default_model: connection.default_model ?? ids[0],
-        },
-      },
-    );
-    return output;
-  }
-
-  async listModels(tenantId: string, connectionId: string) {
-    const rows = await this.store.list<Record<string, unknown>>(
-      tenantId,
-      "provider_model",
-      { parentId: connectionId, status: "active" },
-    );
-    if (rows.length) return rows;
-    const connection = await this.get(tenantId, connectionId);
-    const definition = this.definition(connection.provider);
-    return Promise.all(
-      definition.models.map((item) =>
-        this.store
-          .create({
-            tenantId,
-            kind: "provider_model",
-            parentId: connectionId,
-            name: item.display_name,
-            data: {
-              model_id: item.id,
-              display_name: item.display_name,
-              source: "catalog",
-              capabilities: item.capabilities,
-            },
-          })
-          .catch(async (error) => {
-            if (error instanceof ConflictError)
-              return (
-                await this.store.list<Record<string, unknown>>(
-                  tenantId,
-                  "provider_model",
-                  { parentId: connectionId },
-                )
-              ).find((candidate) => candidate.model_id === item.id)!;
-            throw error;
-          }),
-      ),
-    );
-  }
-
-  async addModel(
-    tenantId: string,
-    connectionId: string,
-    input: Record<string, unknown>,
-  ) {
-    await this.get(tenantId, connectionId);
-    const modelId = String(input.model_id);
-    const known = this.definition(
-      (await this.get(tenantId, connectionId)).provider,
-    ).models.find((item) => item.id === modelId);
-    return this.store.create({
-      tenantId,
-      kind: "provider_model",
-      parentId: connectionId,
-      name: String(input.display_name ?? modelId),
-      data: {
-        model_id: modelId,
-        display_name: String(input.display_name ?? modelId),
-        source: "user",
-        capabilities: {
-          ...(known?.capabilities ?? model(modelId).capabilities),
-          ...((input.capabilities as object) ?? {}),
-          capability_source: "user",
-        },
-      },
+  compactionIssuerFingerprint(
+    connection: ConnectionData,
+    modelId: string,
+  ): string {
+    return hashJson({
+      provider: connection.provider,
+      protocol: connection.protocol,
+      base_url: connection.base_url,
+      model: modelId,
+      credential: this.cipher.fingerprint(this.key(connection)),
     });
   }
 
-  async validate(tenantId: string, id: string) {
+  async compactResponses(
+    connection: ConnectionData,
+    modelId: string,
+    input: unknown[],
+    options: { instructions?: string; signal?: AbortSignal } = {},
+  ): Promise<Record<string, unknown>> {
+    if (connection.protocol !== "responses")
+      throw new ValidationError(
+        `provider ${connection.provider} does not use the Responses protocol`,
+      );
+    const client = new OpenAI({
+      apiKey: this.key(connection),
+      baseURL: connection.base_url,
+      maxRetries: 0,
+    });
+    return (await client.responses.compact(
+      {
+        model: modelId,
+        input: input as never,
+        ...(options.instructions ? { instructions: options.instructions } : {}),
+      },
+      options.signal ? { signal: options.signal } : undefined,
+    )) as unknown as Record<string, unknown>;
+  }
+
+  private discoveryOptions(connection: ConnectionData) {
+    const settings = validatedProviderSettings(connection.settings);
+    return {
+      timeoutMs: Number(
+        settings.model_discovery_timeout_ms ?? DEFAULT_DISCOVERY_TIMEOUT_MS,
+      ),
+      maxRetries: Number(
+        settings.model_discovery_max_retries ?? DEFAULT_DISCOVERY_MAX_RETRIES,
+      ),
+    };
+  }
+
+  private discoveryError(error: unknown): ProviderDiscoveryError {
+    if (error instanceof ProviderDiscoveryError) return error;
+    const value =
+      error && typeof error === "object"
+        ? (error as Record<string, unknown>)
+        : {};
+    const status = Number(value.status ?? value.statusCode);
+    if (status === 401 || status === 403)
+      return new ProviderDiscoveryError(
+        "Provider rejected the credential during model discovery",
+        "authentication",
+        status,
+      );
+    if (status === 429)
+      return new ProviderDiscoveryError(
+        "Provider rate-limited model discovery",
+        "rate_limit",
+        status,
+        true,
+      );
+    if ([404, 405, 501].includes(status))
+      return new ProviderDiscoveryError(
+        "Provider does not expose a compatible model discovery endpoint",
+        "endpoint_unsupported",
+        status,
+      );
+    if (status >= 500)
+      return new ProviderDiscoveryError(
+        "Provider was unavailable during model discovery",
+        "provider_unavailable",
+        status,
+        [502, 503, 504].includes(status),
+      );
+    const name = error instanceof Error ? error.name : "";
+    if (
+      name === "AbortError" ||
+      name.includes("Timeout") ||
+      name.includes("Connection") ||
+      error instanceof TypeError
+    )
+      return new ProviderDiscoveryError(
+        "Provider model discovery network request failed",
+        "network",
+        undefined,
+        true,
+      );
+    return new ProviderDiscoveryError(
+      "Provider model discovery failed",
+      "unknown",
+    );
+  }
+
+  private operationError(error: unknown): ProviderOperationError {
+    const normalized = this.discoveryError(error);
+    return {
+      category: normalized.category,
+      operation: "model_discovery",
+      retryable: normalized.retryable,
+      observed_at: new Date().toISOString(),
+      ...(normalized.statusCode ? { http_status: normalized.statusCode } : {}),
+      message: normalized.message,
+    };
+  }
+
+  private async fetchDiscoveryJson(
+    url: URL,
+    headers: Record<string, string>,
+    timeoutMs: number,
+  ): Promise<Record<string, unknown>> {
+    let response: Response;
     try {
-      const models = await this.syncModels(tenantId, id);
-      return { valid: true, model_count: models.length, models };
+      response = await fetch(url, {
+        headers,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
     } catch (error) {
+      throw this.discoveryError(error);
+    }
+    if (!response.ok) {
+      const retryAfter = response.headers.get("retry-after");
+      const seconds = retryAfter ? Number(retryAfter) : Number.NaN;
+      const retryAfterMs = Number.isFinite(seconds)
+        ? Math.max(0, seconds * 1_000)
+        : undefined;
+      const category =
+        response.status === 401 || response.status === 403
+          ? "authentication"
+          : response.status === 429
+            ? "rate_limit"
+            : [404, 405, 501].includes(response.status)
+              ? "endpoint_unsupported"
+              : response.status >= 500
+                ? "provider_unavailable"
+                : "unknown";
+      throw new ProviderDiscoveryError(
+        `Provider model discovery failed with HTTP ${response.status}`,
+        category,
+        response.status,
+        response.status === 429 || [502, 503, 504].includes(response.status),
+        retryAfterMs,
+      );
+    }
+    try {
+      const body = await response.json();
+      if (!body || typeof body !== "object" || Array.isArray(body))
+        throw new Error("response is not an object");
+      return body as Record<string, unknown>;
+    } catch {
+      throw new ProviderDiscoveryError(
+        "Provider returned invalid JSON for model discovery",
+        "invalid_response",
+      );
+    }
+  }
+
+  private async discoverModelsOnce(
+    connection: ConnectionData,
+    key: string,
+    timeoutMs: number,
+  ): Promise<string[]> {
+    const ids: string[] = [];
+    if (connection.protocol === "anthropic") {
+      let afterId: string | undefined;
+      for (let page = 0; page < MAX_DISCOVERY_PAGES; page++) {
+        const url = new URL(`${connection.base_url}/models`);
+        url.searchParams.set("limit", "1000");
+        if (afterId) url.searchParams.set("after_id", afterId);
+        const body = await this.fetchDiscoveryJson(
+          url,
+          { "x-api-key": key, "anthropic-version": "2023-06-01" },
+          timeoutMs,
+        );
+        if (!Array.isArray(body.data))
+          throw new ProviderDiscoveryError(
+            "Provider model discovery response is missing data",
+            "invalid_response",
+          );
+        const pageIds = body.data
+          .map((item) =>
+            item && typeof item === "object"
+              ? String((item as Record<string, unknown>).id ?? "")
+              : "",
+          )
+          .filter(Boolean);
+        ids.push(...pageIds);
+        if (body.has_more !== true) break;
+        const next = String(body.last_id ?? pageIds.at(-1) ?? "");
+        if (!next || next === afterId)
+          throw new ProviderDiscoveryError(
+            "Provider model discovery pagination did not advance",
+            "invalid_response",
+          );
+        afterId = next;
+        if (page === MAX_DISCOVERY_PAGES - 1)
+          throw new ProviderDiscoveryError(
+            "Provider model discovery exceeded the page limit",
+            "invalid_response",
+          );
+      }
+    } else if (connection.protocol === "google_gemini") {
+      let pageToken: string | undefined;
+      for (let page = 0; page < MAX_DISCOVERY_PAGES; page++) {
+        const url = new URL(`${connection.base_url}/models`);
+        url.searchParams.set("key", key);
+        url.searchParams.set("pageSize", "1000");
+        if (pageToken) url.searchParams.set("pageToken", pageToken);
+        const body = await this.fetchDiscoveryJson(url, {}, timeoutMs);
+        if (body.models !== undefined && !Array.isArray(body.models))
+          throw new ProviderDiscoveryError(
+            "Provider model discovery response has invalid models",
+            "invalid_response",
+          );
+        ids.push(
+          ...((body.models as unknown[] | undefined) ?? [])
+            .map((item) =>
+              item && typeof item === "object"
+                ? String((item as Record<string, unknown>).name ?? "").replace(
+                    /^models\//,
+                    "",
+                  )
+                : "",
+            )
+            .filter(Boolean),
+        );
+        const next = String(body.nextPageToken ?? "");
+        if (!next) break;
+        if (next === pageToken)
+          throw new ProviderDiscoveryError(
+            "Provider model discovery pagination did not advance",
+            "invalid_response",
+          );
+        pageToken = next;
+        if (page === MAX_DISCOVERY_PAGES - 1)
+          throw new ProviderDiscoveryError(
+            "Provider model discovery exceeded the page limit",
+            "invalid_response",
+          );
+      }
+    } else {
+      const client = new OpenAI({
+        apiKey: key,
+        baseURL: connection.base_url,
+        maxRetries: 0,
+        timeout: timeoutMs,
+      });
+      for await (const item of client.models.list()) {
+        if (item.id) ids.push(item.id);
+        if (ids.length > 10_000)
+          throw new ProviderDiscoveryError(
+            "Provider model discovery exceeded the model limit",
+            "invalid_response",
+          );
+      }
+    }
+    return [...new Set(ids)];
+  }
+
+  private async discoverModels(
+    connection: ConnectionData,
+  ): Promise<DiscoveryResult> {
+    const key = this.key(connection);
+    const { timeoutMs, maxRetries } = this.discoveryOptions(connection);
+    let lastError: ProviderDiscoveryError | undefined;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const ids = await this.discoverModelsOnce(connection, key, timeoutMs);
+        return {
+          ids,
+          status: ids.length ? "succeeded" : "empty",
+          attemptedAt: new Date().toISOString(),
+        };
+      } catch (error) {
+        lastError = this.discoveryError(error);
+        if (!lastError.retryable || attempt === maxRetries) throw lastError;
+        const delay = Math.min(
+          5_000,
+          lastError.retryAfterMs ?? 250 * 2 ** attempt,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+    throw lastError!;
+  }
+
+  private legacyUserOverride(
+    current: (Resource<ProviderModelData> & ProviderModelData) | undefined,
+  ): Record<string, unknown> | undefined {
+    if (!current) return undefined;
+    if (current.user_capability_overrides)
+      return validatedCapabilityOverride(current.user_capability_overrides);
+    if (current.source !== "user") return undefined;
+    const legacy = { ...current.capabilities } as Record<string, unknown>;
+    delete legacy.capability_source;
+    delete legacy.capability_status;
+    return validatedCapabilityOverride(legacy);
+  }
+
+  private modelData(
+    modelId: string,
+    known: ProviderModelDefinition | undefined,
+    current: (Resource<ProviderModelData> & ProviderModelData) | undefined,
+    options: { remoteVisible: boolean; catalogFallback: boolean; now: string },
+  ): ProviderModelData {
+    const base = known?.capabilities ?? unknownModelCapabilities();
+    const userOverride = this.legacyUserOverride(current);
+    const capabilities = userOverride
+      ? validatedCapabilityMerge(base, userOverride)
+      : base;
+    const manuallyAdded = Boolean(
+      current?.manually_added || current?.source === "user",
+    );
+    const sourceParts = [
+      known ? "catalog" : "",
+      options.remoteVisible ? "remote" : "",
+      manuallyAdded || userOverride ? "user" : "",
+    ].filter(Boolean);
+    return {
+      model_id: modelId,
+      display_name: String(
+        current?.display_name ?? known?.display_name ?? modelId,
+      ),
+      source: sourceParts.join("+") || "remote",
+      capabilities,
+      ...(known ? { catalog_capabilities: known.capabilities } : {}),
+      ...(userOverride ? { user_capability_overrides: userOverride } : {}),
+      ...(manuallyAdded ? { manually_added: true } : {}),
+      ...(options.remoteVisible ? { last_seen_at: options.now } : {}),
+      last_sync_at: options.now,
+      remote_presence: options.remoteVisible
+        ? "visible"
+        : options.catalogFallback
+          ? "unknown"
+          : "not_listed",
+      capability_provenance: {
+        source: userOverride
+          ? "user"
+          : known
+            ? "catalog"
+            : "conservative_unknown",
+        ...(known ? { catalog_reviewed_at: known.capability_reviewed_at } : {}),
+        ...(options.remoteVisible
+          ? { remote_model_id_seen_at: options.now }
+          : {}),
+        ...(userOverride
+          ? {
+              user_overridden_at: String(
+                current?.capability_provenance?.user_overridden_at ??
+                  options.now,
+              ),
+            }
+          : {}),
+      },
+    };
+  }
+
+  async syncModels(
+    id: string,
+  ): Promise<Array<Resource<ProviderModelData> & ProviderModelData>> {
+    const connection = await this.get(id);
+    const definition = this.definition(connection.provider);
+    const discovery = await this.discoverModels(connection);
+    return this.db.transaction(async (tx) => {
+      await tx.query(
+        "SELECT id FROM resources WHERE id=$1 AND kind='provider_connection' FOR UPDATE",
+        [id],
+      );
+      const existing = await this.store.list<ProviderModelData>(
+        "provider_model",
+        { parentId: id, limit: 2_000 },
+        tx,
+      );
+      const byModel = new Map(
+        existing.map((item) => [String(item.model_id), item]),
+      );
+      const remoteIds = new Set(discovery.ids);
+      const effectiveIds = discovery.ids.length
+        ? [...remoteIds]
+        : definition.models.map((item) => item.id);
+      const effectiveSet = new Set(effectiveIds);
+      for (const item of existing) {
+        if (effectiveSet.has(item.model_id)) continue;
+        const manuallyAdded = Boolean(
+          item.manually_added ||
+          item.source === "user" ||
+          item.source.includes("+user"),
+        );
+        await this.store.update<ProviderModelData>(
+          "provider_model",
+          item.id,
+          {
+            status: manuallyAdded ? "active" : "unavailable",
+            data: {
+              last_sync_at: discovery.attemptedAt,
+              remote_presence: "not_listed",
+            },
+          },
+          tx,
+        );
+      }
+      for (const modelId of effectiveIds) {
+        const known = definition.models.find((item) => item.id === modelId);
+        const current = byModel.get(modelId);
+        const data = this.modelData(modelId, known, current, {
+          remoteVisible: remoteIds.has(modelId),
+          catalogFallback: discovery.status === "empty",
+          now: discovery.attemptedAt,
+        });
+        if (current)
+          await this.store.update<ProviderModelData>(
+            "provider_model",
+            current.id,
+            { status: "active", name: data.display_name, data },
+            tx,
+          );
+        else
+          await this.store.create<ProviderModelData>(
+            {
+              kind: "provider_model",
+              parentId: id,
+              name: data.display_name,
+              data,
+            },
+            tx,
+          );
+      }
+      const active = await this.store.list<ProviderModelData>(
+        "provider_model",
+        { parentId: id, status: "active", limit: 2_000 },
+        tx,
+      );
+      const activeIds = new Set(active.map((item) => item.model_id));
+      const defaultModel =
+        connection.default_model ??
+        definition.models.find((item) => activeIds.has(item.id))?.id ??
+        active[0]?.model_id;
+      const defaultStatus = defaultModel
+        ? activeIds.has(defaultModel)
+          ? "available"
+          : "unavailable"
+        : "unset";
+      const modelDiscovery: ModelDiscoveryState = {
+        status: discovery.status,
+        source: discovery.ids.length ? "remote" : "catalog_fallback",
+        remote_model_count: discovery.ids.length,
+        effective_model_count: active.length,
+        attempted_at: discovery.attemptedAt,
+      };
       await this.store.update<ConnectionData>(
-        tenantId,
         "provider_connection",
         id,
-        { status: "configured", data: { last_error: String(error) } },
+        {
+          status: "active",
+          data: {
+            last_validated_at: discovery.attemptedAt,
+            last_error: undefined,
+            last_error_details: undefined,
+            model_discovery: modelDiscovery,
+            default_model: defaultModel,
+            default_model_status: defaultStatus,
+          },
+        },
+        tx,
       );
-      return { valid: false, error: String(error) };
+      return active;
+    });
+  }
+
+  private async ensureCatalogModels(
+    connection: Resource<ConnectionData> & ConnectionData,
+  ) {
+    const definition = this.definition(connection.provider);
+    if (!definition.models.length) return [];
+    if (
+      connection.model_discovery?.status === "succeeded" &&
+      connection.model_discovery.remote_model_count > 0
+    )
+      return [];
+    return this.db.transaction(async (tx) => {
+      await tx.query(
+        "SELECT id FROM resources WHERE id=$1 AND kind='provider_connection' FOR UPDATE",
+        [connection.id],
+      );
+      const existing = await this.store.list<ProviderModelData>(
+        "provider_model",
+        { parentId: connection.id, limit: 2_000 },
+        tx,
+      );
+      const byModel = new Map(existing.map((item) => [item.model_id, item]));
+      const now = new Date().toISOString();
+      for (const item of definition.models) {
+        const current = byModel.get(item.id);
+        const data = this.modelData(item.id, item, current, {
+          remoteVisible: false,
+          catalogFallback: true,
+          now,
+        });
+        if (current)
+          await this.store.update<ProviderModelData>(
+            "provider_model",
+            current.id,
+            { status: "active", name: data.display_name, data },
+            tx,
+          );
+        else
+          await this.store.create<ProviderModelData>(
+            {
+              kind: "provider_model",
+              parentId: connection.id,
+              name: data.display_name,
+              data,
+            },
+            tx,
+          );
+      }
+      const active = await this.store.list<ProviderModelData>(
+        "provider_model",
+        { parentId: connection.id, status: "active", limit: 2_000 },
+        tx,
+      );
+      const defaultModel =
+        connection.default_model ??
+        definition.models.find((item) =>
+          active.some((candidate) => candidate.model_id === item.id),
+        )?.id;
+      const defaultStatus = defaultModel ? "available" : "unset";
+      await this.store.update<ConnectionData>(
+        "provider_connection",
+        connection.id,
+        {
+          data: {
+            default_model: defaultModel,
+            default_model_status: defaultStatus,
+            ...(connection.model_discovery
+              ? {
+                  model_discovery: {
+                    ...connection.model_discovery,
+                    source: "catalog_fallback",
+                    effective_model_count: active.length,
+                  },
+                }
+              : {}),
+          },
+        },
+        tx,
+      );
+      return active;
+    });
+  }
+
+  async listModels(connectionId: string) {
+    const rows = await this.store.list<ProviderModelData>("provider_model", {
+      parentId: connectionId,
+      status: "active",
+      limit: 2_000,
+    });
+    if (rows.length) return rows;
+    return this.ensureCatalogModels(await this.get(connectionId));
+  }
+
+  async pageModels(connectionId: string, options: PageOptions = {}) {
+    await this.listModels(connectionId);
+    return this.store.page<ProviderModelData>("provider_model", {
+      ...options,
+      parentId: connectionId,
+      status: "active",
+    });
+  }
+
+  async addModel(connectionId: string, input: Record<string, unknown>) {
+    const connection = await this.get(connectionId);
+    const modelId = String(input.model_id);
+    if (!modelId) throw new ValidationError("model_id is required");
+    const definition = this.definition(connection.provider);
+    const known = definition.models.find((item) => item.id === modelId);
+    const incoming = validatedCapabilityOverride(input.capabilities);
+    return this.db.transaction(async (tx) => {
+      await tx.query(
+        "SELECT id FROM resources WHERE id=$1 AND kind='provider_connection' FOR UPDATE",
+        [connectionId],
+      );
+      const current = (
+        await this.store.list<ProviderModelData>(
+          "provider_model",
+          { parentId: connectionId, limit: 2_000 },
+          tx,
+        )
+      ).find((item) => item.model_id === modelId);
+      const previous = this.legacyUserOverride(current) ?? {};
+      const combined = validatedCapabilityOverride({
+        ...previous,
+        ...incoming,
+        ...(previous.reasoning || incoming.reasoning
+          ? {
+              reasoning: {
+                ...((previous.reasoning as Record<string, unknown>) ?? {}),
+                ...((incoming.reasoning as Record<string, unknown>) ?? {}),
+              },
+            }
+          : {}),
+        ...(previous.context_compaction || incoming.context_compaction
+          ? {
+              context_compaction: {
+                ...((previous.context_compaction as Record<string, unknown>) ??
+                  {}),
+                ...((incoming.context_compaction as Record<string, unknown>) ??
+                  {}),
+              },
+            }
+          : {}),
+      });
+      const now = new Date().toISOString();
+      const hasOverride = Object.keys(combined).length > 0;
+      const base = known?.capabilities ?? unknownModelCapabilities();
+      const capabilities = hasOverride
+        ? validatedCapabilityMerge(base, combined)
+        : base;
+      const source = [
+        known ? "catalog" : "",
+        current?.last_seen_at ? "remote" : "",
+        "user",
+      ]
+        .filter(Boolean)
+        .join("+");
+      const data: ProviderModelData = {
+        model_id: modelId,
+        display_name: String(
+          input.display_name ??
+            current?.display_name ??
+            known?.display_name ??
+            modelId,
+        ),
+        source,
+        capabilities,
+        ...(known ? { catalog_capabilities: known.capabilities } : {}),
+        ...(hasOverride ? { user_capability_overrides: combined } : {}),
+        manually_added: true,
+        ...(current?.last_seen_at
+          ? { last_seen_at: current.last_seen_at }
+          : {}),
+        last_sync_at: String(current?.last_sync_at ?? now),
+        remote_presence: current?.remote_presence ?? "unknown",
+        capability_provenance: {
+          source: hasOverride
+            ? "user"
+            : known
+              ? "catalog"
+              : "conservative_unknown",
+          ...(known
+            ? { catalog_reviewed_at: known.capability_reviewed_at }
+            : {}),
+          ...(current?.last_seen_at
+            ? { remote_model_id_seen_at: current.last_seen_at }
+            : {}),
+          ...(hasOverride ? { user_overridden_at: now } : {}),
+        },
+      };
+      const saved = current
+        ? await this.store.update<ProviderModelData>(
+            "provider_model",
+            current.id,
+            { status: "active", name: data.display_name, data },
+            tx,
+          )
+        : await this.store.create<ProviderModelData>(
+            {
+              kind: "provider_model",
+              parentId: connectionId,
+              name: data.display_name,
+              data,
+            },
+            tx,
+          );
+      if (!connection.default_model)
+        await this.store.update<ConnectionData>(
+          "provider_connection",
+          connectionId,
+          {
+            data: {
+              default_model: modelId,
+              default_model_status: "available",
+            },
+          },
+          tx,
+        );
+      return saved;
+    });
+  }
+
+  async validate(id: string) {
+    try {
+      const models = await this.syncModels(id);
+      const connection = await this.get(id);
+      return {
+        valid: true,
+        model_count: models.length,
+        models,
+        discovery: connection.model_discovery,
+        default_model: connection.default_model,
+        default_model_status: connection.default_model_status,
+      };
+    } catch (error) {
+      const current = await this.get(id);
+      const details = this.operationError(error);
+      const active = await this.store.list<ProviderModelData>(
+        "provider_model",
+        { parentId: id, status: "active", limit: 2_000 },
+      );
+      const discovery: ModelDiscoveryState = {
+        status:
+          details.category === "endpoint_unsupported"
+            ? "unsupported"
+            : "failed",
+        source: active.length ? "catalog_fallback" : "none",
+        remote_model_count: 0,
+        effective_model_count: active.length,
+        attempted_at: details.observed_at,
+      };
+      await this.store.update<ConnectionData>("provider_connection", id, {
+        status: current.status,
+        data: {
+          last_error: details.message,
+          last_error_details: details,
+          model_discovery: discovery,
+        },
+      });
+      return {
+        valid: false,
+        error: details.message,
+        error_details: details,
+        discovery,
+      };
     }
   }
 
@@ -903,17 +1706,20 @@ export class ProviderService {
           modelId,
         ),
       );
-    return new OpenAIProvider({
+    const openAIClient = new OpenAI({
       apiKey,
       baseURL: connection.base_url,
+      // Retry decisions belong to the Agents SDK Runtime policy. Leaving the
+      // transport default enabled would make ambiguous retries invisible.
+      maxRetries: 0,
+    });
+    return new OpenAIProvider({
+      openAIClient,
       useResponses: connection.protocol === "responses",
     }).getModel(modelId);
   }
 
-  async resolveConfig(
-    tenantId: string,
-    config: Record<string, unknown>,
-  ): Promise<
+  async resolveConfig(config: Record<string, unknown>): Promise<
     Record<string, unknown> & {
       model: string;
       provider: {
@@ -931,12 +1737,16 @@ export class ProviderService {
     );
     if (!connectionId)
       throw new ValidationError("agent config requires provider.connection_id");
-    const connection = await this.get(tenantId, connectionId);
+    const connection = await this.get(connectionId);
     const modelId = String(config.model ?? connection.default_model ?? "");
     if (!modelId) throw new ValidationError("agent config requires a model");
-    const models = await this.listModels(tenantId, connectionId);
-    const capability = models.find((item) => item.model_id === modelId)
-      ?.capabilities as ModelCapability | undefined;
+    const models = await this.listModels(connectionId);
+    const selectedModel = models.find((item) => item.model_id === modelId);
+    if (!selectedModel)
+      throw new ValidationError(
+        `model ${modelId} is not active for Provider connection ${connectionId}; synchronize models or add it explicitly`,
+      );
+    const capability = selectedModel.capabilities as ModelCapability;
     const settings = {
       ...((config.model_settings as Record<string, unknown>) ?? {}),
     };

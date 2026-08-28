@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { Settings } from "./config.js";
 import { ValidationError } from "./database.js";
@@ -17,7 +17,7 @@ export interface SandboxSpec {
 export interface SandboxHandle {
   id: string;
   root: string;
-  provider: "local" | "docker";
+  provider: "process" | "docker";
   spec: SandboxSpec;
 }
 export interface SandboxResult {
@@ -29,11 +29,17 @@ export interface SandboxResult {
 const runProcess = (
   command: string,
   args: string[],
-  options: { cwd?: string; timeoutMs: number; maxBytes?: number },
+  options: {
+    cwd?: string;
+    timeoutMs: number;
+    maxBytes?: number;
+    env?: NodeJS.ProcessEnv;
+  },
 ): Promise<SandboxResult> =>
   new Promise((resolvePromise, reject) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
+      env: options.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "",
@@ -79,11 +85,11 @@ export class SandboxService {
     const id = newId();
     const root = resolve(this.settings.sandboxRoot, id);
     await mkdir(root, { recursive: true });
-    if (this.settings.environment === "production") await chmod(root, 0o777);
+    if (this.settings.sandboxProvider === "docker") await chmod(root, 0o777);
     return {
       id,
       root,
-      provider: this.settings.environment === "production" ? "docker" : "local",
+      provider: this.settings.sandboxProvider,
       spec: complete,
     };
   }
@@ -109,11 +115,16 @@ export class SandboxService {
     if (!command || command.includes("\0"))
       throw new ValidationError("invalid command");
     const timeoutMs = handle.spec.timeoutSeconds * 1000;
-    if (handle.provider === "local")
-      return runProcess(command, args, { cwd: handle.root, timeoutMs });
-    const hostRoot = this.settings.sandboxHostRoot
-      ? resolve(this.settings.sandboxHostRoot, handle.id)
-      : handle.root;
+    if (handle.provider === "process")
+      return runProcess(command, args, {
+        cwd: handle.root,
+        timeoutMs,
+        env: {
+          PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+          LANG: process.env.LANG ?? "C.UTF-8",
+          OMOIKANE_SANDBOX: "process",
+        },
+      });
     const dockerArgs = [
       "run",
       "--rm",
@@ -128,7 +139,7 @@ export class SandboxService {
       "--tmpfs",
       `/tmp:rw,noexec,nosuid,size=64m`,
       `--mount`,
-      `type=bind,source=${hostRoot},target=/workspace`,
+      `type=bind,source=${handle.root},target=/workspace`,
       "--workdir",
       "/workspace",
       handle.spec.image ?? "node:22-alpine",
@@ -137,7 +148,34 @@ export class SandboxService {
     ];
     return runProcess("docker", dockerArgs, { timeoutMs });
   }
+  async commandAvailable(handle: SandboxHandle, command: string) {
+    if (!/^[A-Za-z0-9._+-]+$/.test(command))
+      throw new ValidationError("invalid command requirement");
+    const result = await this.execute(handle, "sh", [
+      "-c",
+      'command -v "$1" >/dev/null 2>&1',
+      "omoikane-command-check",
+      command,
+    ]);
+    return result.exit_code === 0 && !result.timed_out;
+  }
   async destroy(handle: SandboxHandle) {
+    const makeWritable = async (path: string): Promise<void> => {
+      let info;
+      try {
+        info = await lstat(path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw error;
+      }
+      if (info.isSymbolicLink()) return;
+      if (info.isDirectory()) {
+        await chmod(path, 0o700);
+        for (const entry of await readdir(path))
+          await makeWritable(resolve(path, entry));
+      } else await chmod(path, 0o600);
+    };
+    await makeWritable(handle.root);
     await rm(handle.root, { recursive: true, force: true });
   }
 }

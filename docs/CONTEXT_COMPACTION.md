@@ -1,102 +1,227 @@
-# Context Compaction
+# Context compaction
 
-> 实现：`src/compaction.ts`；Checkpoint Schema v3
+## Contract and ownership
 
-操作方式见[开发者手册的 Context Compaction 章节](DEVELOPER_GUIDE.md#11-context-compaction)；未完成评测和 Native adapter 统一记录在[生产就绪清单](PRODUCTION_READINESS.md)。
-
-## 1. 核心结论
-
-上下文压缩不是删除聊天记录，也不是长期记忆。Omoikane 保留完整 Canonical Transcript，额外生成模型输入用的 Context Projection：
+Context Compaction converts caller-owned model input into a smaller, temporary Projection:
 
 ```text
-Canonical Transcript = 不可变原始 Session Items
-Active Projection     = Checkpoint + 未压缩最近尾部
-Long-term Memory      = 独立 Scope/生命周期的数据
+(items or prior Projection, current input, complete model request, policy)
+  -> Projection v4 + validation + metrics
 ```
 
-前端恢复聊天使用 Transcript；下一次模型调用使用 Projection；Memory retrieval 在 Run preflight 独立执行。没有 Memory Flush。
+It does not store a canonical conversation, write long-term memory, infer user preferences, or mutate the business transcript. The business system remains the source of truth. Omoikane stores only the Projection and small execution-control state needed to finish or recover a Run.
 
-## 2. 触发
+This implementation combines deterministic history reduction before model summarization, structured checkpoints with exact evidence, and repeated-checkpoint lineage. It deliberately does not use a memory flush: memory and compaction have different ownership and reliability requirements.
 
-每次带 Session 的 Run 在模型调用前估算：
+## When compaction runs
 
-```text
-estimated_tokens = bytes(JSON(effective_items))/3 + bytes(current_input)/3
-high_watermark   = context_window × high_watermark_ratio
-low_watermark    = context_window × low_watermark_ratio
+Compaction is evaluated before the first model call and again before every later model call in the same Agent run. Planning includes:
+
+- input items and current user input;
+- system instructions;
+- Function and MCP Tool schemas;
+- handoff schemas;
+- structured-output schema;
+- configured or reserved output tokens;
+- a safety margin.
+
+The Runtime uses a UTF-8 heuristic initially, then calibrates it against Provider-reported input usage during the Run. It starts at the high watermark, treats the emergency watermark as critical, and targets the low watermark. A context-overflow response may trigger one forced compaction and one replay only when a streamed request produced no output.
+
+```yaml
+model_context_window: 1048576
+compaction:
+  enabled: true
+  strategy: auto
+  high_watermark_ratio: 0.82
+  low_watermark_ratio: 0.55
+  emergency_watermark_ratio: 0.96
+  reserved_output_tokens: 16384
+  safety_margin_tokens: 2048
+  preserve_recent_tokens: 16000
+  chunk_tokens: 32000
+  max_checkpoint_tokens: 8000
+  max_attempts_per_run: 2
+  keep_recent_tool_results: 6
+  prune_tool_result_chars: 1500
+  min_tool_prune_reclaim_tokens: 4096
+  max_tool_ledger_entries: 64
 ```
 
-默认 high `0.82`、low `0.55`、保留最近 `16,000` tokens、单个摘要 chunk 上限 `32,000` 估算 tokens。当前估算器是偏保守的 UTF-8 字节近似，不是 Provider tokenizer；Provider 目录提供 `model_context_window` 默认值，Agent 仍可覆盖。`current_input` 在触发判断和压缩后的低水位校验中使用同一次估算，不会出现“判断时没算、执行时才加入”的偏差。
+Known models receive reviewed context/output defaults from the Provider catalog. A Deployment may override `model_context_window`, but an override cannot enlarge the remote model's actual limit.
 
-## 3. Portable 压缩流程
+## Strategies
 
-1. 读取 Session revision 和全部 raw items。
-2. 根据低水位扣除当前输入、Checkpoint 预算和安全余量，再从尾部累计 `preserve_recent_tokens`；最近尾部不能挤破低水位。
-3. 按 Session item 边界切分较早历史；超大单项带少量 overlap 切分。`chunk_tokens` 默认 `32,000`，且不会超过模型窗口的一半。
-4. 使用同一 Provider/Model 生成结构化结果：`summary`、`decisions`、`constraints`、`open_questions`、`artifacts`。
-5. 多 chunk 时，若全部局部摘要可放入 Checkpoint 预算，确定性无损合并；超出预算才分批、分层调用模型合并。合并提示明确要求覆盖每个编号 Checkpoint。
-6. 验证结构、非空、所有 chunk 已处理、压缩有效且最终 Projection 不超过低水位。`force` 只跳过高水位触发条件，不能跳过这些安全校验。
-7. 在事务中锁 Session，使用 revision 做 CAS。
-8. 保存 Compaction、创建 Projection、supersede 旧 Projection、切换 active revision。
-9. Run preflight 自动压缩时写 `context.compacted` Event。
+### Native Responses compaction
 
-结构化摘要按 Provider 能力协商：支持原生 Structured Output 时使用严格 `json_schema`；OpenAI-compatible Provider 使用 `json_object` 并在 Runtime 中做 schema 校验；其他 Provider 使用明确 JSON prompt。若兼容端拒绝 JSON 模式，会回退到 prompt JSON，但解析失败、字段缺失或类型错误仍会使压缩失败，不切换 Projection。MiMo Responses 的实际接口不支持 `json_schema`、支持 `json_object`，live E2E 已覆盖该路径。
+`native` calls `POST /responses/compact`. `auto` selects it only when the chosen model explicitly declares `context_compaction.method = responses_compact`; this currently includes known OpenAI and local Codex Bridge Responses models.
 
-Checkpoint 作为普通 user input item 注入：
+Omoikane requires a `response.compaction` envelope, one non-empty final encrypted `compaction` item, and exact preservation of all returned user messages. It rejects ineffective or unsafe-sized output. The opaque item is never decrypted, summarized, converted to Portable format, or edited.
 
-```xml
-<context_checkpoint version="3">
-Summary...
+Projection v4 binds a native checkpoint to a fingerprint of protocol, Provider, base URL, model, and local credential identity. It is rejected when replayed through a different issuer. `auto` falls back to Portable only for a declared endpoint/capability incompatibility or malformed/ineffective native result. It does not hide authentication, authorization, quota, cancellation, timeout, network, or server failures behind a fallback.
 
-Decisions:
-- ...
-</context_checkpoint>
+### Portable structured checkpoint
+
+Portable compaction performs these operations:
+
+1. Normalize model items and group atomic units. A function call and all of its Tool outputs are never split across the checkpoint boundary.
+2. Deterministically prune eligible old or duplicate large Tool results. Recent unique results remain verbatim; replacements retain size, digest, and SHA-256 evidence.
+3. Keep a bounded recent raw tail and select the older prefix.
+4. Chunk the prefix without splitting normal turns or Tool transactions. Oversized atomic units are segmented only for summarization, not for the final projection boundary.
+5. Ask the configured model for strict semantic JSON. Every fact must cite an existing `source_ref`; prompt content is treated as untrusted data.
+6. Merge every chunk hierarchically, retaining original source references.
+7. Independently extract exact identifiers, bounded recent user excerpts, and a Tool call/result ledger from source items.
+8. Validate schema, citations, anchors, excerpts, Tool integrity, source checksum, token target, and measurable reduction. Any failure leaves the input untouched and fails closed.
+
+The semantic checkpoint contains `active_task`, `goal`, constraints, decisions, completed actions, current state, open questions, errors, artifacts, and critical facts. Deterministic evidence reduces model-summary loss but does not make the summary lossless.
+
+Repeated compaction writes `generation` and `parent_checkpoint_id`. A new checkpoint summarizes the prior checkpoint as data plus newly eligible raw turns; it never treats a previous checkpoint as long-term memory.
+
+## Projection v4
+
+Important fields are:
+
+```json
+{
+  "version": 4,
+  "id": "...",
+  "strategy": "portable",
+  "revision": 2,
+  "source": {
+    "from_index": 0,
+    "to_index": 41,
+    "item_count": 42,
+    "checksum": "..."
+  },
+  "compatibility": {
+    "protocol": "portable",
+    "model": "mimo-v2.5",
+    "issuer_verified": true
+  },
+  "checkpoint": {
+    "schema_version": 4,
+    "checkpoint_id": "...",
+    "parent_checkpoint_id": "...",
+    "generation": 2,
+    "semantic": {},
+    "anchors": [],
+    "user_excerpts": [],
+    "tool_ledger": []
+  },
+  "items": [],
+  "validation": {},
+  "recovery_ref": { "run_id": "..." },
+  "checksum": "..."
+}
 ```
 
-## 4. 不变量
+Every newly created Projection also contains `validation.semantic_risk`. This is an explainable risk signal, not a model-generated confidence score:
 
-- `session_items` 不因压缩被删除或改写。
-- Projection 保存 `source_from_seq`、`source_to_seq`、`source_revision`、checksum 和 metrics。
-- 读取 Projection 前校验规范化 JSON checksum；不匹配时退回 Canonical Transcript，restore 则拒绝执行。
-- 压缩期间 Session 有新写入时，CAS 失败，不覆盖新内容。
-- 摘要失败、为空或效果差时不切换 Projection。
-- `pop` 或 `clear` 等破坏性 Session 编辑会使关联 Compaction/Projection 失效，并清除 active revision。
-- 恢复操作只切换 Projection 状态，不重建 Transcript。
-- 压缩不写 Memory；Memory consolidation 不依赖压缩事件。
-
-## 5. API
-
-```text
-POST /v1/sessions/:id/compact
-GET  /v1/sessions/:id/compactions
-GET  /v1/sessions/:id/compactions/:compactionId
-POST /v1/sessions/:id/compactions/:compactionId/restore
-GET  /v1/sessions/:id/context-preview
+```json
+{
+  "assurance": "degraded",
+  "risk_reasons": [
+    "lossy_model_generated_checkpoint",
+    "semantic_evaluation_is_release_evidence_not_online_proof"
+  ],
+  "recommended_action": "continue_with_business_validation",
+  "evaluation_key": {
+    "provider": "xiaomi_mimo",
+    "model": "mimo-v2.5",
+    "protocol": "responses",
+    "strategy": "portable",
+    "projection_version": 4
+  }
+}
 ```
 
-`dry_run=true` 生成摘要和 metrics 但不切换 Projection。API 默认 `force=false`，只有达到高水位才执行；显式 `force=true` 适合测试或运维，但仍执行 schema、有效性、低水位、checksum/CAS 等校验。
+Generation 1 recommends normal continuation with business validation. Generations 2 and 3 recommend that the caller make source items available for consequential work. More than three Portable generations are outside the currently qualified test envelope and recommend a fresh Run. Exceeding the deterministic anchor, excerpt, or Tool-ledger capacity also reports `deterministic_evidence_capacity_exceeded` and asks the caller for source items. The signal never retrieves history itself, blocks an otherwise valid Projection, or claims that a particular Projection is semantically complete. Older persisted v4 Projections remain readable without this additive field.
 
-主要 metrics 包括 `source_chunk_count`、`all_chunks_processed`、`merge_levels`、`tail_tokens`、`current_input_tokens`、`effective_tokens_after`、高低水位、`projection_within_low_watermark` 和 `summary_schema_valid`。这些字段描述可验证的处理事实，不把模型摘要的语义正确性伪装成布尔“完整覆盖”。
+`checksum` covers the projected items. `source.checksum` identifies the exact source prefix being replaced. Version 3 Projections remain readable for compatibility, but only version 4 contains issuer, evidence, lineage, and validation metadata.
 
-## 6. 与 Agents SDK 原生能力的关系
+## API usage
 
-Agents SDK TypeScript 提供 Session 和与 Provider compaction 相关的可选接口，但 Omoikane 当前没有把数据库 Session 声明为原生 compaction-aware session。原因是平台需要跨 Provider、一致审计、可恢复 Projection 和 Canonical Transcript 不变量。
+Create a Projection from raw items:
 
-未来可以增加 Native engine，但必须满足：
+```http
+POST /v1/context/compact
+Content-Type: application/json
 
-- Provider capability 明确支持；
-- 原生返回内容可持久化为 Projection；
-- Usage/Cost 真实记录；
-- 失败可回退 Portable；
-- 不修改 Canonical Transcript；
-- 与 Runtime Generation/RunState 兼容。
+{
+  "deployment_id": "deployment-id",
+  "items": [{"role":"user","content":"..."}],
+  "current_input": "next request",
+  "strategy": "auto",
+  "force": false
+}
+```
 
-## 7. 验证证据
+For repeated compaction, send `projection` instead of `items`. To start a Run from an existing Projection, send `projection` instead of `conversation` to `POST /v1/runs`. The two fields are mutually exclusive. This retains all v4 compatibility and lineage metadata instead of reducing a Projection to its `items` array.
 
-离线 Compaction 套件目前包含 12 项测试，覆盖自动触发与 Event 语义、非强制 API、Malformed JSON、Canonical/Projection/restore、checksum fallback、`pop`/`clear` 失效、跨 chunk 无损合并、并发 CAS 和无效压缩拒绝。
+Run-time projection changes are persisted atomically with their `context.compacted` Event. `runs.compaction_state_json` records revision, attempt count, last input checksum, calibration state, and verification state so a process restart does not lose the execution decision. Terminal payload cleanup removes this state with the Projection.
 
-`npm run test:e2e:mimo` 通过真实 REST/SSE/Worker 和 MiMo v2.5 验证独立 Compaction：测试关闭 Memory retrieval 和 Focus，仅把随机事实放在 Session 中，压缩后 Canonical Transcript 不变，下一轮仍能回答该事实。当前完整套件为 5/5 通过。
+## Reliability boundary
 
-`npm run test:e2e:compaction-100k` 是显式选择的高成本基准：构造超过 100K 估算 tokens 的上下文，将随机事实放在开头、中间和结尾，验证多 chunk、全部事实保留、Canonical hash 不变、有效 Projection 小于原始上下文的 20%、低水位成立，并继续发起一次真实模型 Run。2026-08-27 的 MiMo v2.5 实测在修复跨 chunk 合并后通过，整条测试约 31 秒。
+Compaction is production-usable infrastructure, but it is not perfectly trustworthy:
 
-这些证据显著提高了可信度，但不等于“任意内容完全可靠”。模型局部摘要仍是有损、概率性的；重复压缩漂移、对抗性 prompt、多 Provider/语言/代码任务评测、真实 tokenizer、故障注入和 Native adapter 尚未完成，统一记录在[生产就绪清单](PRODUCTION_READINESS.md)。
+- Native compaction is opaque. Omoikane can prove envelope, issuer, size, and continuation properties, not its semantic contents.
+- Portable compaction is inspectable and evidence-bearing but still model-generated and lossy.
+- Provider tokenization is approximated before the first measured call.
+- A source transcript can contain adversarial or ambiguous content that a summary mishandles.
+
+Therefore preserve the full transcript in the business system, keep consequential state in structured business records or Tools, verify critical identifiers before side effects, and never use a Projection as the only legal, financial, medical, or audit record.
+
+## Semantic effect evaluation
+
+Omoikane evaluates downstream behavior rather than asking a second model whether a summary “looks good.” The versioned synthetic corpus at `evals/compaction/corpus-v1.json` contains 16 scenarios and 22 deterministic Probes covering:
+
+- exact identifiers, paths, versions, dates, quantities, and Artifact lineage;
+- final state after supersession, negation, hard constraints, decisions, and rationale;
+- completed versus unresolved work;
+- Tool transactions, code failures, and exact Tool results;
+- Chinese/English mixed text;
+- quoted prompt injection, hostile Tool payloads, irrelevant distractors, and absent facts.
+
+Probe answers use strict structured output and are scored without an LLM judge. Release gates require critical-fact recall of at least 99%, exact identifiers and constraints at 100%, task success at least 95%, no known false facts, no stale superseded facts, and no more than a two-percentage-point drop between generations. A finite corpus establishes regression evidence and an operating envelope; it cannot prove correctness for every future conversation.
+
+The opt-in Harness pads facts across approximately 48K estimated tokens, compacts once or repeatedly, runs Probes in bounded strict-Schema batches, and emits a JSON qualification report. Results are test artifacts and are not written to the Runtime database:
+
+```bash
+# MiMo Portable, one generation
+npm run eval:compaction
+
+# MiMo Portable, three generations, full report outside the repository
+OMOIKANE_COMPACTION_EVAL_GENERATIONS=3 \
+OMOIKANE_COMPACTION_EVAL_OUTPUT=/tmp/omoikane-compaction-eval.json \
+npm run eval:compaction
+
+# local Codex Bridge Native
+OMOIKANE_COMPACTION_EVAL_PROVIDER=codex_bridge \
+OMOIKANE_COMPACTION_EVAL_MODEL=gpt-5.6-sol \
+OMOIKANE_COMPACTION_EVAL_STRATEGY=native \
+OMOIKANE_COMPACTION_EVAL_API_KEY_ENV=CODEX_BRIDGE_API_KEY \
+npm run eval:compaction
+```
+
+The default MiMo command reads `MIMO_API_KEY`; the Codex Bridge command reads `CODEX_BRIDGE_API_KEY` or the existing local Bridge configuration. Credentials are never included in the report. Provider/model/protocol/strategy/version tuples are evaluated separately because evidence from one tuple does not qualify another.
+
+The 2026-08-28 release qualification recorded in `evals/compaction/qualification-baselines.json` produced:
+
+| Subject | Generations | Result | Token reduction | Semantic result |
+| --- | ---: | --- | --- | --- |
+| MiMo `mimo-v2.5`, Portable | 3 | passed | 48,890 → 4,283 in generation 1; later generations remained below 4,700 | 22/22 each generation; maximum score drop 0 |
+| Codex Bridge `gpt-5.6-sol`, Native | 1 | passed | 48,890 → 2,444 | 22/22; false/stale fact rates 0 |
+
+The broader corpus exposed and now guards two defects that the former marker-only tests missed: Tool `call_id` anchors were incorrectly validated as message text, and repeated Portable compaction rejected inherited source references and failed to carry deterministic evidence forward. Portable compaction now inherits prior source refs, anchors, user excerpts, and Tool ledger entries. A structurally invalid generated checkpoint receives one explicit validation-repair attempt; the metric `summary_validation_retries` records whether it was used.
+
+## Verification
+
+The offline suite covers v4 schema/citation validation, atomic Tool transactions, deterministic pruning, exact evidence, cross-generation evidence inheritance, bounded checkpoint repair, semantic scoring, release thresholds, native issuer/fallback rules, per-call overflow retry, threshold planning, ineffective output, Run persistence, and checksum integrity.
+
+Optional live suites cover MiMo portable 100K input and Codex Bridge native compaction plus continuation:
+
+```bash
+npm run test:e2e:compaction-100k
+npm run test:e2e:codex-bridge-compaction
+```
+
+These paid tests and the semantic Harness read credentials only from the process environment or ignored local configuration and never print them. Re-run qualification when the corpus, Provider, model, protocol adapter, compaction strategy, checkpoint schema, Agents SDK, or Runtime version changes.

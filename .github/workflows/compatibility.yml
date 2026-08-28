@@ -8,20 +8,33 @@ on:
 jobs:
   typescript:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
-      - uses: azure/setup-helm@v4
       - run: npm ci
       - run: npm run check
       - run: npm test
+      - run: npm run test:postgres
+        env:
+          AGENT_POSTGRES_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
       - run: npm run check:docs
       - run: npm run build
       - run: npm pack --dry-run
-      - run: helm lint deploy/helm/omoikane
       - run: docker compose config --quiet
-        env:
-          AGENT_RUN_STATE_SECRET: ci-compose-secret-at-least-32-bytes

@@ -2,17 +2,18 @@ import { tool, type FunctionTool, type RunContext } from "@openai/agents";
 import type { ArtifactService } from "./artifacts.js";
 import type { Database } from "./database.js";
 import { ConflictError, ValidationError, required } from "./database.js";
-import type { MemoryService } from "./memory.js";
 import { ResourceStore } from "./resources.js";
 import type { SandboxHandle, SandboxService } from "./sandbox.js";
 import { hashJson, newId } from "./serialization.js";
+import type { EventStore } from "./events.js";
+import type { FaultInjector } from "./recovery.js";
+import type { PageOptions } from "./pagination.js";
 
 export interface RuntimeContext extends Record<string, unknown> {
-  tenant_id: string;
   run_id: string;
-  agent_version_id: string;
-  retrieved_memories?: unknown[];
+  deployment_id: string;
   sandbox?: SandboxHandle;
+  skill_bindings?: Array<Record<string, unknown>>;
 }
 export type ToolImplementation = (
   args: Record<string, unknown>,
@@ -20,6 +21,10 @@ export type ToolImplementation = (
 ) => unknown | Promise<unknown>;
 
 const implementations = new Map<string, ToolImplementation>();
+const removedMemoryImplementations = new Set([
+  "builtin.memory_search",
+  "builtin.memory_create",
+]);
 export const registerToolImplementation = (
   key: string,
   implementation: ToolImplementation,
@@ -38,8 +43,9 @@ export class ToolService {
   constructor(
     private readonly db: Database,
     artifacts: ArtifactService,
-    memory: MemoryService,
     sandbox: SandboxService,
+    private readonly events: EventStore,
+    private readonly faults: FaultInjector,
   ) {
     this.store = new ResourceStore(db);
     this.builtins.set("builtin.artifact_create", async (args, context) => {
@@ -47,7 +53,6 @@ export class ToolService {
         ? Buffer.from(String(args.content_base64), "base64")
         : Buffer.from(String(args.content ?? ""));
       const artifact = await artifacts.create(
-        context.tenant_id,
         String(args.filename ?? "artifact.txt"),
         data,
         {
@@ -63,30 +68,6 @@ export class ToolService {
         sha256: artifact.sha256,
       };
     });
-    this.builtins.set("builtin.memory_search", (args, context) =>
-      memory.retrieve(
-        context.tenant_id,
-        String(args.query ?? ""),
-        (args.scopes as Array<[string, string]>) ?? [
-          ["agent", context.agent_version_id],
-          ["global", "global"],
-        ],
-        Number(args.limit ?? 8),
-      ),
-    );
-    this.builtins.set("builtin.memory_create", (args, context) =>
-      memory.create(
-        context.tenant_id,
-        {
-          scope_type: args.scope_type ?? "agent",
-          scope_id: args.scope_id ?? context.agent_version_id,
-          kind: args.kind ?? "semantic",
-          content: args.content,
-          confidence: args.confidence ?? 0.8,
-        },
-        { run_id: context.run_id, source: "tool" },
-      ),
-    );
     this.builtins.set("builtin.sandbox_exec", (args, context) => {
       if (!context.sandbox)
         throw new ValidationError("sandbox is not enabled for this run");
@@ -98,12 +79,12 @@ export class ToolService {
     });
   }
 
-  async seed(tenantId = "default"): Promise<void> {
+  async seed(): Promise<void> {
     const builtins = [
       {
         slug: "artifact-create",
         name: "artifact_create",
-        description: "Create a durable artifact from text or base64 data",
+        description: "Create a temporary Run artifact from text or base64 data",
         implementation_key: "builtin.artifact_create",
         schema: {
           type: "object",
@@ -117,38 +98,6 @@ export class ToolService {
           additionalProperties: false,
         },
         policy: {},
-      },
-      {
-        slug: "memory-search",
-        name: "memory_search",
-        description: "Search approved long-term memories",
-        implementation_key: "builtin.memory_search",
-        schema: {
-          type: "object",
-          properties: { query: { type: "string" }, limit: { type: "integer" } },
-          required: ["query"],
-          additionalProperties: false,
-        },
-        policy: {},
-      },
-      {
-        slug: "memory-create",
-        name: "memory_create",
-        description: "Create a durable long-term memory",
-        implementation_key: "builtin.memory_create",
-        schema: {
-          type: "object",
-          properties: {
-            content: { type: "string" },
-            kind: { type: "string" },
-            scope_type: { type: "string" },
-            scope_id: { type: "string" },
-            confidence: { type: "number" },
-          },
-          required: ["content"],
-          additionalProperties: false,
-        },
-        policy: { requires_approval: true, side_effecting: true },
       },
       {
         slug: "sandbox-exec",
@@ -168,42 +117,71 @@ export class ToolService {
       },
     ];
     for (const item of builtins) {
-      if (!(await this.store.findBySlug(tenantId, "tool", item.slug)))
-        await this.create(tenantId, item);
+      if (!(await this.store.findBySlug("tool", item.slug)))
+        await this.create(item);
     }
   }
 
-  async create(tenantId: string, input: Record<string, unknown>) {
+  async create(input: Record<string, unknown>) {
+    const implementationKey = String(input.implementation_key);
+    if (removedMemoryImplementations.has(implementationKey))
+      throw new ValidationError(
+        "built-in memory tools were removed; provide business memory through a custom Function Tool or MCP",
+      );
+    const suppliedPolicy = (input.policy ?? {}) as Record<string, unknown>;
+    const policy = {
+      ...suppliedPolicy,
+      // A durable approval checkpoint is what lets the Runtime resume the
+      // exact same Tool call and idempotency key after process loss.
+      requires_approval: Boolean(
+        suppliedPolicy.requires_approval || suppliedPolicy.side_effecting,
+      ),
+      side_effecting: Boolean(suppliedPolicy.side_effecting),
+    };
     return this.store.create<Record<string, unknown>>({
-      tenantId,
       kind: "tool",
       slug: String(input.slug),
       name: String(input.name),
       data: {
         description: String(input.description),
         kind: String(input.kind ?? "function"),
-        implementation_key: String(input.implementation_key),
+        implementation_key: implementationKey,
         schema: input.schema ?? {
           type: "object",
           properties: {},
           additionalProperties: false,
         },
-        policy: input.policy ?? {},
+        policy,
       },
     });
   }
 
-  async list(tenantId: string) {
-    return this.store.list<Record<string, unknown>>(tenantId, "tool");
+  async list() {
+    const tools = await this.store.list<Record<string, unknown>>("tool");
+    return tools.filter(
+      (record) =>
+        !removedMemoryImplementations.has(String(record.implementation_key)),
+    );
+  }
+
+  async page(options: PageOptions & { status?: string } = {}) {
+    const page = await this.store.page<Record<string, unknown>>(
+      "tool",
+      options,
+    );
+    return {
+      ...page,
+      data: page.data.filter(
+        (record) =>
+          !removedMemoryImplementations.has(String(record.implementation_key)),
+      ),
+    };
   }
 
   async resolve(
-    tenantId: string,
     references: unknown[],
   ): Promise<Array<Record<string, unknown>>> {
-    const local = await this.list(tenantId);
-    const shared = tenantId === "default" ? [] : await this.list("default");
-    const all = [...local, ...shared];
+    const all = await this.list();
     return references.map((reference) => {
       const id =
         typeof reference === "string"
@@ -247,14 +225,17 @@ export class ToolService {
       });
       const existing = (
         await this.db.query<Record<string, unknown>>(
-          "SELECT * FROM tool_executions WHERE tenant_id=$1 AND idempotency_key=$2",
-          [context.tenant_id, idempotencyKey],
+          "SELECT * FROM tool_executions WHERE idempotency_key=$1",
+          [idempotencyKey],
         )
       ).rows[0];
       if (existing?.status === "completed") return existing.output_json;
       if (
         existing &&
-        ["running", "unknown"].includes(String(existing.status))
+        (["running", "unknown"].includes(String(existing.status)) ||
+          (Boolean(policy.side_effecting) &&
+            existing.status === "failed" &&
+            !existing.resolution_reason))
       ) {
         throw new ConflictError("tool execution outcome is unresolved");
       }
@@ -266,38 +247,49 @@ export class ToolService {
         );
       } else {
         await this.db.query(
-          `INSERT INTO tool_executions(id,tenant_id,run_id,tool_call_id,tool_name,implementation_key,idempotency_key,arguments_hash,lease_expires_at)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8,now()+interval '5 minutes')`,
+          `INSERT INTO tool_executions(id,run_id,tool_call_id,tool_name,implementation_key,idempotency_key,arguments_hash,lease_expires_at,side_effecting)
+          VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '5 minutes',$8)`,
           [
             executionId,
-            context.tenant_id,
             context.run_id,
             callId,
             record.name,
             implementationKey,
             idempotencyKey,
             hashJson(args),
+            Boolean(policy.side_effecting),
           ],
         );
       }
       try {
         const output = await implementation(args, context);
+        await this.faults.hit("tool.after_effect_before_commit", {
+          run_id: context.run_id,
+          execution_id: executionId,
+          tool_name: record.name,
+          side_effecting: Boolean(policy.side_effecting),
+        });
         await this.db.query(
           "UPDATE tool_executions SET status='completed',output_json=$2::jsonb,completed_at=now(),lease_expires_at=NULL,updated_at=now() WHERE id=$1",
           [executionId, JSON.stringify(output ?? null)],
         );
         return output;
       } catch (error) {
-        await this.db.query(
-          "UPDATE tool_executions SET status='failed',error_json=$2::jsonb,completed_at=now(),lease_expires_at=NULL,updated_at=now() WHERE id=$1",
-          [
-            executionId,
-            JSON.stringify({
-              code: error instanceof Error ? error.name : "Error",
-              message: String(error),
-            }),
-          ],
-        );
+        // For a declared side effect, every failure after dispatch is
+        // ambiguous. A failed result commit must never authorize a replay.
+        await this.db
+          .query(
+            "UPDATE tool_executions SET status=$2,error_json=$3::jsonb,completed_at=now(),lease_expires_at=NULL,updated_at=now() WHERE id=$1",
+            [
+              executionId,
+              policy.side_effecting ? "unknown" : "failed",
+              JSON.stringify({
+                code: error instanceof Error ? error.name : "Error",
+                message: String(error),
+              }),
+            ],
+          )
+          .catch(() => undefined);
         throw error;
       }
     };
@@ -306,47 +298,82 @@ export class ToolService {
       description: String(record.description),
       parameters: record.schema as never,
       strict: false,
-      needsApproval: Boolean(policy.requires_approval),
+      ...(policy.side_effecting ? { errorFunction: null } : {}),
+      needsApproval: Boolean(policy.requires_approval || policy.side_effecting),
       execute,
     } as never);
   }
 
-  async executions(tenantId: string, runId: string) {
+  async executions(runId: string) {
     return (
       await this.db.query(
-        "SELECT * FROM tool_executions WHERE tenant_id=$1 AND run_id=$2 ORDER BY created_at",
-        [tenantId, runId],
+        "SELECT * FROM tool_executions WHERE run_id=$1 ORDER BY created_at",
+        [runId],
       )
     ).rows;
   }
 
-  async resolveExecution(
-    tenantId: string,
-    id: string,
-    input: Record<string, unknown>,
-    actorId: string,
-  ) {
-    const execution = await required<Record<string, unknown>>(
-      this.db,
-      "SELECT * FROM tool_executions WHERE id=$1 AND tenant_id=$2",
-      [id, tenantId],
-      "tool execution not found",
-    );
-    if (!["unknown", "failed"].includes(String(execution.status))) {
-      throw new ConflictError("tool execution does not require reconciliation");
-    }
-    return required(
-      this.db,
-      "UPDATE tool_executions SET status=$3,output_json=$4::jsonb,error_json=$5::jsonb,resolved_by=$6,resolution_reason=$7,completed_at=now(),updated_at=now() WHERE id=$1 AND tenant_id=$2 RETURNING *",
-      [
-        id,
-        tenantId,
-        input.status,
-        JSON.stringify(input.output ?? null),
-        JSON.stringify(input.error ?? null),
-        actorId,
-        input.reason,
-      ],
-    );
+  async resolveExecution(id: string, input: Record<string, unknown>) {
+    const status = String(input.status ?? "");
+    if (!["completed", "failed"].includes(status))
+      throw new ValidationError(
+        "reconciled Tool execution status must be completed or failed",
+      );
+    if (!String(input.reason ?? "").trim())
+      throw new ValidationError("reconciliation reason is required");
+    return this.db.transaction(async (tx) => {
+      const execution = await required<Record<string, unknown>>(
+        tx,
+        "SELECT * FROM tool_executions WHERE id=$1 FOR UPDATE",
+        [id],
+        "tool execution not found",
+      );
+      if (!["unknown", "failed"].includes(String(execution.status)))
+        throw new ConflictError(
+          "tool execution does not require reconciliation",
+        );
+      const updated = await required<Record<string, unknown>>(
+        tx,
+        "UPDATE tool_executions SET status=$2,output_json=$3::jsonb,error_json=$4::jsonb,resolution_reason=$5,completed_at=now(),lease_expires_at=NULL,updated_at=now() WHERE id=$1 RETURNING *",
+        [
+          id,
+          status,
+          JSON.stringify(input.output ?? null),
+          JSON.stringify(input.error ?? null),
+          String(input.reason),
+        ],
+      );
+      const unresolved = (
+        await tx.query<{ count: number }>(
+          "SELECT count(*)::int count FROM tool_executions WHERE run_id=$1 AND status IN ('running','unknown')",
+          [execution.run_id],
+        )
+      ).rows[0]?.count;
+      if (!unresolved) {
+        const run = (
+          await tx.query<Record<string, unknown>>(
+            "SELECT status FROM runs WHERE id=$1 FOR UPDATE",
+            [execution.run_id],
+          )
+        ).rows[0];
+        if (run?.status === "waiting_reconciliation") {
+          await tx.query(
+            "UPDATE runs SET status='queued',lease_owner=NULL,lease_expires_at=NULL,updated_at=now() WHERE id=$1",
+            [execution.run_id],
+          );
+          await this.events.appendInTransaction(
+            tx,
+            String(execution.run_id),
+            "tool.reconciled",
+            {
+              execution_id: id,
+              status,
+              reason: String(input.reason),
+            },
+          );
+        }
+      }
+      return updated;
+    });
   }
 }

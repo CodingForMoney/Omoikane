@@ -1,16 +1,27 @@
-slug: example-business-tools-v1
-name: Example Business Tools
-transport: stdio
-endpoint_config:
-  command: node
-  args:
-    - --import
-    - tsx
-    - examples/business-mcp/server.ts
-secret_refs: {}
-policy:
-  allowed_tools:
-    - get_account_summary
-    - create_review_request
-  approval_required:
-    - create_review_request
+apiVersion: omoikane/v1
+kind: McpServer
+metadata:
+  slug: example-business-tools-v1
+  name: Example Business Tools
+spec:
+  transport: stdio
+  endpoint:
+    command: node
+    args:
+      - --import
+      - tsx
+      - examples/business-mcp/server.ts
+  secret_refs: {}
+  policy:
+    allowed_tools:
+      - get_account_summary
+      - create_review_request
+    approval:
+      mode: selected
+      tools:
+        - create_review_request
+    side_effecting_tools:
+      - create_review_request
+    connect_timeout_ms: 10000
+    call_timeout_ms: 60000
+    max_output_bytes: 262144

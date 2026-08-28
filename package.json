@@ -1,6 +1,6 @@
 {
   "name": "omoikane",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Durable TypeScript Agent Runtime built on the OpenAI Agents SDK",
   "type": "module",
   "main": "./dist/index.js",
@@ -13,13 +13,15 @@
     "./client": {
       "types": "./dist/client/index.d.ts",
       "import": "./dist/client/index.js"
+    },
+    "./contracts": {
+      "types": "./dist/contracts.d.ts",
+      "import": "./dist/contracts.js"
     }
   },
   "bin": {
     "omoikane": "./dist/bin/cli.js",
     "omoikane-runtime": "./dist/bin/runtime.js",
-    "omoikane-worker": "./dist/bin/worker.js",
-    "omoikane-webhook-worker": "./dist/bin/webhook-worker.js",
     "omoikane-migrate": "./dist/bin/migrate.js"
   },
   "files": [
@@ -29,29 +31,31 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "npm run clean && tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.check.json",
     "dev": "node --import tsx src/bin/runtime.ts",
     "start": "node dist/bin/runtime.js",
-    "worker": "node dist/bin/worker.js",
-    "webhook-worker": "node dist/bin/webhook-worker.js",
     "migrate": "node --import tsx src/bin/migrate.ts",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:postgres": "vitest run --config vitest.postgres.config.ts",
+    "test:postgres:docker": "node --import tsx scripts/postgres-test.ts",
     "test:mimo": "node --import tsx scripts/mimo-e2e.ts",
+    "test:e2e:structured-output": "node --import tsx scripts/structured-output-e2e.ts",
     "test:e2e:mimo": "vitest run --config vitest.e2e.config.ts test/e2e/mimo-runtime.e2e.test.ts",
+    "test:e2e:codex-bridge-compaction": "vitest run --config vitest.e2e.config.ts test/e2e/codex-bridge-compaction.e2e.test.ts",
     "test:e2e:compaction-100k": "vitest run --config vitest.compaction-100k.config.ts test/e2e/mimo-compaction-100k.e2e.test.ts",
+    "eval:compaction": "node --import tsx scripts/compaction-semantic-eval.ts",
     "test:sandbox": "node --import tsx scripts/sandbox-smoke.ts",
     "check:docs": "node --import tsx scripts/check-docs.ts",
     "format": "prettier --write 'src/**/*.ts' 'test/**/*.ts' 'scripts/**/*.ts' 'examples/**/*.ts' 'vitest*.config.ts'",
     "example:mcp": "node --import tsx examples/business-mcp/server.ts",
-    "prepack": "npm run clean && npm run check && npm test && npm run build",
+    "prepack": "npm run check && npm test && npm run build",
     "clean": "node -e \"import('node:fs').then(({rmSync})=>rmSync('dist',{recursive:true,force:true}))\""
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^4.0.44",
     "@ai-sdk/google": "^4.0.54",
-    "@aws-sdk/client-s3": "^3.883.0",
     "@electric-sql/pglite": "^0.3.10",
     "@fastify/multipart": "^9.2.1",
     "@modelcontextprotocol/sdk": "^1.25.1",
@@ -65,7 +69,6 @@
     "fastify": "^5.6.0",
     "openai": "^7.2.0",
     "pg": "^8.16.3",
-    "redis": "^5.8.2",
     "uuidv7": "^1.0.2",
     "yaml": "^2.8.1",
     "zod": "^4.1.5"

@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "corpus_version": "2026-08-28.v1",
+  "description": "Checked-in release qualification summaries. An entry records historical evidence for an exact subject tuple; it is not online proof that any individual Projection is semantically complete.",
+  "entries": [
+    {
+      "observed_at": "2026-08-28",
+      "subject": {
+        "provider": "xiaomi_mimo",
+        "model": "mimo-v2.5",
+        "protocol": "responses",
+        "strategy": "portable",
+        "projection_version": 4,
+        "runtime_version": "0.0.2",
+        "sdk_version": "0.17.0"
+      },
+      "status": "passed",
+      "generation_count": 3,
+      "probe_count_per_generation": 22,
+      "max_observed_task_score_drop": 0,
+      "generations": [
+        {"generation": 1, "tokens_before": 48890, "tokens_after": 4283, "task_success_rate": 1, "critical_fact_recall": 1, "exact_value_recall": 1, "constraint_retention": 1, "false_fact_rate": 0, "stale_fact_rate": 0},
+        {"generation": 2, "tokens_before": 27888, "tokens_after": 4503, "task_success_rate": 1, "critical_fact_recall": 1, "exact_value_recall": 1, "constraint_retention": 1, "false_fact_rate": 0, "stale_fact_rate": 0},
+        {"generation": 3, "tokens_before": 28108, "tokens_after": 4653, "task_success_rate": 1, "critical_fact_recall": 1, "exact_value_recall": 1, "constraint_retention": 1, "false_fact_rate": 0, "stale_fact_rate": 0}
+      ]
+    },
+    {
+      "observed_at": "2026-08-28",
+      "subject": {
+        "provider": "codex_bridge",
+        "model": "gpt-5.6-sol",
+        "protocol": "responses",
+        "strategy": "native",
+        "projection_version": 4,
+        "runtime_version": "0.0.2",
+        "sdk_version": "0.17.0"
+      },
+      "status": "passed",
+      "generation_count": 1,
+      "probe_count_per_generation": 22,
+      "max_observed_task_score_drop": 0,
+      "generations": [
+        {"generation": 1, "tokens_before": 48890, "tokens_after": 2444, "task_success_rate": 1, "critical_fact_recall": 1, "exact_value_recall": 1, "constraint_retention": 1, "false_fact_rate": 0, "stale_fact_rate": 0}
+      ]
+    }
+  ]
+}

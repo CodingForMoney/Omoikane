@@ -6,6 +6,16 @@ import YAML from "yaml";
 import { OmoikaneClient } from "../client/index.js";
 import { parseAgentMarkdown } from "../agent-definitions.js";
 import { OMOIKANE_VERSION } from "../runtime-versions.js";
+import { configuredCredentialSecret, getSettings } from "../config.js";
+import {
+  createPgliteBackup,
+  defaultBackupPath,
+  restorePgliteBackup,
+  verifyBackup,
+} from "../backup.js";
+import { safeUpgrade } from "../upgrade.js";
+import type { BackupVerification } from "../backup.js";
+import type { UpgradeResult } from "../upgrade.js";
 
 const program = new Command()
   .name("omoikane")
@@ -14,9 +24,19 @@ const program = new Command()
 const client = (options: { url?: string }) =>
   new OmoikaneClient({
     baseUrl: options.url ?? process.env.OMOIKANE_URL ?? "http://127.0.0.1:8000",
-    tenantId: process.env.OMOIKANE_TENANT_ID,
-    actorId: process.env.OMOIKANE_ACTOR_ID ?? "omoikane-cli",
   });
+const backupSummary = (result: BackupVerification) => ({
+  path: result.path,
+  format: `${result.manifest.format}/v${result.manifest.format_version}`,
+  created_at: result.manifest.created_at,
+  migration_version: result.manifest.migration.current_version,
+  files_verified: result.files_verified,
+  bytes_verified: result.bytes_verified,
+});
+const upgradeSummary = (result: UpgradeResult) => ({
+  ...result,
+  backup: result.backup ? backupSummary(result.backup) : undefined,
+});
 program
   .command("init")
   .argument("[directory]", "project directory", ".")
@@ -28,7 +48,7 @@ program
       resolve(root, "omoikane.yaml"),
       YAML.stringify({
         apiVersion: "omoikane.io/v1",
-        kind: "ProjectRelease",
+        kind: "RuntimeDeployment",
         project: "my-agent-project",
         resources: {
           agents: { assistant: "agents/assistant/AGENT.md" },
@@ -57,13 +77,9 @@ program
   .command("deploy-agent")
   .argument("<agentFile>")
   .option("--url <url>")
-  .option("--draft")
   .action(async (path, options) => {
     const document = await readFile(resolve(path), "utf8");
-    const result = await client(options).createAgentFromDefinition(
-      document,
-      !options.draft,
-    );
+    const result = await client(options).deployDefinition(document);
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   });
 program
@@ -90,22 +106,78 @@ program
   });
 program
   .command("run")
-  .requiredOption("--agent-version <id>")
+  .requiredOption("--deployment <id>")
   .requiredOption("--input <text>")
-  .option("--session <id>")
+  .option("--external-session <id>")
   .option("--url <url>")
   .action(async (options) => {
     const runtime = client(options);
     const created = await runtime.createRun({
-      agent_version_id: options.agentVersion,
+      deployment_id: options.deployment,
       input: options.input,
-      session_id: options.session,
+      external_session_id: options.externalSession,
     });
     const runId = String(created.id);
     for await (const event of runtime.streamRun(runId))
       process.stdout.write(`${JSON.stringify(event)}\n`);
     const run = await runtime.getRun(runId);
     process.stdout.write(`${JSON.stringify(run, null, 2)}\n`);
+  });
+program
+  .command("backup")
+  .description("Create and verify an offline PGlite snapshot")
+  .argument("[target]", "new snapshot directory")
+  .action(async (target) => {
+    const settings = getSettings();
+    const result = await createPgliteBackup(
+      settings,
+      target ? resolve(target) : defaultBackupPath(settings),
+    );
+    process.stdout.write(`${JSON.stringify(backupSummary(result), null, 2)}\n`);
+  });
+program
+  .command("backup-verify")
+  .description("Verify a snapshot manifest and all file checksums")
+  .argument("<snapshot>")
+  .action(async (snapshot) => {
+    const result = await verifyBackup(resolve(snapshot));
+    process.stdout.write(`${JSON.stringify(backupSummary(result), null, 2)}\n`);
+  });
+program
+  .command("restore")
+  .description(
+    "Restore a verified PGlite snapshot into an empty data directory",
+  )
+  .argument("<snapshot>")
+  .argument("<dataDirectory>")
+  .action(async (snapshot, dataDirectory) => {
+    const result = await restorePgliteBackup(
+      resolve(snapshot),
+      resolve(dataDirectory),
+      { externalCredentialSecret: configuredCredentialSecret() },
+    );
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  });
+program
+  .command("upgrade")
+  .description("Preflight and safely upgrade the offline Runtime database")
+  .option("--check", "perform read-only compatibility checks")
+  .option("--backup <path>", "PGlite pre-upgrade snapshot path")
+  .option(
+    "--postgres-backup <path>",
+    "existing non-empty pg_dump file required for PostgreSQL upgrades",
+  )
+  .action(async (options) => {
+    const result = await safeUpgrade(getSettings(), {
+      checkOnly: Boolean(options.check),
+      backupPath: options.backup ? resolve(options.backup) : undefined,
+      postgresBackupPath: options.postgresBackup
+        ? resolve(options.postgresBackup)
+        : undefined,
+    });
+    process.stdout.write(
+      `${JSON.stringify(upgradeSummary(result), null, 2)}\n`,
+    );
   });
 program
   .command("serve")
@@ -115,8 +187,11 @@ program
   });
 program
   .command("migrate")
-  .description("Apply database migrations")
+  .description("Alias for the safe upgrade workflow")
   .action(async () => {
-    await import("./migrate.js");
+    const result = await safeUpgrade(getSettings());
+    process.stdout.write(
+      `${JSON.stringify(upgradeSummary(result), null, 2)}\n`,
+    );
   });
 await program.parseAsync();

@@ -1,228 +1,160 @@
-# Omoikane 架构与能力边界
+# Architecture and state ownership
 
-> 当前源码基线：Omoikane `0.0.2`；Node.js 22+；`@openai/agents` `0.17.0`；ESM；migration `0001`
+## Product boundary
 
-本文是系统架构、能力状态和公共边界的统一事实入口。安装与 API 操作见[开发者手册](DEVELOPER_GUIDE.md)，Provider 细节见[Provider 文档](PROVIDERS.md)，未关闭工作见[生产就绪清单](PRODUCTION_READINESS.md)。
+Omoikane is a persistent execution engine, not a platform control plane. One process serves one local business system and one namespace. There are no Tenant, User, Actor, authentication, organization, or cross-customer isolation concepts in its API or current schema.
 
-## 1. 定位与职责
+The ownership rule is:
 
-Omoikane 是完全使用 TypeScript 实现、通过 npm 和 Docker 分发的独立 Agent Runtime。OpenAI Agents SDK 负责 Agent loop、Tool/MCP、Handoff、Guardrail、结构化输出和模型流；Omoikane 补齐服务化、持久化、Provider 管理、长期状态和平台治理。
+> Generic execution state required for reliable Agent operation belongs to Omoikane. State whose meaning, permission, lifecycle, or correctness depends on the domain belongs to the business system.
 
-稳定调用边界是 REST/SSE 和 `omoikane/client`。业务项目不访问 Runtime 数据库，也不依赖内部 service。
+| State                                                       | Owner           |
+| ----------------------------------------------------------- | --------------- |
+| Provider/model configuration                                | Omoikane        |
+| Immutable Agent Deployment                                  | Omoikane        |
+| Tool, MCP, and Skill definitions                            | Omoikane        |
+| Run queue/status/lease/retry/cancel                         | Omoikane        |
+| Approval checkpoint and SDK RunState                        | Omoikane        |
+| Tool idempotency, MCP Run snapshots, and ambiguous result   | Omoikane        |
+| Short-lived Event, Usage detail, and Artifact               | Omoikane        |
+| Worker/maintenance status and metadata-only execution Trace | Omoikane        |
+| User identity and business authorization                    | Business system |
+| Canonical conversation and messages                         | Business system |
+| Long-term memory or experience                              | Business system |
+| Business records, notifications, releases, permanent files  | Business system |
 
-| Omoikane | 业务项目 |
-|---|---|
-| Provider、Agent Version、Runner、Session、Event | 最终用户身份、权限和 UI |
-| Tool/MCP 调度、审批状态、Run 恢复 | 审批人的鉴权和业务决定 |
-| Memory、Compaction、Artifact | 业务主数据与业务事务 |
-| Usage/Cost、Webhook、Runtime Generation | 调度策略、业务通知和结果解释 |
-| Sandbox 生命周期和资源边界 | 决定允许暴露哪些业务能力 |
-
-## 2. 能力矩阵
-
-“已实现”表示存在可执行 TypeScript 和至少一种自动化验证，不表示已经获得生产 SLA。
-
-| 能力 | OpenAI Agents SDK | Omoikane 当前状态 |
-|---|---|---|
-| Agent 定义与注册 | `Agent` 对象 | `AGENT.md`、全局设置、不可变版本和发布已实现 |
-| Runner | `Runner`、`RunState` | 队列、lease、取消、超时和恢复已实现；多进程故障注入待补 |
-| Function Tool | `tool()` | 注册表、Schema、审批和执行账本已实现 |
-| MCP | stdio/SSE/Streamable HTTP | 注册、Secret 引用和健康检查已实现；细粒度执行策略未强制 |
-| Session/Context | Session 接口 | PostgreSQL/PGlite Transcript 与 Projection 已实现 |
-| Streaming | SDK stream events | SSE、顺序号、重放、reasoning/output 分流已实现；当前使用 DB polling |
-| Guardrail | 输入/输出 Guardrail | 配置式正则规则已实现；不是完整策略引擎 |
-| 人工审批 | interruption + RunState | 加密状态、跨 Worker approve/reject/resume 已实现 |
-| 结构化输出 | JSON Schema output type | Agent Version 固化 Schema 已实现 |
-| 数据库存储 | 不提供平台数据库 | PostgreSQL 生产、PGlite 开发，migration `0001` |
-| REST/SSE API | 不提供 | Fastify `/v1` API 和 TypeScript Client 已实现 |
-| Tracing/Usage/Cost | SDK tracing 与 Usage | Trace metadata、Usage、价格、成本和基础预算已实现 |
-| 多 Agent | Handoff | 版本引用、递归构建和环检测已实现 |
-| Sandbox | 不提供业务容器沙箱 | Local/Docker 已实现；Local 不安全，生产策略仍有缺口 |
-| `SKILL.md` | 不提供平台技能治理 | Bundle、版本、物化和指令注入已实现 |
-| 长期经验记忆 | 不提供 | Scope、CRUD、检索和 Run 后写入已实现；检索质量仍是基础级别 |
-| Context Compaction | Provider/SDK 有相关接口 | Portable Projection、审计和恢复已实现；Native adapter 未接入 |
-| Artifact | 不提供平台文件服务 | Local/S3、校验和和 Run 血缘已实现 |
-| Webhook | 不提供 | 事务内 Delivery、HMAC、重试和重放已实现 |
-| Release/Channel | 不提供 | 不可变 Project Release 和 CAS Channel 已实现 |
-
-完整生产缺口只在[生产就绪清单](PRODUCTION_READINESS.md)维护，专题文档不再各自建立重复待办。
-
-## 3. 技术架构
-
-| 层 | 实现 |
-|---|---|
-| Agent Runtime | `@openai/agents`、`@openai/agents-openai`、AI SDK adapter |
-| API | Fastify 5、REST、SSE、multipart |
-| 数据 | `pg` + PostgreSQL；本地和测试使用 PGlite |
-| Schema/配置 | TypeScript、Zod、JSON Schema、YAML |
-| MCP | `@modelcontextprotocol/sdk` |
-| Artifact | 本地文件或 S3 API |
-| Sandbox | Node `child_process` + Docker CLI |
-| 测试 | Vitest + Agents SDK `ScriptedModel` + 显式 live E2E |
-| 分发 | 单一 npm 包、CLI bins、Docker/Compose/Helm |
-
-```mermaid
-flowchart LR
-  App[Business App] --> Client[omoikane/client]
-  Client --> API[Fastify REST + SSE]
-  API --> DB[(PostgreSQL/PGlite)]
-  AgentWorker[Agent Worker] --> DB
-  WebhookWorker[Webhook Worker] --> DB
-  AgentWorker --> SDK[OpenAI Agents SDK]
-  SDK --> Provider[Model Provider]
-  SDK --> Tool[Function Tool]
-  SDK --> MCP[Business MCP]
-  Tool --> Sandbox[Local/Docker Sandbox]
-  AgentWorker --> Artifact[Local/S3 Artifact]
-```
-
-主要模块：
-
-- `Container`：composition root；
-- `ProviderService`：Provider/Profile/Model 和 SDK Model adapter；
-- `AgentFactory`：把已发布 Agent Version 编译为 SDK `Agent`；
-- `RunnerService`：领取 Run，执行 SDK，保存事件、Usage、审批和结果；
-- `SessionService`：保存 Canonical Transcript，实现 SDK Session；
-- `CompactionService`：生成可逆 Context Projection；
-- `ToolService`、`SkillService`、`MemoryService`、`SandboxService`、`ArtifactService`：平台扩展能力；
-- `EventStore` 与 `WebhookWorker`：持久事件、Transactional Outbox 和外部通知。
-
-源码集中在 `src/`，迁移为 `migrations/0001_typescript_runtime.sql`，离线测试位于 `test/`，真实 Provider E2E 位于 `test/e2e/`。
-
-## 4. Agent 定义、默认与平台策略
-
-配置分层：
+## Local topology
 
 ```text
-Platform Policy（不可突破）
-  ↓
-Global Defaults（租户默认）
-  ↓
-AGENT.md spec（角色覆盖）
-  ↓
-显式发布 overrides
-  ↓
-Immutable Agent Version
+Business system
+      |
+      | REST / SSE on loopback
+      v
++-------------------------------------------+
+| One Omoikane process                      |
+| API + Provider/Agent/Tool/MCP/Skill       |
+| Run queue + Worker pool + maintenance     |
+| Approval + Compaction + Artifact + Usage  |
+| Runtime status + metadata-only Tracing    |
++-------------------------------------------+
+      |                         |
+      v                         v
+PGlite by default          Local Artifact files
+PostgreSQL optional        Immutable Skill bundles
 ```
 
-- global instructions：所有角色必须遵守的组织规则；
-- defaults：模型设置、Runtime 限额、Memory、Compaction、Tracing 和 Sandbox 默认；
-- policy：turns、tool calls、handoffs、运行时长等硬上限；
-- `AGENT.md`：角色身份、目标、判断标准及确有必要的差异；
-- Provider Connection：独立管理，不在角色中保存 Key、URL 或协议。
+The default Worker pool has four slots. A separate maintenance loop reclaims expired leases, expires approvals, and applies retention. This is one service topology; there is no standalone Worker executable or generation router.
 
-最小定义：
-
-```md
----
-apiVersion: agentsdk/v1
-kind: Agent
-metadata:
-  slug: research-reviewer
-  name: Research Reviewer
-spec:
-  provider:
-    connection_id: <connection-id>
-  model: mimo-v2.5
-  tools: []
-  skills: []
----
-
-Review evidence, unsupported claims and unresolved questions.
-```
-
-编译和发布依次执行：校验 Definition、深合并 defaults、应用显式 overrides、前置 global instructions、按 policy 收紧数值限额、固化 revision/config hash、创建 draft，再显式 publish。全局设置变化不会修改旧 Agent Version。
-
-| 内容 | 放置位置 |
-|---|---|
-| 企业政策、统一输出底线 | global instructions / policy |
-| 默认 Memory、Compaction、Tracing | global defaults |
-| 角色身份、目标和判断标准 | `AGENT.md` body |
-| Tool/Skill/MCP/Handoff 差异 | `AGENT.md` spec |
-| Provider Key、URL、协议 | Provider Connection |
-| 用户请求和业务对象 | Run input/context |
-| 完整对话 | Session Transcript |
-| 跨会话事实 | Memory |
-
-Agent 是逻辑资源；Agent Version 是不可变运行资源；Project Release 再把一组 Agent/Skill/MCP 版本固化为可回滚集合。
-
-## 5. Run、状态与数据一致性
+## Run lifecycle
 
 ```text
-queued -> running -> completed
-                  -> failed
-                  -> cancelled
-                  -> waiting_approval -> queued -> running
-                  -> waiting_reconciliation
+queued -> running -> completed | failed | cancelled
+                    |
+                    +-> waiting_approval -> queued
+                    |
+                    +-> waiting_reconciliation
 ```
 
-Run 固化 `agent_version_id`、config hash、SDK version、Runtime Generation 和 Trace ID。Worker 使用 `FOR UPDATE SKIP LOCKED` 领取并续租；未知副作用结果不能自动重复执行，而是进入人工 reconciliation。
+Queued Runs are claimed transactionally and receive a monotonically increasing `execution_attempt`. A running Run renews its lease. After process loss, a Run with no uncertain Tool side effect is returned to the queue. The `run.requeued` Event declares `execution_semantics: at_least_once`, `model_replay_possible: true`, and invalidates provisional output from the preceding attempt.
 
-审批中断保存加密 SDK `RunState` 及格式版本。恢复时验证版本并应用决定。升级 SDK 时，新旧 generation Worker 不混合恢复彼此的暂停状态。
+Every side-effecting Function Tool and MCP Tool is approval-gated. The approval stores the OpenAI Agents SDK `RunState` before dispatch, so reconciliation resumes the exact same Tool call and idempotency key. If the external effect or its local result commit is uncertain, the execution becomes `unknown` and the Run waits for explicit reconciliation instead of repeating it.
 
-关键不变量：
+Run state transitions and ordered Events share a database transaction. The Runtime persists input, caller conversation, context, output, and SDK approval state as JSONB so the local process can recover after restart.
 
-- Run 状态、Run version、终态 Event 和目标 Webhook Delivery 同事务提交；
-- Event sequence 单调递增，数据库 Event log 是事实来源；
-- Tool execution 由 `run_id + tool_call_id + tool` 派生稳定幂等键；
-- Session append 使用事务，Canonical Transcript 不因压缩删除；
-- Provider Key、Webhook Secret 和 RunState 使用认证加密，API 返回明确剔除密文字段。
+Recovery guarantees are deliberately explicit:
 
-## 6. Memory、Compaction、Artifact 与 Sandbox
+| Boundary                                | Semantics                                                                                |
+| --------------------------------------- | ---------------------------------------------------------------------------------------- |
+| Run execution after Worker loss         | at least once; model work and cost may repeat                                            |
+| Run terminal state + matching Event     | one local database transaction                                                           |
+| Side-effecting Tool                     | approval checkpoint + idempotency journal; unknown outcomes require reconciliation       |
+| Model retry inside one attempt          | at most one by default, and only for HTTP 429 or Provider-confirmed replay-safe failures |
+| Timeout, ambiguous network failure, 5xx | no automatic model replay                                                                |
+| SSE Event delivery                      | at least once across reconnect; deduplicate by per-Run `seq`                             |
 
-Memory 和 Compaction 严格分离：Memory 管理跨 Session 的事实及作用域；Compaction 只改变模型输入 Projection，不删除 Transcript，也不自动写 Memory。详细算法见[Context Compaction 文档](CONTEXT_COMPACTION.md)。
+The Runtime writes `model.request_started`, `model.request_completed`, and `model.request_failed` Events without request or response content. A started request with no matching completion after process loss is evidence that Provider work may have happened. Omoikane does not claim exactly-once model execution.
 
-Artifact 保存 SHA-256、大小、MIME、storage key、Run 血缘；开发使用本地文件，生产使用 S3/MinIO。
+REST resource lists use bounded `(created_at,id)` keyset pagination. `GET /v1/runs` returns control-plane summaries rather than stored execution payloads. SSE remains database-backed and replayable by per-Run sequence, but idle streams wait on an in-process notification registered after transaction commit, with a low-frequency database fallback. Total and per-Run connection limits protect the single local process. There is no Redis, distributed Event Bus, or cross-instance stream coordination.
 
-Local Sandbox 只有工作目录和超时，不构成安全边界。生产 Docker Sandbox 使用非 root、只读 rootfs、drop capabilities、`no-new-privileges`、PID/CPU/内存限制、默认无网络和独立可写目录。Docker socket 本身仍是高权限边界，因此 Worker 应独立部署。
+Temporary Run Artifacts use a filesystem/SQL recovery protocol because those two stores cannot share one transaction. Upload streams to a private staging file, persists size and SHA-256, atomically renames the file, and then exposes the metadata as `active`. Deletion first records `deleting` and is idempotently completed by maintenance or startup recovery. Startup also reconciles interrupted `staging` records, verifies active files, and removes orphans. TTL is enforced on every read/list as well as by maintenance. Per-file and total active-byte limits bound local memory and disk exposure; permanent files remain business-owned.
 
-## 7. 多项目接入与发布
+Every Run has a stable Omoikane `trace_id`. When Runtime-global tracing is enabled, each execution attempt gets a separate OpenAI Agents SDK Trace ID recorded in `run.started`. SDK Trace metadata contains only the Run ID, stable Run Trace ID, execution attempt, Deployment ID, Provider, and model. It deliberately excludes `external_session_id`. Input/output, Tool arguments/results, rejected Guardrail output, and credentials are disabled at both the Runtime Runner and SDK global logging layers.
 
-推荐每个业务环境使用独立 Runtime，或至少隔离数据库、Artifact prefix、Sandbox root 和 Provider Secret：
+Input and Output Guardrails execute through the OpenAI Agents SDK lifecycle,
+while their typed local implementation registry, timeout/failure policy,
+structured audit Events, and delivery safety belong to Omoikane. Input checks
+finish before a model request starts. If a reachable Agent has an Output
+Guardrail, the Runtime withholds model text, reasoning, message items, and
+`agent.completed` output until the final output passes. Accepted buffered text
+and the terminal Event commit atomically; rejected content never enters the Run
+Event stream. Function/MCP Tool arguments and outputs remain governed by Tool
+schema, approval, and execution policy rather than Output Guardrails.
 
-```text
-project-a/dev  -> Omoikane dev A
-project-a/prod -> Omoikane prod A
-project-b/dev  -> Omoikane dev B
+## Conversation and memory
+
+A Run is self-contained:
+
+```json
+{
+  "deployment_id": "...",
+  "external_session_id": "correlation-only",
+  "conversation": [],
+  "input": "...",
+  "context": {}
+}
 ```
 
-共享实例必须位于可信 Gateway 后，由 Gateway 设置 `X-Tenant-ID` 和 `X-Actor-ID`。Runtime 当前不验证 Header 来源，不能直接暴露给互不信任的调用方。
+There is no Session or Memory repository. Compaction transforms caller-supplied items into a temporary Projection; it does not change the business transcript or write long-term memory. Business memory can be supplied through `context`, a Function Tool, or MCP after the business system applies its own permission, freshness, and relevance rules.
 
-业务定义仓库推荐包含：
+## Retention
 
-```text
-business-project/
-├── omoikane.yaml
-├── agents/*/AGENT.md
-├── skills/*/SKILL.md
-├── mcp/*.yaml
-├── schemas/*.json
-├── tests/
-└── application/
-```
+| Class                                    | Default                                    |
+| ---------------------------------------- | ------------------------------------------ |
+| Active Run/checkpoint                    | retained until resolved or terminal        |
+| Terminal payload and detailed errors     | purged after 24 hours                      |
+| Events for terminal Runs                 | deleted after 7 days                       |
+| Active Artifact bytes                    | unavailable at TTL; deleted by maintenance |
+| Artifact lifecycle tombstones            | purged one Artifact TTL after transition   |
+| Run control metadata and aggregate Usage | retained for operation                     |
 
-发布顺序为：创建并验证 Provider Connection；上传 Skill/MCP/Agent；发布不可变 Agent Version；创建 Project Release；使用 revision CAS 切换 Channel。回滚只把 Channel 指回历史 Release。
+The business system must copy accepted results and files before TTL expiry.
 
-开发中的 Runtime 分为 `local`、`next` 和 `stable`。业务项目依赖固定 Client 版本并连接稳定 Runtime URL，不引用本地源码路径，也不在生产使用 `latest`。
+## Local trust model
 
-Runtime Generation 用于 SDK/RunState 升级隔离：新 Run 进入新 generation，旧 Worker 排空旧 Run 和审批状态后再停止；数据库迁移遵循 expand/contract。
+The API is unauthenticated and binds to loopback by default. Remote binding requires an explicit unsafe override and must be placed behind the business system's trusted boundary. CORS origins are allowlisted.
 
-## 8. 公共合同与部署
+Provider keys are protected against accidental database-only disclosure. Omoikane does not claim to protect local data after the host or Runtime process is compromised. Run-level application encryption, cloud KMS, keyrings, tenants, and end-user authorization are non-goals.
 
-npm exports：
+The OpenAI Agents SDK installs an OpenAI Trace exporter when imported, but Omoikane replaces that global processor before any Run starts. Tracing is disabled by default. Export to OpenAI requires an explicit Runtime setting and dedicated key; custom exporters must be registered in the same process. Export is bounded and batched, failure never changes Run status, and shutdown flushes pending items. Logs use allowlisted correlation/status fields and do not serialize raw exceptions, Provider bodies, Tool content, or credentials.
 
-- `omoikane`：Runtime、Container、配置、Tool 注册和 Provider Catalog；
-- `omoikane/client`：轻量 HTTP/SSE Client；
-- bins：`omoikane`、`omoikane-runtime`、`omoikane-worker`、`omoikane-webhook-worker`、`omoikane-migrate`。
+stdio MCP servers receive a minimal environment, not the Runtime's Provider keys or database settings. MCP credentials must be injected explicitly with `secret_refs`.
 
-生产把 API、Agent Worker 和 Webhook Worker 分开扩缩容，以 PostgreSQL 为事实来源，S3/MinIO 保存 Artifact，并将 Secret、Docker socket 和网络策略放在基础设施边界内。
+MCP Tools are Runtime-managed rather than delegated to a Provider-hosted MCP feature. Omoikane uses the OpenAI Agents SDK transports and conversion primitives, then applies its own allowlist, approval, timeout, output-size, execution-journal, collision, and per-Run snapshot rules. This keeps the contract consistent across OpenAI, MiMo, and other Providers. MCP endpoint configuration is trusted local configuration; URL/domain policy is not an isolation boundary.
 
-公共兼容维度包括 REST major、Event schema、Agent Definition、Compaction checkpoint、RunState format、migration head、Runtime Generation 和 Agents SDK version。
+The supported boundary is MCP Tools, not a general-purpose MCP Host. Resources/Templates/Read are a possible demand-gated read-only extension but are not automatically injected into model context. Prompts would conflict with Deployment-owned instructions; Roots would grant filesystem authority; Sampling would permit server-initiated model work; Elicitation would require business user interaction; Tasks would duplicate durable Runs; OAuth requires business identity ownership. These capabilities are deliberately absent until a concrete integration defines their authority and lifecycle.
 
-## 9. 明确边界
+Skill definitions and their immutable file indexes belong to Omoikane because exact version binding and checksum verification are generic execution infrastructure. Skill content and version selection belong to the business system. The supported contract injects `SKILL.md` instructions; it does not provide executable Skill workspaces or automatically run bundled entrypoints.
 
-- Runtime 面向受信业务 Agent 平台，不实现最终用户登录、组织和 RBAC；
-- 不承诺对任意 Prompt、Trace 和 Tool 参数做可靠的通用脱敏；明确 Secret 使用字段隔离和加密，业务内容由调用方治理；
-- 不把 Memory Flush 与 Context Compaction 绑定；
-- Agent Version 不保存明文 Provider Key 或任意 URL；只有显式 custom provider 可配置 URL；
-- 不把“功能存在”描述成“生产完备”。生产宣布前必须关闭[生产就绪清单](PRODUCTION_READINESS.md)中的 P0 项并完成安全、备份恢复和故障注入审查。
+Omoikane currently provides no supported built-in Sandbox or model-directed shell execution. Function Tool and MCP implementations run inside boundaries selected by the integrating business system, which must externally isolate untrusted code. Experimental Process/Docker Sandbox code remains in the repository only as a future option and is not part of the public product contract.
+
+## Upgrade migration
+
+Runtime startup always checks that recorded migrations are a contiguous prefix known to the binary. A new database can be initialized automatically; an existing database with pending migrations refuses to start until the offline safe-upgrade command runs. This prevents an application restart from silently combining schema mutation with normal Run processing.
+
+PGlite safe upgrade is `preflight -> offline snapshot -> checksum verification -> ordered migration -> post-verification`. The snapshot contains generic execution state, the file-backed Provider credential key, Skill bundles, and temporary Artifacts. Restore is allowed only into a missing or empty target and verifies database compatibility plus Provider/Skill/Artifact readability. The CLI coordinates these operations with the Runtime lock. Rollback means restoring the pre-upgrade snapshot; there are no destructive down migrations.
+
+PostgreSQL uses the same migration preflight and post-verification, but backup and restore remain delegated to `pg_dump` and `pg_restore`. Before an existing PostgreSQL schema is changed, Omoikane requires a non-empty external backup file and records its checksum as evidence. It does not claim to validate the dump's logical completeness.
+
+Migration `0005` collapses legacy tenant namespaces, removes unused cloud/control-plane tables and fields, and keeps only the single-instance schema. Before changing anything, it detects duplicate resource slugs, Run idempotency keys, and Tool idempotency keys across old namespaces. Any conflict aborts the migration transaction; Omoikane never chooses or overwrites a winner automatically.
+
+Migration `0006` converts Usage to a Provider-reported Token contract: `reported`, `partial`, or `missing`, with `null` Token counts for missing reports and one cumulative snapshot per Run. Monetary pricing and budget calculation are deliberately outside the Runtime.
+
+Migration `0007` adds immutable MCP Tool/policy bindings per Run and MCP execution provenance, side-effect, output-size, and output-hash fields.
+
+Migration `0008` adds small per-Run compaction control state so projection revision, retry suppression, and measured-token verification survive process restart. It does not add Session, transcript, or memory storage.
+
+Migration `0009` adds the durable Run execution-attempt counter used to delimit replayed provisional Events.
+
+Migration `0010` adds the Run/status keyset index used by bounded Artifact listing. The lifecycle itself reuses the existing durable `status`, checksum, size, and expiry fields.
+
+Earlier migrations remain in the package so existing databases can upgrade in order. A new database ends at schema head `0010`.
