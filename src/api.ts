@@ -352,6 +352,9 @@ export async function createApp(
       runtime_managed_mcp_tools: true,
       mcp_streamable_http: true,
       mcp_sse_compatibility: true,
+      mcp_oauth_auto_scopes: true,
+      mcp_oauth_confidential_clients: true,
+      mcp_oauth_url_client_metadata: true,
       mcp_resources: false,
       provider_hosted_mcp: false,
       structured_output: true,
@@ -786,6 +789,50 @@ export async function createApp(
   app.delete("/v1/mcp-servers/:serverId", async (request, reply) => {
     const { serverId } = requestParams(request, "deleteMcpServer");
     await container.mcp.delete(serverId);
+    return reply.code(204).send();
+  });
+  app.get("/v1/mcp-servers/:serverId/oauth/status", async (request, reply) => {
+    const { serverId } = requestParams(request, "mcpOAuthStatus");
+    reply.header("Cache-Control", "no-store");
+    return container.mcp.oauthStatus(serverId);
+  });
+  app.get(
+    "/v1/mcp-servers/:serverId/oauth/client-metadata",
+    async (request, reply) => {
+      const { serverId } = requestParams(request, "mcpOAuthClientMetadata");
+      reply.header("Cache-Control", "public, max-age=300");
+      return container.mcp.oauthClientMetadata(serverId);
+    },
+  );
+  app.post("/v1/mcp-servers/:serverId/oauth/start", async (request, reply) => {
+    const { serverId } = requestParams(request, "startMcpOAuth");
+    requestBody(request, "startMcpOAuth");
+    reply.header("Cache-Control", "no-store");
+    return container.mcp.startOAuth(serverId);
+  });
+  app.post(
+    "/v1/mcp-servers/:serverId/oauth/callback",
+    async (request, reply) => {
+      const { serverId } = requestParams(request, "completeMcpOAuth");
+      const callback = requestBody(request, "completeMcpOAuth");
+      reply.header("Cache-Control", "no-store");
+      reply.header("Referrer-Policy", "no-referrer");
+      return container.mcp.completeOAuth(serverId, callback);
+    },
+  );
+  app.get(
+    "/v1/mcp-servers/:serverId/oauth/callback",
+    async (request, reply) => {
+      const { serverId } = requestParams(request, "completeMcpOAuthRedirect");
+      const callback = requestQuery(request, "completeMcpOAuthRedirect");
+      reply.header("Cache-Control", "no-store");
+      reply.header("Referrer-Policy", "no-referrer");
+      return container.mcp.completeOAuth(serverId, callback);
+    },
+  );
+  app.delete("/v1/mcp-servers/:serverId/oauth", async (request, reply) => {
+    const { serverId } = requestParams(request, "disconnectMcpOAuth");
+    await container.mcp.disconnectOAuth(serverId);
     return reply.code(204).send();
   });
   app.post("/v1/mcp-servers/:serverId/health", async (request) => {

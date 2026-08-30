@@ -18,6 +18,7 @@ export const MIGRATION_FILES = [
   "0008_compaction_runtime.sql",
   "0009_recovery_semantics.sql",
   "0010_artifact_lifecycle.sql",
+  "0011_mcp_oauth.sql",
 ] as const;
 
 export const MIGRATION_VERSIONS = MIGRATION_FILES.map(

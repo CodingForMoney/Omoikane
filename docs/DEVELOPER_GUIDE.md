@@ -18,6 +18,7 @@ One process starts the REST/SSE API, Run worker pool, maintenance loop, embedded
 | --------------------------------------- | --------------------------------------------------------------------- |
 | `OMOIKANE_DATA_DIR`                     | root for the default database, local files, and credential key        |
 | `OMOIKANE_HOST`, `OMOIKANE_PORT`        | bind address and port; defaults to `127.0.0.1:8000`                   |
+| `OMOIKANE_PUBLIC_BASE_URL`              | externally visible base URL used for MCP OAuth callbacks              |
 | `OMOIKANE_CORS_ORIGINS`                 | comma-separated browser-origin allowlist                              |
 | `OMOIKANE_RUN_CONCURRENCY`              | in-process Run worker count; default `4`                              |
 | `OMOIKANE_DATABASE_URL`                 | optional PGlite or PostgreSQL override                                |
@@ -155,11 +156,51 @@ spec:
     max_output_bytes: 262144
 ```
 
-For HTTP transports, use `endpoint.url` and targets such as `headers.Authorization` in `secret_refs`. Values are environment-variable names, not credentials. Unknown configuration and policy fields are rejected. Existing flat `transport`/`endpoint_config` records and `approval_required` lists remain accepted for compatibility and are normalized to this contract.
+For HTTP transports, use `endpoint.url`. Static bearer credentials may use targets such as `headers.Authorization` in `secret_refs`; values are environment-variable names, not credentials. OAuth endpoints use `auth.type: oauth`. A non-empty `auth.scopes` list selects explicit scope mode; omitting it selects automatic discovery and requires `policy.approval.mode: always`. OAuth cannot be combined with a configured `Authorization` header. Unknown configuration and policy fields are rejected. Existing flat `transport`/`endpoint_config` records and `approval_required` lists remain accepted for compatibility and are normalized to this contract.
+
+Remote MCP OAuth uses RFC 9728 protected-resource discovery, authorization-server discovery, Authorization Code with PKCE, issuer validation, refresh tokens, and encrypted local persistence. It supports public or confidential dynamic registration, URL-based Client IDs, and pre-registered clients. `OMOIKANE_PUBLIC_BASE_URL` must resolve from the user's browser to this Runtime; it defaults to the local bind URL. URL-based Client IDs additionally require a public HTTPS base URL. Start authorization explicitly, open the returned URL in a browser, and let the authorization server redirect to the Runtime callback.
+
+`auth.client_registration` selects one of three generic client modes:
+
+- `dynamic` registers a public client by default; set `token_endpoint_auth_method` to `client_secret_basic` or `client_secret_post` for a confidential client;
+- `metadata_url` uses `client_metadata_url`, or the Runtime's HTTPS metadata endpoint when omitted, as the OAuth Client ID;
+- `pre_registered` reads the Client ID from `client_id_env` and, for confidential clients, the secret from `client_secret_env`.
+
+Client IDs and secrets supplied through environment-variable references are never copied into the public MCP server resource.
+
+Register each remote service through the generic MCP resource contract:
+
+```yaml
+apiVersion: omoikane/v1
+kind: McpServer
+metadata:
+  slug: remote-tools
+  name: Remote Tools
+spec:
+  transport: streamable_http
+  endpoint:
+    url: https://mcp.example.com/mcp
+  auth:
+    type: oauth
+    scopes: [tools.read]
+  policy:
+    approval:
+      mode: never
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/mcp-servers/remote-tools/oauth/start \
+  -H 'content-type: application/json' -d '{}'
+curl http://127.0.0.1:8000/v1/mcp-servers/remote-tools/oauth/status
+```
+
+The start response contains `authorization_url`. OAuth state and PKCE verifier expire after 15 minutes. The Runtime refreshes credentials after a protected server returns `401`; it never returns access tokens, refresh tokens, registered client secrets, pre-registered secrets, or PKCE material through resource/status APIs. `DELETE /v1/mcp-servers/:id/oauth` removes the local authorization. Provider-side revocation remains a separate account action.
+
+`auth.write_scopes` marks provider-specific write authorities such as `order:write`, `trade:write`, and `trading.write`. Requesting one of those scopes requires `policy.approval.mode: always`. Automatic scope mode can request every scope advertised by a server, so it also requires approval for every Tool call.
 
 Omoikane connects and discovers Tools with the OpenAI Agents SDK, validates names and schemas, filters the exposed set, and converts each effective MCP Tool to a managed Function Tool. Policy is enforced again at invocation. Side-effecting Tools always require approval even when `approval.mode` is `never`. Calls have an aborting timeout and a serialized UTF-8 output limit. Oversized content is not stored; only size, SHA-256, and the stable error are recorded.
 
-Each Run stores an immutable MCP Tool/policy snapshot and fingerprint. Approval resume therefore rebuilds the same Tool graph even if the server record changes. Tool name collisions across Function Tools or MCP servers fail Agent construction. An Agent reference may narrow, but never broaden, the server policy:
+Each Run stores an immutable MCP Tool-schema/policy snapshot and fingerprint. Approval resume therefore rebuilds the same Tool graph even if the server record changes. Endpoint, static-secret references, and OAuth authorization remain operational server configuration rather than part of that snapshot; do not change them while a Run using the server is nonterminal. Tool name collisions across Function Tools or MCP servers fail Agent construction. An Agent reference may narrow, but never broaden, the server policy:
 
 ```yaml
 mcp_servers:
@@ -176,6 +217,7 @@ Allowlist merging uses intersection; side-effect and selected-approval sets use 
 The REST inspection surface is:
 
 - `GET/POST /v1/mcp-servers`, `GET/PATCH/DELETE /v1/mcp-servers/:id`;
+- `POST /v1/mcp-servers/:id/oauth/start`, `GET /oauth/status`, browser/JSON `GET/POST /oauth/callback`, `GET /oauth/client-metadata`, and `DELETE /oauth`;
 - `POST /v1/mcp-servers/:id/health` for discovered/effective/blocked Tools and the current fingerprint;
 - `GET /v1/mcp-servers/:id/tools` for effective schemas;
 - `POST /v1/mcp-servers/:id/tools/:tool/call` for non-side-effecting, non-approval test calls only.
@@ -184,17 +226,17 @@ The REST inspection surface is:
 
 Omoikane is an MCP Tools Runtime, not a general-purpose MCP Host. The capability response deliberately reports `runtime_managed_mcp_tools: true`, `mcp_resources: false`, and `provider_hosted_mcp: false`.
 
-| MCP capability                       | Product contract                                                                                                                  |
-| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
-| Tools over stdio/Streamable HTTP/SSE | Supported with discovery, filtering, approval, timeout, output limits, immutable Run binding, journaling, and recovery            |
-| Resources, Resource Templates, Read  | Not exposed; a demand-gated read-only extension is possible because the Agents SDK transport wrappers already provide these calls |
-| Prompts                              | Not supported; Agent instructions remain owned by immutable `AGENT.md` Deployments                                                |
-| Roots                                | Not supported; Omoikane does not expose local directory authority to MCP servers                                                  |
-| Sampling                             | Not supported; an MCP server cannot initiate model work outside the durable Run execution contract                                |
-| Elicitation                          | Not supported; business identity, user interaction, and UI state remain business-system concerns                                  |
-| Tasks                                | Not supported; MCP task state does not replace or bypass Omoikane Runs                                                            |
-| OAuth discovery/refresh              | Not owned by the Runtime; the business system supplies credentials through explicit `secret_refs`                                 |
-| Provider-hosted MCP                  | Not the cross-Provider backend; OpenAI-specific use may be added later only as an explicit adapter                                |
+| MCP capability                       | Product contract                                                                                                                                                             |
+| ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tools over stdio/Streamable HTTP/SSE | Supported with discovery, filtering, approval, timeout, output limits, immutable Tool/policy Run binding, journaling, and recovery                                           |
+| Resources, Resource Templates, Read  | Not exposed; a demand-gated read-only extension is possible because the Agents SDK transport wrappers already provide these calls                                            |
+| Prompts                              | Not supported; Agent instructions remain owned by immutable `AGENT.md` Deployments                                                                                           |
+| Roots                                | Not supported; Omoikane does not expose local directory authority to MCP servers                                                                                             |
+| Sampling                             | Not supported; an MCP server cannot initiate model work outside the durable Run execution contract                                                                           |
+| Elicitation                          | Not supported; business identity, user interaction, and UI state remain business-system concerns                                                                             |
+| Tasks                                | Not supported; MCP task state does not replace or bypass Omoikane Runs                                                                                                       |
+| OAuth discovery/refresh              | Supported for remote HTTP MCP with explicit/automatic scopes, public/confidential/URL clients, browser callback, encrypted state, issuer/PKCE validation, and refresh-on-401 |
+| Provider-hosted MCP                  | Not the cross-Provider backend; OpenAI-specific use may be added later only as an explicit adapter                                                                           |
 
 If a business integration needs Resources, add only bounded list/template/read APIs with timeout, size, URI, and content-type validation. Resource content must not be injected automatically into Agent context: the business system or an explicit Agent binding must select it. The other capabilities require a new ownership, approval, persistence, or isolation design and are not missing parts of the current MCP Tools contract.
 
@@ -528,7 +570,7 @@ npx omoikane restore /safe/location/omoikane-before-change /new/empty/data-dir
 
 The backup command writes to a new directory atomically and verifies every regular file with SHA-256. Its versioned manifest records the Runtime version, applied and target migrations, and exclusions. It contains the offline PGlite directory, local `credential.key` when file-backed, immutable Skill bundles, and the Artifact directory. It excludes Sandbox workspaces, caches/logs, environment Provider keys, and business-owned conversations or memory that Omoikane never stored.
 
-Restore accepts only a missing or empty destination and never overwrites an active data directory. It verifies the manifest and checksums, migration compatibility, encrypted Provider credential readability, Skill file indexes, Artifact metadata/bytes, and relocates absolute Skill bundle paths. A snapshot created with `OMOIKANE_CREDENTIAL_SECRET` instead of a key file requires that same environment secret during restore. Restore preserves the snapshot's schema version; run `upgrade` afterward if it is older than the current head.
+Restore accepts only a missing or empty destination and never overwrites an active data directory. It verifies the manifest and checksums, migration compatibility, encrypted Provider credential and MCP OAuth state readability, Skill file indexes, Artifact metadata/bytes, and relocates absolute Skill bundle paths. A snapshot created with `OMOIKANE_CREDENTIAL_SECRET` instead of a key file requires that same environment secret during restore. Restore preserves the snapshot's schema version; run `upgrade` afterward if it is older than the current head.
 
 Do not edit a snapshot or treat its checksum manifest as protection against a malicious party who can rewrite both files and manifest. This is corruption detection for trusted local storage, not a signed or encrypted archive.
 

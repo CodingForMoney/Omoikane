@@ -19,6 +19,7 @@ import type { Settings } from "./config.js";
 import { Database } from "./database.js";
 import { MIGRATION_VERSIONS, assertMigrationCompatible } from "./migrations.js";
 import { ProviderService } from "./providers.js";
+import { McpOAuthService } from "./mcp-oauth.js";
 import { RuntimeLock } from "./runtime-lock.js";
 import { OMOIKANE_VERSION } from "./runtime-versions.js";
 
@@ -541,6 +542,11 @@ export async function restorePgliteBackup(
       credentialsVerified = await new ProviderService(
         db,
         credentialSecret,
+      ).verifyStoredCredentialEncryption();
+      credentialsVerified += await new McpOAuthService(
+        db,
+        credentialSecret,
+        "http://127.0.0.1",
       ).verifyStoredCredentialEncryption();
     } finally {
       await db.close();

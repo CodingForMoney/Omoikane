@@ -20,6 +20,13 @@ import { canonicalJson, hashJson, newId } from "./serialization.js";
 import type { RuntimeContext } from "./tools.js";
 import type { FaultInjector } from "./recovery.js";
 import type { PageOptions } from "./pagination.js";
+import {
+  McpAuthorizationRequiredError,
+  McpOAuthService,
+  type McpAuthConfig,
+  type McpOAuthCallback,
+  type McpOAuthConfig,
+} from "./mcp-oauth.js";
 
 type McpTool = Awaited<ReturnType<MCPServer["listTools"]>>[number];
 type McpToolCallDetails = Parameters<
@@ -48,6 +55,7 @@ export interface McpServerData extends Record<string, unknown> {
   endpoint_config: Record<string, unknown>;
   secret_refs: Record<string, string>;
   policy: McpPolicy;
+  auth: McpAuthConfig;
 }
 
 export interface McpReference extends Record<string, unknown> {
@@ -110,6 +118,164 @@ const stringRecord = (
     throw new ValidationError(`${label} values must be strings`);
   return record as Record<string, string>;
 };
+
+function normalizeAuth(
+  value: unknown,
+  current: McpAuthConfig | undefined,
+  transport: McpTransport,
+): McpAuthConfig {
+  if (value === undefined) return current ?? { type: "none" };
+  const auth = asRecord(value, "MCP auth");
+  const type = String(auth.type ?? "none");
+  if (type === "none") {
+    assertKeys(auth, ["type"], "MCP auth");
+    return { type: "none" };
+  }
+  if (type !== "oauth")
+    throw new ValidationError("MCP auth.type must be none or oauth");
+  if (transport === "stdio")
+    throw new ValidationError("MCP OAuth requires streamable_http or sse");
+  assertKeys(
+    auth,
+    [
+      "type",
+      "scope_mode",
+      "scopes",
+      "write_scopes",
+      "client_name",
+      "client_registration",
+      "token_endpoint_auth_method",
+      "client_metadata_url",
+      "client_id_env",
+      "client_secret_env",
+    ],
+    "MCP auth",
+  );
+  const scopes = stringList(auth.scopes, "MCP auth.scopes")
+    .map((scope) => scope.trim())
+    .filter(Boolean);
+  const scopeMode = String(
+    auth.scope_mode ?? (scopes.length ? "explicit" : "auto"),
+  ) as "explicit" | "auto";
+  if (!["explicit", "auto"].includes(scopeMode))
+    throw new ValidationError("MCP auth.scope_mode must be explicit or auto");
+  if (scopeMode === "explicit" && !scopes.length)
+    throw new ValidationError(
+      "MCP auth.scopes must list at least one scope in explicit mode",
+    );
+  if (scopeMode === "auto" && scopes.length)
+    throw new ValidationError(
+      "MCP auth.scopes must be omitted in automatic scope mode",
+    );
+  if (scopes.some((scope) => scope.length > 256 || /\s/.test(scope)))
+    throw new ValidationError(
+      "MCP auth.scopes entries must be non-empty scope tokens",
+    );
+  const clientName = String(auth.client_name ?? "Omoikane MCP Client").trim();
+  if (!clientName || clientName.length > 512)
+    throw new ValidationError("MCP auth.client_name is invalid");
+  const writeScopes = stringList(
+    auth.write_scopes ?? ["mcp.write"],
+    "MCP auth.write_scopes",
+  )
+    .map((scope) => scope.trim())
+    .filter(Boolean);
+  if (writeScopes.some((scope) => scope.length > 256 || /\s/.test(scope)))
+    throw new ValidationError(
+      "MCP auth.write_scopes entries must be non-empty scope tokens",
+    );
+  const clientRegistration = String(
+    auth.client_registration ?? "dynamic",
+  ) as McpOAuthConfig["client_registration"];
+  if (
+    !["dynamic", "metadata_url", "pre_registered"].includes(clientRegistration)
+  )
+    throw new ValidationError(
+      "MCP auth.client_registration must be dynamic, metadata_url, or pre_registered",
+    );
+  const tokenEndpointAuthMethod = String(
+    auth.token_endpoint_auth_method ?? "none",
+  ) as McpOAuthConfig["token_endpoint_auth_method"];
+  if (
+    !["none", "client_secret_basic", "client_secret_post"].includes(
+      tokenEndpointAuthMethod,
+    )
+  )
+    throw new ValidationError(
+      "MCP auth.token_endpoint_auth_method is unsupported",
+    );
+  const clientMetadataUrl = auth.client_metadata_url
+    ? String(auth.client_metadata_url).trim()
+    : undefined;
+  if (clientMetadataUrl) {
+    let url: URL;
+    try {
+      url = new URL(clientMetadataUrl);
+    } catch {
+      throw new ValidationError("MCP auth.client_metadata_url is invalid");
+    }
+    if (url.protocol !== "https:" || url.pathname === "/")
+      throw new ValidationError(
+        "MCP auth.client_metadata_url must be HTTPS with a non-root path",
+      );
+  }
+  const clientIdEnvironment = auth.client_id_env
+    ? String(auth.client_id_env).trim()
+    : undefined;
+  const clientSecretEnvironment = auth.client_secret_env
+    ? String(auth.client_secret_env).trim()
+    : undefined;
+  for (const [label, environmentName] of [
+    ["client_id_env", clientIdEnvironment],
+    ["client_secret_env", clientSecretEnvironment],
+  ] as const)
+    if (environmentName && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(environmentName))
+      throw new ValidationError(
+        `MCP auth.${label} must name an environment variable`,
+      );
+  if (clientRegistration === "dynamic") {
+    if (clientMetadataUrl || clientIdEnvironment || clientSecretEnvironment)
+      throw new ValidationError(
+        "dynamic MCP OAuth registration cannot use client metadata or pre-registered client environment variables",
+      );
+  } else if (clientRegistration === "metadata_url") {
+    if (
+      clientIdEnvironment ||
+      clientSecretEnvironment ||
+      tokenEndpointAuthMethod !== "none"
+    )
+      throw new ValidationError(
+        "URL-based MCP OAuth clients cannot use client credentials",
+      );
+  } else {
+    if (!clientIdEnvironment)
+      throw new ValidationError(
+        "pre-registered MCP OAuth requires client_id_env",
+      );
+    if (tokenEndpointAuthMethod !== "none" && !clientSecretEnvironment)
+      throw new ValidationError(
+        "confidential pre-registered MCP OAuth requires client_secret_env",
+      );
+    if (clientMetadataUrl)
+      throw new ValidationError(
+        "pre-registered MCP OAuth cannot use client_metadata_url",
+      );
+  }
+  return {
+    type: "oauth",
+    scope_mode: scopeMode,
+    scopes: [...new Set(scopes)],
+    write_scopes: [...new Set(writeScopes)],
+    client_name: clientName,
+    client_registration: clientRegistration,
+    token_endpoint_auth_method: tokenEndpointAuthMethod,
+    ...(clientMetadataUrl ? { client_metadata_url: clientMetadataUrl } : {}),
+    ...(clientIdEnvironment ? { client_id_env: clientIdEnvironment } : {}),
+    ...(clientSecretEnvironment
+      ? { client_secret_env: clientSecretEnvironment }
+      : {}),
+  };
+}
 
 function normalizeApproval(
   value: unknown,
@@ -215,6 +381,7 @@ function normalizeInput(
         "endpoint",
         "endpoint_config",
         "secret_refs",
+        "auth",
         "policy",
         "execution_mode",
         "status",
@@ -230,7 +397,14 @@ function normalizeInput(
   if (isDocument)
     assertKeys(
       spec,
-      ["transport", "endpoint", "secret_refs", "policy", "execution_mode"],
+      [
+        "transport",
+        "endpoint",
+        "secret_refs",
+        "auth",
+        "policy",
+        "execution_mode",
+      ],
       "spec",
     );
   if (spec.execution_mode !== undefined && spec.execution_mode !== "runtime")
@@ -296,6 +470,35 @@ function normalizeInput(
         `MCP secret ref ${target} must name an environment variable`,
       );
   }
+  const auth = normalizeAuth(spec.auth, current?.auth, transport);
+  if (auth.type === "oauth" && transport !== "stdio") {
+    const headers = stringRecord(endpoint.headers, "MCP endpoint.headers");
+    const configuredAuthorization = Object.keys(headers).some(
+      (name) => name.toLowerCase() === "authorization",
+    );
+    const secretAuthorization = Object.keys(secretRefs).some((target) => {
+      const name = target.startsWith("headers.") ? target.slice(8) : target;
+      return name.toLowerCase() === "authorization";
+    });
+    if (configuredAuthorization || secretAuthorization)
+      throw new ValidationError(
+        "MCP OAuth cannot be combined with an Authorization header",
+      );
+  }
+  const policy = normalizePolicy(spec.policy, "MCP policy", current?.policy);
+  if (auth.type === "oauth" && policy.approval.mode !== "always") {
+    if ((auth.scope_mode ?? "explicit") === "auto")
+      throw new ValidationError(
+        "automatic MCP OAuth scopes require policy.approval.mode=always",
+      );
+    const requestedWriteScopes = auth.scopes.filter((scope) =>
+      (auth.write_scopes ?? ["mcp.write"]).includes(scope),
+    );
+    if (requestedWriteScopes.length)
+      throw new ValidationError(
+        `MCP OAuth write scope ${requestedWriteScopes.join(", ")} requires policy.approval.mode=always`,
+      );
+  }
   return {
     slug,
     name,
@@ -304,7 +507,8 @@ function normalizeInput(
       transport,
       endpoint_config: endpoint,
       secret_refs: secretRefs,
-      policy: normalizePolicy(spec.policy, "MCP policy", current?.policy),
+      auth,
+      policy,
     } satisfies McpServerData,
   };
 }
@@ -479,6 +683,7 @@ export class McpService {
   constructor(
     private readonly db: Database,
     private readonly faults: FaultInjector,
+    private readonly oauth: McpOAuthService,
   ) {
     this.store = new ResourceStore(db);
   }
@@ -517,12 +722,27 @@ export class McpService {
   async update(id: string, input: Record<string, unknown>) {
     const current = await this.get(id);
     const normalized = normalizeInput(input, current);
-    return this.store.update<McpServerData>("mcp_server", current.id, {
-      slug: normalized.slug,
-      name: normalized.name,
-      status: normalized.status,
-      data: normalized.data,
+    const previousCredentialBoundary = hashJson({
+      endpoint: current.endpoint_config,
+      auth: current.auth ?? { type: "none" },
     });
+    const nextCredentialBoundary = hashJson({
+      endpoint: normalized.data.endpoint_config,
+      auth: normalized.data.auth,
+    });
+    const updated = await this.store.update<McpServerData>(
+      "mcp_server",
+      current.id,
+      {
+        slug: normalized.slug,
+        name: normalized.name,
+        status: normalized.status,
+        data: normalized.data,
+      },
+    );
+    if (previousCredentialBoundary !== nextCredentialBoundary)
+      await this.oauth.disconnect(current.id);
+    return updated;
   }
 
   async delete(id: string) {
@@ -579,6 +799,11 @@ export class McpService {
         value,
       ]),
     );
+    if (record.auth?.type === "oauth") {
+      const status = await this.oauth.status(record.id, record.auth);
+      if (status.status === "disconnected")
+        throw new McpAuthorizationRequiredError(record.id);
+    }
     const options = {
       name: String(record.name),
       url: String(endpoint.url),
@@ -593,6 +818,9 @@ export class McpService {
         record.policy.call_timeout_ms / 1000,
       ),
       errorFunction: null,
+      ...(record.auth?.type === "oauth"
+        ? { authProvider: this.oauth.provider(record.id, record.auth) }
+        : {}),
     };
     return {
       server:
@@ -612,8 +840,66 @@ export class McpService {
       return built;
     } catch (error) {
       await built.server.close().catch(() => undefined);
+      if (record.auth?.type === "oauth") {
+        const status = await this.oauth.status(record.id, record.auth);
+        if (status.status === "authorization_pending")
+          throw new McpAuthorizationRequiredError(record.id);
+      }
       throw new ValidationError(redact(error, built.secretValues));
     }
+  }
+
+  private async oauthRecord(id: string) {
+    const record = await this.get(id);
+    if (record.transport === "stdio" || record.auth?.type !== "oauth")
+      throw new ValidationError("MCP server is not configured for HTTP OAuth");
+    return record as typeof record & { auth: McpOAuthConfig };
+  }
+
+  async oauthStatus(id: string) {
+    const record = await this.get(id);
+    if (record.auth?.type !== "oauth")
+      return {
+        type: "none" as const,
+        status: "not_configured" as const,
+        server_id: record.id,
+        scope_mode: "explicit" as const,
+        scopes_requested: [],
+        scopes_granted: [],
+        authorization_server: null,
+        authorization_url: null,
+        token_expires_at: null,
+      };
+    return this.oauth.status(record.id, record.auth);
+  }
+
+  async oauthClientMetadata(id: string) {
+    const record = await this.oauthRecord(id);
+    return this.oauth.clientMetadata(record.id, record.auth);
+  }
+
+  async startOAuth(id: string) {
+    const record = await this.oauthRecord(id);
+    return this.oauth.start(
+      record.id,
+      String(record.endpoint_config.url),
+      record.auth,
+    );
+  }
+
+  async completeOAuth(id: string, callback: McpOAuthCallback) {
+    const record = await this.oauthRecord(id);
+    return this.oauth.complete(
+      record.id,
+      String(record.endpoint_config.url),
+      record.auth,
+      callback,
+    );
+  }
+
+  async disconnectOAuth(id: string) {
+    const record = await this.get(id);
+    await this.oauth.disconnect(record.id);
   }
 
   private effectiveTools(tools: McpTool[], policy: McpPolicy) {

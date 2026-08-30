@@ -89,8 +89,8 @@ describe.sequential("PostgreSQL concurrency and failure recovery", () => {
     await test.closeRuntimeConnections();
     const pool = new pg.Pool({ connectionString: test.databaseUrl, max: 2 });
     try {
-      await pool.query("DROP INDEX ix_artifacts_run_status_page");
-      await pool.query("DELETE FROM omoikane_migrations WHERE version='0010'");
+      await pool.query("DROP TABLE mcp_oauth_states");
+      await pool.query("DELETE FROM omoikane_migrations WHERE version='0011'");
     } finally {
       await pool.end();
     }
@@ -105,9 +105,9 @@ describe.sequential("PostgreSQL concurrency and failure recovery", () => {
     });
     expect(result).toMatchObject({
       engine: "postgresql",
-      applied_versions: ["0010"],
+      applied_versions: ["0011"],
       postgres_backup: { path: evidence },
-      after: { current_version: "0010", pending_versions: [] },
+      after: { current_version: "0011", pending_versions: [] },
     });
   });
 

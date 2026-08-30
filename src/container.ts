@@ -15,6 +15,7 @@ import { CompactionService } from "./compaction.js";
 import { RunnerService } from "./runner.js";
 import { ResourceStore } from "./resources.js";
 import { McpService } from "./mcp.js";
+import { McpOAuthService } from "./mcp-oauth.js";
 import { NO_FAULT_INJECTOR, type FaultInjector } from "./recovery.js";
 import { GuardrailService } from "./guardrails.js";
 import { ObservabilityService } from "./observability.js";
@@ -63,7 +64,15 @@ export class Container {
       this.events,
       faults,
     );
-    this.mcp = new McpService(db, faults);
+    this.mcp = new McpService(
+      db,
+      faults,
+      new McpOAuthService(
+        db,
+        settings.credentialSecret,
+        settings.publicBaseUrl,
+      ),
+    );
     this.providers = new ProviderService(db, settings.credentialSecret);
     this.guardrails = new GuardrailService(this.events);
     this.definitions = new AgentDefinitionService(db, this.skills, this.tools);

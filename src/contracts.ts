@@ -347,6 +347,36 @@ export const McpEndpointSchema = z
     headers: z.record(z.string(), z.string()).optional(),
   })
   .strict();
+export const McpAuthSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("none") }).strict(),
+  z
+    .object({
+      type: z.literal("oauth"),
+      scope_mode: z.enum(["explicit", "auto"]).optional(),
+      scopes: z.array(z.string().trim().min(1).max(256)).max(256).optional(),
+      write_scopes: z
+        .array(z.string().trim().min(1).max(256))
+        .max(256)
+        .optional(),
+      client_name: shortText.optional(),
+      client_registration: z
+        .enum(["dynamic", "metadata_url", "pre_registered"])
+        .optional(),
+      token_endpoint_auth_method: z
+        .enum(["none", "client_secret_basic", "client_secret_post"])
+        .optional(),
+      client_metadata_url: z.string().url().max(4096).optional(),
+      client_id_env: z
+        .string()
+        .regex(/^[A-Za-z_][A-Za-z0-9_]*$/)
+        .optional(),
+      client_secret_env: z
+        .string()
+        .regex(/^[A-Za-z_][A-Za-z0-9_]*$/)
+        .optional(),
+    })
+    .strict(),
+]);
 const McpTransportSchema = z.enum(["stdio", "streamable_http", "sse"]);
 const McpMetadataSchema = z
   .object({
@@ -359,6 +389,7 @@ const McpSpecSchema = z
     transport: McpTransportSchema,
     endpoint: McpEndpointSchema,
     secret_refs: z.record(z.string(), z.string()).optional(),
+    auth: McpAuthSchema.optional(),
     policy: McpPolicySchema.optional(),
     execution_mode: z.literal("runtime").optional(),
   })
@@ -379,6 +410,7 @@ const McpLegacyCreateSchema = z
     endpoint: McpEndpointSchema.optional(),
     endpoint_config: McpEndpointSchema.optional(),
     secret_refs: z.record(z.string(), z.string()).optional(),
+    auth: McpAuthSchema.optional(),
     policy: McpPolicySchema.optional(),
     execution_mode: z.literal("runtime").optional(),
     status: z.string().min(1).max(64).optional(),
@@ -404,6 +436,15 @@ export const McpServerUpdateSchema = z.union([
 ]);
 export const McpToolCallSchema = z
   .object({ arguments: JsonObjectSchema.optional() })
+  .strict();
+export const McpOAuthCallbackSchema = z
+  .object({
+    code: z.string().min(1).max(16_384).optional(),
+    state: z.string().min(1).max(4096).optional(),
+    iss: z.string().url().max(4096).optional(),
+    error: z.string().min(1).max(256).optional(),
+    error_description: z.string().max(4096).optional(),
+  })
   .strict();
 
 export const SkillImportSchema = z
@@ -728,8 +769,37 @@ export const McpServerRecordSchema = ResourceRecordSchema.extend({
   transport: z.enum(["stdio", "streamable_http", "sse"]),
   endpoint_config: JsonObjectSchema,
   secret_refs: z.record(z.string(), z.string()),
+  auth: McpAuthSchema,
   policy: JsonObjectSchema,
 }).passthrough();
+export const McpOAuthStatusSchema = z
+  .object({
+    type: z.enum(["none", "oauth"]),
+    status: z.enum([
+      "not_configured",
+      "disconnected",
+      "authorization_pending",
+      "connected",
+    ]),
+    server_id: z.string(),
+    scope_mode: z.enum(["explicit", "auto"]),
+    scopes_requested: z.array(z.string()),
+    scopes_granted: z.array(z.string()),
+    authorization_server: z.string().nullable(),
+    authorization_url: z.string().nullable(),
+    token_expires_at: z.string().datetime().nullable(),
+  })
+  .strict();
+export const McpOAuthClientMetadataSchema = z
+  .object({
+    redirect_uris: z.array(z.string().url()),
+    token_endpoint_auth_method: z.string().optional(),
+    grant_types: z.array(z.string()).optional(),
+    response_types: z.array(z.string()).optional(),
+    client_name: z.string().optional(),
+    scope: z.string().optional(),
+  })
+  .passthrough();
 export const McpHealthSchema = z
   .object({
     status: z.enum(["ok", "degraded"]),
@@ -827,6 +897,7 @@ export type ToolCreate = z.infer<typeof ToolCreateSchema>;
 export type ToolExecutionResolve = z.infer<typeof ToolExecutionResolveSchema>;
 export type McpServerInput = z.infer<typeof McpServerCreateSchema>;
 export type McpServerUpdate = z.infer<typeof McpServerUpdateSchema>;
+export type McpOAuthCallbackInput = z.infer<typeof McpOAuthCallbackSchema>;
 export type SkillImport = z.infer<typeof SkillImportSchema>;
 export type SkillBundle = z.infer<typeof SkillBundleSchema>;
 export type ResourceRecord = z.infer<typeof ResourceRecordSchema>;
@@ -858,6 +929,10 @@ export type InputTokenCountingModel = z.infer<
 export type SkillImportResponse = z.infer<typeof SkillImportResponseSchema>;
 export type ToolExecutionRecord = z.infer<typeof ToolExecutionRecordSchema>;
 export type McpServerRecord = z.infer<typeof McpServerRecordSchema>;
+export type McpOAuthStatus = z.infer<typeof McpOAuthStatusSchema>;
+export type McpOAuthClientMetadata = z.infer<
+  typeof McpOAuthClientMetadataSchema
+>;
 export type McpHealth = z.infer<typeof McpHealthSchema>;
 export type McpToolsResponse = z.infer<typeof McpToolsResponseSchema>;
 export type McpCallResponse = z.infer<typeof McpCallResponseSchema>;
@@ -1218,6 +1293,52 @@ export const API_CONTRACTS = {
     method: "delete",
     path: "/v1/mcp-servers/:serverId",
     summary: "Delete an MCP server",
+    params: serverParams,
+    responseStatus: 204,
+  },
+  mcpOAuthStatus: {
+    method: "get",
+    path: "/v1/mcp-servers/:serverId/oauth/status",
+    summary: "Inspect MCP OAuth status",
+    params: serverParams,
+    response: McpOAuthStatusSchema,
+  },
+  mcpOAuthClientMetadata: {
+    method: "get",
+    path: "/v1/mcp-servers/:serverId/oauth/client-metadata",
+    summary: "Publish URL-based MCP OAuth client metadata",
+    params: serverParams,
+    response: McpOAuthClientMetadataSchema,
+  },
+  startMcpOAuth: {
+    method: "post",
+    path: "/v1/mcp-servers/:serverId/oauth/start",
+    summary: "Start MCP OAuth authorization",
+    params: serverParams,
+    body: EmptyObjectSchema,
+    bodyOptional: true,
+    response: McpOAuthStatusSchema,
+  },
+  completeMcpOAuth: {
+    method: "post",
+    path: "/v1/mcp-servers/:serverId/oauth/callback",
+    summary: "Complete MCP OAuth authorization",
+    params: serverParams,
+    body: McpOAuthCallbackSchema,
+    response: McpOAuthStatusSchema,
+  },
+  completeMcpOAuthRedirect: {
+    method: "get",
+    path: "/v1/mcp-servers/:serverId/oauth/callback",
+    summary: "Receive an MCP OAuth browser redirect",
+    params: serverParams,
+    query: McpOAuthCallbackSchema,
+    response: McpOAuthStatusSchema,
+  },
+  disconnectMcpOAuth: {
+    method: "delete",
+    path: "/v1/mcp-servers/:serverId/oauth",
+    summary: "Delete locally stored MCP OAuth credentials",
     params: serverParams,
     responseStatus: 204,
   },

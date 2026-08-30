@@ -49,7 +49,7 @@ const applyLegacySchema = async (db: Database) => {
 };
 
 describe("local Runtime storage boundary", () => {
-  it("generates and reuses a private local Provider credential key", async () => {
+  it("generates and reuses a private local Runtime credential key", async () => {
     const root = await tempRoot();
     const keyFile = join(root, "credential.key");
     const env = {
@@ -86,7 +86,7 @@ describe("local Runtime storage boundary", () => {
     expect(allowed.corsOrigins).toEqual(["http://127.0.0.1:3000"]);
   });
 
-  it("migrates legacy encrypted Run data to JSONB and keeps only Provider credential encryption", async () => {
+  it("migrates legacy encrypted Run data to JSONB and keeps credential encryption scoped", async () => {
     const root = await tempRoot();
     const settings = getSettings({
       AGENT_DATABASE_URL: "pglite://:memory:",
@@ -149,7 +149,16 @@ describe("local Runtime storage boundary", () => {
 
       expect(
         await migrate(db, { credentialSecret: settings.credentialSecret }),
-      ).toEqual(["0004", "0005", "0006", "0007", "0008", "0009", "0010"]);
+      ).toEqual([
+        "0004",
+        "0005",
+        "0006",
+        "0007",
+        "0008",
+        "0009",
+        "0010",
+        "0011",
+      ]);
 
       const run = (
         await db.query<Record<string, unknown>>(

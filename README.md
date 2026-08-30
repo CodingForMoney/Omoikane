@@ -92,14 +92,14 @@ saveToBusinessStore(completed.output, completed.new_items);
 | Runtime    | durable queue, leases, retry/cancel, restart recovery, paged Run listing, ordered Events, bounded REST/SSE             |
 | Agents     | immutable `AGENT.md`/JSON Deployments, model settings, Handoffs                                                        |
 | Providers  | built-in catalog, model sync/capabilities, qualified complete-input Token counting, MiMo V2.5 ASR/TTS adapters         |
-| Tools      | Function Tools; Runtime-managed MCP Tools with policy, snapshots, approvals, and reconciliation                        |
+| Tools      | Function Tools; Runtime-managed MCP Tools with OAuth, policy, snapshots, approvals, and reconciliation                 |
 | Skills     | immutable bundles, explicit version binding, checksum verification, instruction injection                              |
 | Context    | caller-supplied conversation; native/portable temporary Projection; no Session or memory store                         |
 | Output     | validated structured output; typed pluggable Input/Output Guardrails with safe output buffering                        |
 | Execution  | Function Tools and MCP Tools; paged, checksummed, quota-bounded temporary Run Artifacts; no supported built-in Sandbox |
 | Operations | PGlite snapshot/restore/safe upgrade, optional PostgreSQL, Usage, Runtime status, metadata-only SDK tracing            |
 
-The MCP product contract intentionally covers Runtime-managed Tools, not a general-purpose MCP Host. Resources, Prompts, client callbacks, OAuth ownership, and Provider-hosted MCP are outside the current boundary rather than incomplete Tool support. Context compaction remains lossy and its reliability boundary is documented explicitly.
+The MCP product contract covers Runtime-managed Tools, including generic OAuth discovery, public/confidential/URL-based OAuth clients, browser authorization, encrypted token refresh, disconnect for remote HTTP servers, and generic write-scope protection. Resources, Prompts, Elicitation, and Provider-hosted MCP remain outside the current boundary.
 
 Complete-input Token counting is capability-gated per model. Omoikane uses Provider count endpoints where available and pinned official open-source chat serializers and Tokenizers for qualified MiMo, DeepSeek, and Qwen models. Local Tokenizer counting covers text requests only and fails closed for unsupported modalities or unavailable assets; see the Provider guide for the exact model list and accuracy class.
 

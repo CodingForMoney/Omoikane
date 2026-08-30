@@ -20,6 +20,7 @@ export interface Settings {
   databaseUrl: string;
   host: string;
   port: number;
+  publicBaseUrl: string;
   allowRemote: boolean;
   corsOrigins: string[];
   artifactRoot: string;
@@ -106,6 +107,12 @@ export function getSettings(env: NodeJS.ProcessEnv = process.env): Settings {
   const dataDir = resolve(env.OMOIKANE_DATA_DIR ?? "./var");
   const credential = localCredentialSecret(env, dataDir);
   const host = env.OMOIKANE_HOST ?? env.AGENT_HOST ?? "127.0.0.1";
+  const port = z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(65_535)
+    .parse(env.OMOIKANE_PORT ?? env.AGENT_PORT ?? 8000);
   const allowRemote = bool(false).parse(env.OMOIKANE_ALLOW_REMOTE);
   if (!allowRemote && !localHosts.has(host))
     throw new Error(
@@ -132,12 +139,27 @@ export function getSettings(env: NodeJS.ProcessEnv = process.env): Settings {
       env.AGENT_DATABASE_URL ??
       `pglite://${resolve(dataDir, "omoikane")}`,
     host,
-    port: z.coerce
-      .number()
-      .int()
-      .min(1)
-      .max(65_535)
-      .parse(env.OMOIKANE_PORT ?? env.AGENT_PORT ?? 8000),
+    port,
+    publicBaseUrl: (() => {
+      const displayHost = host === "::1" ? "[::1]" : host;
+      const raw =
+        env.OMOIKANE_PUBLIC_BASE_URL ?? `http://${displayHost}:${port}`;
+      let url: URL;
+      try {
+        url = new URL(raw);
+      } catch {
+        throw new Error("OMOIKANE_PUBLIC_BASE_URL must be an absolute URL");
+      }
+      if (!["http:", "https:"].includes(url.protocol))
+        throw new Error("OMOIKANE_PUBLIC_BASE_URL must use http or https");
+      if (url.username || url.password || url.search || url.hash)
+        throw new Error(
+          "OMOIKANE_PUBLIC_BASE_URL must not contain credentials, query, or fragment",
+        );
+      if (url.pathname !== "/")
+        throw new Error("OMOIKANE_PUBLIC_BASE_URL must not contain a path");
+      return url.toString().replace(/\/$/, "");
+    })(),
     allowRemote,
     corsOrigins: (
       env.OMOIKANE_CORS_ORIGINS ?? "http://localhost:3000,http://127.0.0.1:3000"

@@ -15,6 +15,9 @@ import type {
   JsonObject,
   McpCallResponse,
   McpHealth,
+  McpOAuthClientMetadata,
+  McpOAuthCallbackInput,
+  McpOAuthStatus,
   McpServerInput,
   McpServerRecord,
   McpServerUpdate,
@@ -59,6 +62,9 @@ export type {
   JsonObject,
   McpCallResponse,
   McpHealth,
+  McpOAuthClientMetadata,
+  McpOAuthCallbackInput,
+  McpOAuthStatus,
   McpServerInput,
   McpServerRecord,
   McpServerUpdate,
@@ -330,6 +336,34 @@ export class OmoikaneClient {
   deleteMcpServer(serverId: string) {
     return this.request<void>(
       `/v1/mcp-servers/${encodeURIComponent(serverId)}`,
+      { method: "DELETE" },
+    );
+  }
+  mcpOAuthStatus(serverId: string) {
+    return this.request<McpOAuthStatus>(
+      `/v1/mcp-servers/${encodeURIComponent(serverId)}/oauth/status`,
+    );
+  }
+  mcpOAuthClientMetadata(serverId: string) {
+    return this.request<McpOAuthClientMetadata>(
+      `/v1/mcp-servers/${encodeURIComponent(serverId)}/oauth/client-metadata`,
+    );
+  }
+  startMcpOAuth(serverId: string) {
+    return this.request<McpOAuthStatus>(
+      `/v1/mcp-servers/${encodeURIComponent(serverId)}/oauth/start`,
+      { method: "POST" },
+    );
+  }
+  completeMcpOAuth(serverId: string, input: McpOAuthCallbackInput) {
+    return this.request<McpOAuthStatus>(
+      `/v1/mcp-servers/${encodeURIComponent(serverId)}/oauth/callback`,
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+  disconnectMcpOAuth(serverId: string) {
+    return this.request<void>(
+      `/v1/mcp-servers/${encodeURIComponent(serverId)}/oauth`,
       { method: "DELETE" },
     );
   }

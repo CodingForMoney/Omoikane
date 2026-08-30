@@ -319,8 +319,8 @@ describe("backup, restore, and safe upgrades", () => {
 
     const db = await Database.connect(runtimeSettings);
     try {
-      await db.query("DROP INDEX ix_artifacts_run_status_page");
-      await db.query("DELETE FROM omoikane_migrations WHERE version='0010'");
+      await db.query("DROP TABLE mcp_oauth_states");
+      await db.query("DELETE FROM omoikane_migrations WHERE version='0011'");
     } finally {
       await db.close();
     }
@@ -330,14 +330,14 @@ describe("backup, restore, and safe upgrades", () => {
 
     const backupPath = join(testRoot, "pre-upgrade");
     const result = await safeUpgrade(runtimeSettings, { backupPath });
-    expect(result.before.current_version).toBe("0009");
-    expect(result.applied_versions).toEqual(["0010"]);
+    expect(result.before.current_version).toBe("0010");
+    expect(result.applied_versions).toEqual(["0011"]);
     expect(result.after?.current_version).toBe(
       MIGRATION_VERSIONS[MIGRATION_VERSIONS.length - 1],
     );
     expect(
       (await verifyBackup(backupPath)).manifest.migration.current_version,
-    ).toBe("0009");
+    ).toBe("0010");
 
     const reopened = await Container.create(runtimeSettings, {
       startWorker: false,
