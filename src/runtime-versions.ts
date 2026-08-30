@@ -1,4 +1,4 @@
-export const OMOIKANE_VERSION = "0.0.3";
+export const OMOIKANE_VERSION = "0.0.5";
 export const OPENAI_AGENTS_SDK_VERSION = "0.17.0";
 export const RUN_STATE_FORMAT_VERSION = 1.19;
 export const API_VERSION = 1;

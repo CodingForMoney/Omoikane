@@ -1,6 +1,6 @@
 {
   "name": "omoikane",
-  "version": "0.0.3",
+  "version": "0.0.5",
   "description": "Durable TypeScript Agent Runtime built on the OpenAI Agents SDK",
   "type": "module",
   "main": "./dist/index.js",
@@ -20,9 +20,9 @@
     }
   },
   "bin": {
-    "omoikane": "./dist/bin/cli.js",
-    "omoikane-runtime": "./dist/bin/runtime.js",
-    "omoikane-migrate": "./dist/bin/migrate.js"
+    "omoikane": "dist/bin/cli.js",
+    "omoikane-runtime": "dist/bin/runtime.js",
+    "omoikane-migrate": "dist/bin/migrate.js"
   },
   "files": [
     "dist",
@@ -43,6 +43,7 @@
     "test:mimo": "node --import tsx scripts/mimo-e2e.ts",
     "test:e2e:structured-output": "node --import tsx scripts/structured-output-e2e.ts",
     "test:e2e:mimo": "vitest run --config vitest.e2e.config.ts test/e2e/mimo-runtime.e2e.test.ts",
+    "test:e2e:mimo-audio": "node --env-file=.env --import tsx scripts/mimo-audio-e2e.ts",
     "test:e2e:codex-bridge-compaction": "vitest run --config vitest.e2e.config.ts test/e2e/codex-bridge-compaction.e2e.test.ts",
     "test:e2e:compaction-100k": "vitest run --config vitest.compaction-100k.config.ts test/e2e/mimo-compaction-100k.e2e.test.ts",
     "eval:compaction": "node --import tsx scripts/compaction-semantic-eval.ts",
@@ -58,6 +59,8 @@
     "@ai-sdk/google": "^4.0.54",
     "@electric-sql/pglite": "^0.3.10",
     "@fastify/multipart": "^9.2.1",
+    "@huggingface/jinja": "^0.5.9",
+    "@huggingface/tokenizers": "^0.1.3",
     "@modelcontextprotocol/sdk": "^1.25.1",
     "@openai/agents": "0.17.0",
     "@openai/agents-extensions": "0.17.0",

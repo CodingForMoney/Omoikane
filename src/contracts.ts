@@ -1,5 +1,6 @@
 import { z } from "zod";
 import {
+  ModelCapabilitySchema,
   ModelCapabilityOverrideSchema,
   ProviderSettingsSchema,
 } from "./provider-capabilities.js";
@@ -96,6 +97,38 @@ export const ProviderModelCreateSchema = z
   })
   .strict();
 
+const Base64AudioDataSchema = z
+  .string()
+  .min(4)
+  .max(90_000_000)
+  .refine(
+    (value) => value.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(value),
+    "audio data must be canonical Base64 without a data URL prefix",
+  );
+
+export const AudioTranscriptionCreateSchema = z
+  .object({
+    model: identifier.default("mimo-v2.5-asr"),
+    audio: z
+      .object({
+        data: Base64AudioDataSchema,
+        format: z.enum(["mp3", "wav"]),
+      })
+      .strict(),
+    language: z.enum(["auto", "zh", "en"]).default("auto"),
+  })
+  .strict();
+
+export const SpeechCreateSchema = z
+  .object({
+    model: identifier.default("mimo-v2.5-tts"),
+    input: z.string().trim().min(1).max(32_000),
+    voice: z.string().trim().min(1).max(512).optional(),
+    format: z.enum(["wav", "mp3"]).default("wav"),
+    instructions: z.string().trim().min(1).max(8_000).optional(),
+  })
+  .strict();
+
 export const AgentDefinitionValidateSchema = z
   .object({
     document: z.string().min(1).max(2_000_000),
@@ -146,6 +179,26 @@ export const RunCreateSchema = z
     context: JsonObjectSchema.optional(),
     limits: RunLimitsSchema.optional(),
     parent_run_id: identifier.optional(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.conversation && value.projection)
+      context.addIssue({
+        code: "custom",
+        path: ["projection"],
+        message: "conversation and projection are mutually exclusive",
+      });
+  });
+
+export const InputTokenCountSchema = z
+  .object({
+    input: z.union([
+      z.string(),
+      z.array(ModelInputItemSchema).min(1).max(100_000),
+    ]),
+    conversation: z.array(ModelInputItemSchema).max(100_000).optional(),
+    projection: JsonObjectSchema.optional(),
+    context: JsonObjectSchema.optional(),
   })
   .strict()
   .superRefine((value, context) => {
@@ -515,7 +568,16 @@ export const ProviderDefinitionSchema = z
     name: z.string(),
     default_profile: z.string(),
     profiles: z.record(z.string(), OpenRecordSchema),
-    models: z.array(OpenRecordSchema),
+    models: z.array(
+      z
+        .object({
+          id: z.string(),
+          display_name: z.string(),
+          capabilities: ModelCapabilitySchema,
+          capability_reviewed_at: z.string(),
+        })
+        .strict(),
+    ),
   })
   .passthrough();
 export const ProviderConnectionSchema = ResourceRecordSchema.extend({
@@ -528,7 +590,7 @@ export const ProviderConnectionSchema = ResourceRecordSchema.extend({
 export const ProviderModelSchema = ResourceRecordSchema.extend({
   model_id: z.string(),
   display_name: z.string(),
-  capabilities: JsonObjectSchema,
+  capabilities: ModelCapabilitySchema,
 }).passthrough();
 export const ProviderValidationSchema = z
   .object({
@@ -544,10 +606,71 @@ export const ProviderValidationSchema = z
       .optional(),
   })
   .strict();
+export const AudioTranscriptionResponseSchema = z
+  .object({
+    model: z.string(),
+    text: z.string(),
+    usage: JsonObjectSchema.optional(),
+  })
+  .strict();
+export const SpeechResponseSchema = z
+  .object({
+    model: z.string(),
+    audio: z
+      .object({
+        data: z.string(),
+        format: z.enum(["wav", "mp3"]),
+        mime_type: z.string(),
+      })
+      .strict(),
+    usage: JsonObjectSchema.optional(),
+  })
+  .strict();
 export const DeploymentRecordSchema = ResourceRecordSchema.extend({
   config: JsonObjectSchema,
   config_hash: z.string(),
 }).passthrough();
+export const InputTokenCountResponseSchema = z
+  .object({
+    deployment_id: z.string(),
+    provider: z.string(),
+    model_id: z.string(),
+    input_tokens: z.number().int().nonnegative(),
+    context_window_type: z.enum(["total", "input"]),
+    context_window_tokens: z.number().int().positive(),
+    reserved_output_tokens: z.number().int().nonnegative(),
+    maximum_input_tokens: z.number().int().positive(),
+    method: z.enum([
+      "openai_responses_input_tokens",
+      "anthropic_messages_count_tokens",
+      "gemini_count_tokens",
+      "zai_tokenizer",
+      "official_local_tokenizer",
+    ]),
+    accuracy: z.enum([
+      "authoritative_exact",
+      "provider_estimate",
+      "verified_local",
+    ]),
+    tokenizer_id: z.string().optional(),
+    tokenizer_revision: z.string().optional(),
+    counted_at: z.string(),
+  })
+  .strict();
+export const InputTokenCountingModelSchema = z
+  .object({
+    provider: z.string(),
+    provider_name: z.string(),
+    model_id: z.string(),
+    display_name: z.string(),
+    context_window_tokens: z.number().int().min(1_000_000),
+    context_window_type: z.enum(["total", "input"]),
+    max_input_tokens: z.number().int().positive().optional(),
+    max_output_tokens: z.number().int().positive().optional(),
+    input_token_counting: ModelCapabilitySchema.shape.input_token_counting,
+    capability_reviewed_at: z.string(),
+  })
+  .strict();
 export const RunRecordSchema = z
   .object({
     id: z.string(),
@@ -688,11 +811,16 @@ export type ProviderConnectionUpdate = z.infer<
   typeof ProviderConnectionUpdateSchema
 >;
 export type ProviderModelCreate = z.infer<typeof ProviderModelCreateSchema>;
+export type AudioTranscriptionCreate = z.input<
+  typeof AudioTranscriptionCreateSchema
+>;
+export type SpeechCreate = z.input<typeof SpeechCreateSchema>;
 export type AgentDefinitionValidate = z.infer<
   typeof AgentDefinitionValidateSchema
 >;
 export type DeploymentCreate = z.infer<typeof DeploymentCreateSchema>;
 export type RunCreate = z.infer<typeof RunCreateSchema>;
+export type InputTokenCount = z.infer<typeof InputTokenCountSchema>;
 export type RunLimits = z.infer<typeof RunLimitsSchema>;
 export type ContextCompact = z.infer<typeof ContextCompactSchema>;
 export type ToolCreate = z.infer<typeof ToolCreateSchema>;
@@ -716,7 +844,17 @@ export type CapabilitiesResponse = z.infer<typeof CapabilitiesResponseSchema>;
 export type ProviderConnection = z.infer<typeof ProviderConnectionSchema>;
 export type ProviderModel = z.infer<typeof ProviderModelSchema>;
 export type ProviderValidation = z.infer<typeof ProviderValidationSchema>;
+export type AudioTranscriptionResponse = z.infer<
+  typeof AudioTranscriptionResponseSchema
+>;
+export type SpeechResponse = z.infer<typeof SpeechResponseSchema>;
 export type DeploymentRecord = z.infer<typeof DeploymentRecordSchema>;
+export type InputTokenCountResponse = z.infer<
+  typeof InputTokenCountResponseSchema
+>;
+export type InputTokenCountingModel = z.infer<
+  typeof InputTokenCountingModelSchema
+>;
 export type SkillImportResponse = z.infer<typeof SkillImportResponseSchema>;
 export type ToolExecutionRecord = z.infer<typeof ToolExecutionRecordSchema>;
 export type McpServerRecord = z.infer<typeof McpServerRecordSchema>;
@@ -830,6 +968,13 @@ export const API_CONTRACTS = {
     body: ProviderConnectionUpdateSchema,
     response: ProviderConnectionSchema,
   },
+  deleteProvider: {
+    method: "delete",
+    path: "/v1/provider-connections/:connectionId",
+    summary: "Delete an unused Provider connection",
+    params: connectionParams,
+    responseStatus: 204,
+  },
   validateProvider: {
     method: "post",
     path: "/v1/provider-connections/:connectionId/validate",
@@ -855,6 +1000,22 @@ export const API_CONTRACTS = {
     body: ProviderModelCreateSchema,
     response: ProviderModelSchema,
     responseStatus: 201,
+  },
+  transcribeAudio: {
+    method: "post",
+    path: "/v1/provider-connections/:connectionId/audio/transcriptions",
+    summary: "Transcribe audio with a dedicated Provider model",
+    params: connectionParams,
+    body: AudioTranscriptionCreateSchema,
+    response: AudioTranscriptionResponseSchema,
+  },
+  createSpeech: {
+    method: "post",
+    path: "/v1/provider-connections/:connectionId/audio/speech",
+    summary: "Synthesize speech with a dedicated Provider model",
+    params: connectionParams,
+    body: SpeechCreateSchema,
+    response: SpeechResponseSchema,
   },
   validateAgentDefinition: {
     method: "post",
@@ -884,6 +1045,21 @@ export const API_CONTRACTS = {
     summary: "Get an Agent deployment",
     params: deploymentParams,
     response: DeploymentRecordSchema,
+  },
+  countDeploymentInputTokens: {
+    method: "post",
+    path: "/v1/deployments/:deploymentId/input-token-count",
+    summary: "Count the complete assembled model input",
+    params: deploymentParams,
+    body: InputTokenCountSchema,
+    response: InputTokenCountResponseSchema,
+  },
+  listInputTokenCountingModels: {
+    method: "get",
+    path: "/v1/input-token-counting/models",
+    summary:
+      "List qualified input Token counting models with at least one million context Tokens",
+    response: listOf(InputTokenCountingModelSchema),
   },
   compactContext: {
     method: "post",

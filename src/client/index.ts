@@ -1,12 +1,17 @@
 import type {
   ApprovalRecord,
   ArtifactRecord,
+  AudioTranscriptionCreate,
+  AudioTranscriptionResponse,
   CapabilitiesResponse,
   CompactionResponse,
   ContextCompact,
   DeploymentCreate,
   DeploymentRecord,
   HealthResponse,
+  InputTokenCount,
+  InputTokenCountResponse,
+  InputTokenCountingModel,
   JsonObject,
   McpCallResponse,
   McpHealth,
@@ -26,6 +31,8 @@ import type {
   RunLimits,
   RunRecord,
   RunSummary,
+  SpeechCreate,
+  SpeechResponse,
   RuntimeStatusResponse,
   RuntimeEvent,
   SkillBundle,
@@ -38,12 +45,17 @@ import type { ProviderDefinition } from "../providers.js";
 export type {
   ApprovalRecord,
   ArtifactRecord,
+  AudioTranscriptionCreate,
+  AudioTranscriptionResponse,
   CapabilitiesResponse,
   CompactionResponse,
   ContextCompact,
   DeploymentCreate,
   DeploymentRecord,
   HealthResponse,
+  InputTokenCount,
+  InputTokenCountResponse,
+  InputTokenCountingModel,
   JsonObject,
   McpCallResponse,
   McpHealth,
@@ -63,6 +75,8 @@ export type {
   RunLimits,
   RunRecord,
   RunSummary,
+  SpeechCreate,
+  SpeechResponse,
   RuntimeStatusResponse,
   RuntimeEvent,
   SkillBundle,
@@ -250,6 +264,12 @@ export class OmoikaneClient {
       { method: "PATCH", body: JSON.stringify(input) },
     );
   }
+  deleteProvider(connectionId: string) {
+    return this.request<void>(
+      `/v1/provider-connections/${encodeURIComponent(connectionId)}`,
+      { method: "DELETE" },
+    );
+  }
   validateProvider(connectionId: string) {
     return this.request<ProviderValidation>(
       `/v1/provider-connections/${encodeURIComponent(connectionId)}/validate`,
@@ -264,6 +284,18 @@ export class OmoikaneClient {
   addProviderModel(connectionId: string, input: ProviderModelCreate) {
     return this.request<ProviderModel>(
       `/v1/provider-connections/${encodeURIComponent(connectionId)}/models`,
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+  transcribeAudio(connectionId: string, input: AudioTranscriptionCreate) {
+    return this.request<AudioTranscriptionResponse>(
+      `/v1/provider-connections/${encodeURIComponent(connectionId)}/audio/transcriptions`,
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+  createSpeech(connectionId: string, input: SpeechCreate) {
+    return this.request<SpeechResponse>(
+      `/v1/provider-connections/${encodeURIComponent(connectionId)}/audio/speech`,
       { method: "POST", body: JSON.stringify(input) },
     );
   }
@@ -387,6 +419,17 @@ export class OmoikaneClient {
   }
   getRun(runId: string) {
     return this.request<RunRecord>(`/v1/runs/${encodeURIComponent(runId)}`);
+  }
+  countInputTokens(deploymentId: string, input: InputTokenCount) {
+    return this.request<InputTokenCountResponse>(
+      `/v1/deployments/${encodeURIComponent(deploymentId)}/input-token-count`,
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+  inputTokenCountingModels() {
+    return this.request<{ data: InputTokenCountingModel[] }>(
+      "/v1/input-token-counting/models",
+    );
   }
   cancelRun(runId: string) {
     return this.request<RunRecord>(

@@ -26,6 +26,8 @@ export interface BuiltAgent {
 
 export interface AgentBuildOptions {
   modelDecorator?: (model: Model, config: Record<string, unknown>) => Model;
+  persistMcpBindings?: boolean;
+  includeGuardrails?: boolean;
 }
 
 export class AgentFactory {
@@ -103,6 +105,7 @@ export class AgentFactory {
       (config.mcp_servers ?? []) as unknown[],
       context,
       toolNames,
+      { persistBindings: options.persistMcpBindings ?? true },
     );
     const handoffs: Agent<any, any>[] = [];
     const handoffClosers: Array<() => Promise<void>> = [];
@@ -161,7 +164,14 @@ export class AgentFactory {
             schema: structuredOutput.schema,
           } as JsonSchemaDefinition)
         : undefined;
-    const guardrails = this.guardrails.build(config.guardrails);
+    const guardrails =
+      options.includeGuardrails === false
+        ? {
+            inputGuardrails: [],
+            outputGuardrails: [],
+            buffersOutput: false,
+          }
+        : this.guardrails.build(config.guardrails);
     const agent = new Agent<RuntimeContext, any>({
       name: String(config.name ?? deployment.name ?? "Agent"),
       handoffDescription: String(config.description ?? ""),

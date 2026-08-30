@@ -94,11 +94,35 @@ curl -X POST 'http://127.0.0.1:8000/v1/provider-connections' \
   }'
 ```
 
-Creation validates the connection and synchronizes visible models unless `?sync_models=false` is supplied. The remote model list is merged with Omoikane's capability catalog because most `/models` responses do not include reliable context-window, output-limit, structured-output, or Reasoning Effort metadata. Synchronization is atomic, paginated and bounded; it reports `succeeded`, `empty`, `unsupported`, or `failed`, retains disappeared model records as unavailable, preserves explicit user overrides, and never silently replaces an unavailable default model. See [Provider and model catalog](PROVIDERS.md).
+Creation validates the connection and synchronizes visible models unless `?sync_models=false` is supplied. The remote model list is merged with Omoikane's capability catalog because most `/models` responses do not include reliable input/output modalities, task support, context-window, output-limit, structured-output, or Reasoning Effort metadata. Synchronization is atomic, paginated and bounded; it reports `succeeded`, `empty`, `unsupported`, or `failed`, retains disappeared model records as unavailable, preserves explicit user overrides, and never silently replaces an unavailable default model. Each effective model record declares `model_kind`, `input_modalities`, `output_modalities`, and explicit image-understanding/STT/TTS task fields. See [Provider and model catalog](PROVIDERS.md#model-modalities-and-tasks).
 
 The npm client exposes `listProviders`, `getProvider`, `updateProvider`, `validateProvider`, `listProviderModels`, and `addProviderModel` in addition to `createProvider`. Arbitrary base URLs and protocols are accepted only for `custom_openai_compatible`; known Provider endpoint profiles cannot be rewritten through custom URL fields.
 
 Use `api_key_env` for normal local operation. The named environment variable must exist in the Runtime process, not only in the calling shell or browser. A directly submitted `api_key` is encrypted with the Runtime's local credential key.
+
+MiMo connections also expose dedicated, non-streaming ASR and TTS operations. They reuse the same Token Plan or PAYG credential and do not persist audio or transcripts:
+
+```ts
+import { readFile, writeFile } from "node:fs/promises";
+
+const wav = await readFile("question.wav");
+const transcription = await client.transcribeAudio(provider.id, {
+  model: "mimo-v2.5-asr",
+  audio: { data: wav.toString("base64"), format: "wav" },
+  language: "auto",
+});
+
+const speech = await client.createSpeech(provider.id, {
+  model: "mimo-v2.5-tts",
+  input: `You said: ${transcription.text}`,
+  voice: "mimo_default",
+  format: "wav",
+  instructions: "Speak clearly and naturally.",
+});
+await writeFile("reply.wav", Buffer.from(speech.audio.data, "base64"));
+```
+
+The equivalent REST routes are `POST /v1/provider-connections/:connectionId/audio/transcriptions` and `POST /v1/provider-connections/:connectionId/audio/speech`. The former accepts canonical Base64 MP3/WAV plus `auto`, `zh`, or `en`; the latter accepts up to 32,000 characters, optional voice/instructions, and WAV or MP3 output. Dedicated `transcription` and `speech_synthesis` models are deliberately rejected as Agent Deployment backends.
 
 ## 3. Register capabilities
 
@@ -224,6 +248,32 @@ npx omoikane deploy-agent ./agents/analyst/AGENT.md
 The resulting Deployment is immutable and has a canonical `config_hash`. Changing instructions, model, capability bindings, Guardrails, output schema, context settings, or limits creates a new Deployment. The business system controls which Deployment ID is active.
 
 Reasoning Effort is validated against the selected model. The Agent can override a known context-window default with `model_context_window`; this affects context planning and compaction but cannot make a Provider accept a larger request.
+
+### Count a complete model input
+
+For a qualified large-context model, count the complete input without creating a Run or invoking model generation:
+
+```ts
+const supported = await client.inputTokenCountingModels();
+
+const count = await client.countInputTokens(String(deployment.id), {
+  conversation: previousModelItems,
+  input: "Select the relevant knowledge.",
+  context: { business_object_id: "company-42" },
+});
+
+if (count.input_tokens > count.maximum_input_tokens * 0.95) {
+  // Apply the business system's fallback policy.
+}
+```
+
+The REST operations are `GET /v1/input-token-counting/models` and `POST /v1/deployments/:deploymentId/input-token-count`. The list contains only catalog models with at least 1,000,000 context Tokens and `input_token_counting.status = qualified`; it does not imply that a matching Provider Connection exists. The count request accepts the same `input`, `conversation`/`projection`, and model-visible context envelope as a Run, with `conversation` and `projection` mutually exclusive.
+
+Omoikane asks the OpenAI Agents SDK to assemble system instructions, immutable Skill instructions, history, current input, Function/MCP Tool schemas, Handoffs, and structured-output configuration. It then calls the selected Provider's official count endpoint or, for explicitly cataloged open models, applies a pinned official chat/Tool serializer and Tokenizer. Runtime-only `context` data is not counted unless an Agent feature actually injects it into the model input. MCP discovery may open the configured read-only Tool-list connection, but the operation creates no Run, Event, Artifact, MCP Run binding, or model generation request.
+
+The response returns `input_tokens`, context-window type and size, output reservation, `maximum_input_tokens`, method, accuracy, and count timestamp. For a total context window, the maximum input is the configured context window minus Deployment `maxTokens` or the catalog output limit; an input-window model uses its declared maximum input directly. Counting a supplied Projection validates and uses its items. The operation never invokes automatic compaction to manufacture a different input.
+
+Failure is closed: an unqualified model, failed Provider count endpoint, unavailable official Tokenizer asset, or unsupported multimodal local-count request returns an error and never falls back to the compaction subsystem's rough byte-based estimator. Qualified Provider and local-Tokenizer models are documented in [Complete input Token counting](PROVIDERS.md#complete-input-token-counting).
 
 Model retries use a conservative Runtime policy. The default is one retry, accepted only for HTTP 429 or a Provider adapter that explicitly marks replay as safe. Timeouts, ambiguous connection failures, 5xx responses, stateful replay without safety evidence, and a stream that emitted any Event are not retried automatically. Configure only the bounded JSON settings, never a callback:
 
@@ -543,6 +593,8 @@ npm test
 npm run check:docs
 npm run build
 ```
+
+The opt-in `npm run test:e2e:mimo-audio` check synthesizes a short WAV with `mimo-v2.5-tts`, sends the returned bytes through `mimo-v2.5-asr`, and verifies a non-empty round-trip transcript. It reads `MIMO_API_KEY` from the ignored `.env` file and never prints the credential.
 
 The offline suite includes malformed request tables, unknown-field rejection, credential non-reflection, dynamic-payload compatibility, both MCP request formats, and an assertion that every documented operation is emitted from the shared OpenAPI contract.
 

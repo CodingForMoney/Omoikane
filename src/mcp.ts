@@ -690,7 +690,27 @@ export class McpService {
     record: Resource<McpServerData> & McpServerData,
     server: MCPServer,
     policy: McpPolicy,
+    persist: boolean,
   ): Promise<{ tools: McpTool[]; policy: McpPolicy; fingerprint: string }> {
+    if (!persist) {
+      const listed = await timed(
+        () => server.listTools(),
+        policy.connect_timeout_ms,
+      );
+      const effective = this.effectiveTools(listed, policy);
+      if (effective.blocked.some((item) => item.reason !== "not allowed"))
+        throw new ValidationError(
+          `MCP server ${record.slug} exposes invalid tools: ${effective.blocked
+            .filter((item) => item.reason !== "not allowed")
+            .map((item) => `${item.name}: ${item.reason}`)
+            .join("; ")}`,
+        );
+      return {
+        tools: effective.effective,
+        policy,
+        fingerprint: hashJson({ tools: effective.effective, policy }),
+      };
+    }
     const existing = (
       await this.db.query<{
         tools_json: McpTool[];
@@ -906,6 +926,7 @@ export class McpService {
     references: unknown[],
     context: RuntimeContext,
     reservedNames: Set<string>,
+    options: { persistBindings?: boolean } = {},
   ): Promise<McpBuiltTools> {
     const opened: MCPServer[] = [];
     const tools: FunctionTool<RuntimeContext, any, any>[] = [];
@@ -928,6 +949,7 @@ export class McpService {
           record,
           built.server,
           policy,
+          options.persistBindings ?? true,
         );
         for (const definition of binding.tools) {
           if (names.has(definition.name))

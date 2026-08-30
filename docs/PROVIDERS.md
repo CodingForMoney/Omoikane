@@ -1,6 +1,6 @@
 # Provider and model catalog
 
-> Implementation source of truth: `src/providers.ts`. Catalog last reviewed: 2026-08-28.
+> Implementation source of truth: `src/providers.ts`. Catalog last reviewed: 2026-08-30.
 
 This document describes Provider definitions, protocols, model discovery, Reasoning Effort, structured output, context defaults, and credentials. For the creation workflow, see [Configure a Provider first](DEVELOPER_GUIDE.md#2-configure-a-provider-first).
 
@@ -12,7 +12,7 @@ Provider Definition
 Provider Connection
   └── selected Provider/Profile + encrypted key or environment reference
 Provider Model
-  └── model ID + context/output/reasoning/vision/structured/compaction capabilities
+  └── model ID + kind/modalities/tasks/context/reasoning/structured/compaction/Token-count capabilities
 Agent Deployment
   └── connection ID + model ID + optional capability overrides
 ```
@@ -44,7 +44,7 @@ On connection creation or an explicit sync request, Omoikane discovers models th
 - a successful empty result remains explicitly `empty` and uses the catalog as a labeled fallback;
 - an unsupported or failed endpoint remains explicitly `unsupported` or `failed`. A later model-list request can still materialize catalog defaults without claiming remote confirmation.
 
-A discovery response reliably establishes only the model IDs currently visible to that key. Most endpoints omit accurate context-window, maximum-output, vision, structured-output, and Reasoning Effort information. Omoikane therefore merges discovered IDs with versioned catalog capability data and caller overrides.
+A discovery response reliably establishes only the model IDs currently visible to that key. Most endpoints omit accurate context-window, maximum-output, modalities, task support, structured-output, and Reasoning Effort information. Omoikane therefore merges discovered IDs with versioned catalog capability data and caller overrides.
 
 Discovery is bounded and read-only: the default request timeout is 15 seconds, safe failures are retried at most twice with bounded backoff and `Retry-After`, and Anthropic/Gemini pagination is followed with a 100-page ceiling. The OpenAI client handles its protocol pagination with implicit transport retries disabled. Override the local discovery bounds per Connection only when necessary:
 
@@ -59,11 +59,115 @@ Discovery is bounded and read-only: the default request timeout is 15 seconds, s
 
 The complete result is committed in one database transaction. Models absent from a successful non-empty remote result become `unavailable` and disappear from the active selection list, but their historical records are retained. An explicitly added model remains active and is marked `remote_presence: not_listed`. A missing default model is not silently replaced: the Connection reports `default_model_status: unavailable`, and new resolution fails until the caller selects another active model.
 
-Newly discovered unknown models receive conservative capabilities (`tools`, `vision`, and `streaming` are false, with `capability_status: unknown`) until they are cataloged or explicitly overridden. User overrides are stored separately and survive later synchronization. Capability input is Schema-validated, including nested Reasoning and native-compaction contracts.
+Newly discovered unknown models receive conservative capabilities (text input/output only; Tools, legacy `vision`, and Streaming are false; all task capabilities are `none`; `capability_status` is `unknown`) until they are cataloged or explicitly overridden. User overrides are stored separately and survive later synchronization. Capability input is Schema-validated, including modalities, task consistency, nested Reasoning, and native-compaction contracts.
 
 Connection validation returns structured discovery state and safe error metadata. It distinguishes authentication, rate limiting, unsupported endpoints, Provider unavailability, invalid responses, and network failures without storing response bodies or credentials. A successful empty `/models` response validates endpoint access but does not claim that catalog models were remotely observed.
 
 Model generation does not inherit the OpenAI transport client's implicit retries. Omoikane disables those retries and lets the OpenAI Agents SDK apply one visible, bounded Runtime retry by default. Only HTTP 429 or Provider advice with `replaySafety: safe` is accepted; timeout, ambiguous network, 5xx, stateful, and already-started stream failures are not automatically replayed. This avoids hiding duplicate Provider work behind an adapter.
+
+## Model modalities and tasks
+
+Every Provider Model exposes machine-readable model type, input/output modalities, and task capabilities:
+
+```json
+{
+  "model_kind": "agent",
+  "input_modalities": ["text", "image", "audio", "video"],
+  "output_modalities": ["text"],
+  "tasks": {
+    "image_understanding": "native",
+    "transcription": "general",
+    "speech_synthesis": "none"
+  }
+}
+```
+
+`general` transcription means a general multimodal model can accept audio and return text; it does not promise a dedicated timestamped transcription API. `dedicated` is reserved for task-specific STT/TTS models. The deprecated `vision` Boolean remains in responses for compatibility and is always equal to `tasks.image_understanding === "native"`. New integrations must use `input_modalities`, `output_modalities`, and `tasks`.
+
+The current catalog includes dedicated MiMo V2.5 ASR and TTS models backed by explicit Provider adapters. No other Provider receives STT/TTS merely because it is multimodal or OpenAI-compatible. Dedicated audio models cannot back an Agent Deployment; use the audio endpoints described below.
+
+| Provider                | Model                         | Kind               | Input                     | Output | Image understanding | STT       | TTS       |
+| ----------------------- | ----------------------------- | ------------------ | ------------------------- | ------ | ------------------- | --------- | --------- |
+| OpenAI                  | `gpt-5.6-sol`                 | `agent`            | text, image               | text   | native              | —         | —         |
+| OpenAI                  | `gpt-5.6-terra`               | `agent`            | text, image               | text   | native              | —         | —         |
+| OpenAI                  | `gpt-5.6-luna`                | `agent`            | text, image               | text   | native              | —         | —         |
+| OpenAI                  | `gpt-5.4`                     | `agent`            | text, image               | text   | native              | —         | —         |
+| OpenAI                  | `gpt-5.4-mini`                | `agent`            | text, image               | text   | native              | —         | —         |
+| Codex Bridge (local)    | `gpt-5.6-sol`                 | `agent`            | text, image               | text   | native              | —         | —         |
+| Codex Bridge (local)    | `gpt-5.6-luna`                | `agent`            | text, image               | text   | native              | —         | —         |
+| Anthropic Claude        | `claude-opus-5`               | `agent`            | text, image               | text   | native              | —         | —         |
+| Anthropic Claude        | `claude-sonnet-5`             | `agent`            | text, image               | text   | native              | —         | —         |
+| Anthropic Claude        | `claude-opus-4-6`             | `agent`            | text, image               | text   | native              | —         | —         |
+| Anthropic Claude        | `claude-sonnet-4-6`           | `agent`            | text, image               | text   | native              | —         | —         |
+| Anthropic Claude        | `claude-haiku-4-5-20251001`   | `agent`            | text, image               | text   | native              | —         | —         |
+| Google Gemini           | `gemini-3.1-pro-preview`      | `agent`            | text, image, audio, video | text   | native              | general   | —         |
+| Google Gemini           | `gemini-3-flash-preview`      | `agent`            | text, image, audio, video | text   | native              | general   | —         |
+| Google Gemini           | `gemini-3.1-flash-lite`       | `agent`            | text, image, audio, video | text   | native              | general   | —         |
+| Cohere                  | `command-a-plus-05-2026`      | `agent`            | text, image               | text   | native              | —         | —         |
+| Cohere                  | `command-a-03-2025`           | `agent`            | text                      | text   | —                   | —         | —         |
+| xAI Grok                | `grok-4.3`                    | `agent`            | text, image               | text   | native              | —         | —         |
+| xAI Grok                | `grok-4.5`                    | `agent`            | text, image               | text   | native              | —         | —         |
+| xAI Grok                | `grok-build-0.1`              | `agent`            | text, image               | text   | native              | —         | —         |
+| Mistral AI              | `mistral-large-latest`        | `agent`            | text, image               | text   | native              | —         | —         |
+| Mistral AI              | `mistral-small-latest`        | `agent`            | text, image               | text   | native              | —         | —         |
+| Mistral AI              | `codestral-latest`            | `agent`            | text                      | text   | —                   | —         | —         |
+| Groq                    | `openai/gpt-oss-120b`         | `agent`            | text                      | text   | —                   | —         | —         |
+| Groq                    | `qwen/qwen3.6-27b`            | `agent`            | text, image               | text   | native              | —         | —         |
+| Groq                    | `minimaxai/minimax-m2.7`      | `agent`            | text                      | text   | —                   | —         | —         |
+| Together AI             | `openai/gpt-oss-120b`         | `agent`            | text                      | text   | —                   | —         | —         |
+| Together AI             | `openai/gpt-oss-20b`          | `agent`            | text                      | text   | —                   | —         | —         |
+| Perplexity              | `sonar`                       | `agent`            | text, image               | text   | native              | —         | —         |
+| Perplexity              | `sonar-pro`                   | `agent`            | text, image               | text   | native              | —         | —         |
+| Cerebras Inference      | `gpt-oss-120b`                | `agent`            | text                      | text   | —                   | —         | —         |
+| Xiaomi MiMo             | `mimo-v2.5`                   | `agent`            | text, image, audio, video | text   | native              | general   | —         |
+| Xiaomi MiMo             | `mimo-v2.5-pro`               | `agent`            | text                      | text   | —                   | —         | —         |
+| Xiaomi MiMo             | `mimo-v2.5-asr`               | `transcription`    | audio                     | text   | —                   | dedicated | —         |
+| Xiaomi MiMo             | `mimo-v2.5-tts`               | `speech_synthesis` | text                      | audio  | —                   | —         | dedicated |
+| DeepSeek                | `deepseek-v4-pro`             | `agent`            | text                      | text   | —                   | —         | —         |
+| DeepSeek                | `deepseek-v4-flash`           | `agent`            | text                      | text   | —                   | —         | —         |
+| Alibaba Qwen            | `qwen3.8-max-preview`         | `agent`            | text, image               | text   | native              | —         | —         |
+| Alibaba Qwen            | `qwen3.7-max`                 | `agent`            | text, image               | text   | native              | —         | —         |
+| Alibaba Qwen            | `qwen3.7-plus`                | `agent`            | text, image               | text   | native              | —         | —         |
+| Alibaba Qwen            | `qwen3.6-flash`               | `agent`            | text, image               | text   | native              | —         | —         |
+| Zhipu GLM               | `glm-5.2`                     | `agent`            | text                      | text   | —                   | —         | —         |
+| Zhipu GLM               | `glm-5.1`                     | `agent`            | text                      | text   | —                   | —         | —         |
+| Zhipu GLM               | `glm-5`                       | `agent`            | text                      | text   | —                   | —         | —         |
+| Zhipu GLM               | `glm-4.7`                     | `agent`            | text                      | text   | —                   | —         | —         |
+| Moonshot / Kimi         | `kimi-k2.7-code`              | `agent`            | text                      | text   | —                   | —         | —         |
+| Moonshot / Kimi         | `kimi-k2.6`                   | `agent`            | text, image               | text   | native              | —         | —         |
+| Moonshot / Kimi         | `kimi-k2.5`                   | `agent`            | text, image               | text   | native              | —         | —         |
+| Volcengine Ark / Doubao | `doubao-seed-2-0-lite-260215` | `agent`            | text, image               | text   | native              | —         | —         |
+| Volcengine Ark / Doubao | `ark-code-latest`             | `routing`          | text                      | text   | —                   | —         | —         |
+| Baidu Qianfan           | `ernie-4.5-turbo-128k`        | `agent`            | text                      | text   | —                   | —         | —         |
+| Baidu Qianfan           | `ernie-x1.1-preview`          | `agent`            | text                      | text   | —                   | —         | —         |
+| Tencent Hunyuan         | `hunyuan-turbos-latest`       | `agent`            | text                      | text   | —                   | —         | —         |
+| Tencent Hunyuan         | `hunyuan-lite`                | `agent`            | text                      | text   | —                   | —         | —         |
+| Tencent Hunyuan         | `hunyuan-vision`              | `agent`            | text, image               | text   | native              | —         | —         |
+| MiniMax                 | `MiniMax-M2.7`                | `agent`            | text                      | text   | —                   | —         | —         |
+| MiniMax                 | `MiniMax-M2.5`                | `agent`            | text                      | text   | —                   | —         | —         |
+| MiniMax                 | `MiniMax-M2.1`                | `agent`            | text                      | text   | —                   | —         | —         |
+| StepFun                 | `step-3.5-flash`              | `agent`            | text                      | text   | —                   | —         | —         |
+| StepFun                 | `step-3.5-flash-2603`         | `agent`            | text                      | text   | —                   | —         | —         |
+| StepFun                 | `step-router-v1`              | `routing`          | text                      | text   | —                   | —         | —         |
+| Baichuan                | `Baichuan3-Turbo-128k`        | `agent`            | text                      | text   | —                   | —         | —         |
+| Baichuan                | `Baichuan3-Turbo`             | `agent`            | text                      | text   | —                   | —         | —         |
+| 01.AI                   | `yi-lightning`                | `agent`            | text                      | text   | —                   | —         | —         |
+| 01.AI                   | `yi-large`                    | `agent`            | text                      | text   | —                   | —         | —         |
+| iFlytek Spark           | `4.0Ultra`                    | `agent`            | text                      | text   | —                   | —         | —         |
+| iFlytek Spark           | `spark-x`                     | `agent`            | text                      | text   | —                   | —         | —         |
+
+Providers with an empty fixed catalog (`openrouter`, `siliconflow`, `modelscope`, and `custom_openai_compatible`) expose remotely discovered models as conservative unknowns until a caller supplies an explicit validated capability override.
+
+### MiMo dedicated audio adapters
+
+Omoikane exposes two stateless, connection-scoped operations:
+
+- `POST /v1/provider-connections/:connectionId/audio/transcriptions` calls `mimo-v2.5-asr` with Base64 MP3/WAV input and returns text;
+- `POST /v1/provider-connections/:connectionId/audio/speech` calls `mimo-v2.5-tts` with text, optional instructions/voice, and returns Base64 WAV/MP3 audio.
+
+Both Token Plan and PAYG MiMo profiles use their existing connection credential. Internally, MiMo audio uses its OpenAI-compatible `/chat/completions` extension rather than OpenAI's `/audio/transcriptions` or `/audio/speech` routes. Omoikane therefore constructs and validates the MiMo-specific message/audio envelope instead of passing it through the Agent model adapter.
+
+These operations are currently non-streaming and hold no Session or conversation state. The Provider models can stream natively, but Omoikane advertises `streaming: false` for these effective adapters until bounded SSE audio forwarding and cancellation are part of the public Runtime contract. Audio bytes and transcripts are not stored by this path; the caller owns any permanent recording, transcript, playback file, consent, and retention policy.
 
 ## Reasoning Effort
 
@@ -88,8 +192,9 @@ Before execution, Omoikane maps this to the selected adapter's SDK model setting
 
 ## Structured output
 
-Structured output is recorded per model as `native` or `prompt`; it is not inferred from the endpoint protocol alone:
+Structured output is recorded per model as `none`, `native`, or `prompt`; it is not inferred from the endpoint protocol alone:
 
+- `none` applies to dedicated non-Agent models such as ASR/TTS and cannot back an Agent Deployment;
 - `native` sends the exact Agent `output_schema` through the OpenAI Agents SDK as strict JSON Schema output, then validates the returned value locally;
 - `prompt` does not send an unsupported native output parameter. Omoikane injects an exact-JSON instruction into the system instructions, parses the final text, and validates it locally against the same schema.
 
@@ -116,6 +221,27 @@ The catalog enables it for known OpenAI Responses models and the supported local
 
 Model discovery does not establish this capability. The Omoikane `auto` strategy uses the catalog declaration and falls back to portable checkpoint compaction on a compatible native failure. Explicit `native` mode fails when the capability or endpoint is unavailable. See [Context compaction](CONTEXT_COMPACTION.md).
 
+## Complete input Token counting
+
+`input_token_counting` declares whether Omoikane can reliably count the complete logical model input assembled by the OpenAI Agents SDK. A qualified declaration has `scope: assembled_model_input`, a method, an accuracy class, and a review date. Unknown, remotely discovered, manually added, and custom OpenAI-compatible models default to `unavailable`; capability overrides cannot promote them to qualified.
+
+The qualified set uses either a Provider count endpoint or an immutable official open-source Tokenizer plus the model's complete chat/Tool serialization:
+
+| Provider     | Qualified models                                                            | Method                                              | Accuracy            | Input scope |
+| ------------ | --------------------------------------------------------------------------- | --------------------------------------------------- | ------------------- | ----------- |
+| OpenAI       | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.4`                   | OpenAI Responses input Tokens                       | authoritative exact | model       |
+| Anthropic    | `claude-opus-5`, `claude-sonnet-5`, `claude-opus-4-6`, `claude-sonnet-4-6`  | Anthropic Messages count Tokens                     | Provider estimate   | model       |
+| Google       | `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-3.1-flash-lite` | Gemini count Tokens                                 | Provider estimate   | model       |
+| Xiaomi MiMo  | `mimo-v2.5`, `mimo-v2.5-pro`                                                | pinned official chat template and Tokenizer         | verified local      | text only   |
+| DeepSeek     | `deepseek-v4-pro`, `deepseek-v4-flash`                                      | pinned official V4 Prompt Encoder and Tokenizer     | verified local      | text only   |
+| Alibaba Qwen | `qwen3.8-max-preview`                                                       | pinned official Qwen3.8 chat template and Tokenizer | verified local      | text only   |
+
+For local counting, Omoikane first asks the OpenAI Agents SDK to compile the complete logical input into OpenAI-compatible messages and Tools. It then serializes system instructions, history, current input, Tool/Handoff schemas, Tool calls/results, and prompt-based structured-output instructions with the official model template before tokenization. Tokenizer repositories and Git revisions are returned in the capability and count response. Assets are downloaded from Hugging Face by immutable revision on first use and cached in memory; download or template failure is closed. These paths are `verified_local`, not Provider billing authority. Multimodal input is rejected because an open text Tokenizer cannot reproduce Provider-side image, audio, or video accounting.
+
+GLM `glm-5.2`, xAI `grok-4.3`, the older Qwen catalog IDs, and other models remain unavailable until their exact model has a complete request counter or immutable public serialization. Z.AI's published `/tokenizer` contract currently names older GLM versions, while xAI's public Tokenizer accepts bare text rather than messages and Tools. Codex Bridge exposes only a conservative compatibility estimate and its 258,400-Token context is below this list's threshold. Omoikane never substitutes `UTF-8 bytes / 3` or a bare-text Tokenizer for a complete request count.
+
+`GET /v1/input-token-counting/models` returns only qualified catalog models with `context_window >= 1,000,000`. It is a support catalog, not proof that a Provider Connection has been configured or that the model is visible to a particular key. Use the connection-specific model list for availability.
+
 ## Context-window defaults
 
 Known values initialize Agent configuration and context-compaction thresholds. A user can still override `model_context_window` for a Deployment.
@@ -127,6 +253,7 @@ Known values initialize Agent configuration and context-compaction thresholds. A
 | OpenAI        | `gpt-5.4-mini`                                 |                400,000 | catalog default                        |
 | Codex Bridge  | supported Codex models                         |            **258,400** | explicit local Bridge contract         |
 | Xiaomi MiMo   | `mimo-v2.5`, `mimo-v2.5-pro`                   |              1,048,576 | Token Plan and PAYG profiles           |
+| Xiaomi MiMo   | `mimo-v2.5-asr`, `mimo-v2.5-tts`               |                  8,192 | dedicated non-Agent audio adapters     |
 | Anthropic     | cataloged Claude Opus/Sonnet models            |        1,000,000 input | input-window value                     |
 | Anthropic     | cataloged Claude Haiku model                   |          200,000 input | input-window value                     |
 | Google        | cataloged Gemini 3 models                      |        1,000,000 input | output limit stored separately         |
@@ -162,6 +289,6 @@ Keep `.env` ignored. Examples contain placeholders only. Release validation must
 
 1. Prefer Provider documentation and live endpoint behavior over third-party aggregators.
 2. Record the per-model review date when changing capability defaults. Persisted model records expose that date through `capability_provenance.catalog_reviewed_at`.
-3. Test UI Effort visibility, structured-output mode, native-compaction selection, server validation, context defaults, and compaction thresholds together.
+3. Test UI modalities/tasks, Effort visibility, structured-output mode, native-compaction selection, server validation, context defaults, and compaction thresholds together.
 4. Do not infer context or Effort solely from a newly discovered model name.
 5. Treat catalog age and live adapter conformance as release evidence, not as proof that a Provider will never change. Refresh evidence when a Provider becomes a real business dependency or changes behavior.

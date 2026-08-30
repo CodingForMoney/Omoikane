@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Container } from "../src/container.js";
-import { ValidationError } from "../src/database.js";
+import { ConflictError, ValidationError } from "../src/database.js";
 import { OMOIKANE_VERSION } from "../src/runtime-versions.js";
 import packageJson from "../package.json" with { type: "json" };
 import { testContainer } from "./helpers.js";
@@ -41,6 +41,110 @@ describe("provider registry", () => {
     });
   });
 
+  it("declares coherent modalities and task capabilities for every catalog model", async () => {
+    const test = await testContainer();
+    container = test.container;
+    cleanup = test.close;
+    const catalog = container.providers.catalog();
+    const models = catalog.flatMap((provider) =>
+      provider.models.map((model) => ({
+        provider: provider.id,
+        model: model.id,
+        capabilities: model.capabilities,
+      })),
+    );
+    expect(models.length).toBeGreaterThanOrEqual(60);
+    for (const { capabilities } of models) {
+      const image = capabilities.tasks.image_understanding === "native";
+      expect(capabilities.vision).toBe(image);
+      expect(capabilities.input_modalities.includes("image")).toBe(image);
+      expect(new Set(capabilities.input_modalities).size).toBe(
+        capabilities.input_modalities.length,
+      );
+      expect(new Set(capabilities.output_modalities).size).toBe(
+        capabilities.output_modalities.length,
+      );
+      if (capabilities.tasks.transcription !== "none") {
+        expect(capabilities.input_modalities).toContain("audio");
+        expect(capabilities.output_modalities).toContain("text");
+      }
+      if (capabilities.tasks.speech_synthesis !== "none") {
+        expect(capabilities.input_modalities).toContain("text");
+        expect(capabilities.output_modalities).toContain("audio");
+      }
+    }
+
+    const capability = (provider: string, model: string) =>
+      models.find((item) => item.provider === provider && item.model === model)!
+        .capabilities;
+    expect(capability("openai", "gpt-5.6-sol")).toMatchObject({
+      model_kind: "agent",
+      input_modalities: ["text", "image"],
+      output_modalities: ["text"],
+      tasks: {
+        image_understanding: "native",
+        transcription: "none",
+        speech_synthesis: "none",
+      },
+    });
+    expect(capability("google_gemini", "gemini-3.1-pro-preview")).toMatchObject(
+      {
+        input_modalities: ["text", "image", "audio", "video"],
+        output_modalities: ["text"],
+        tasks: { image_understanding: "native", transcription: "general" },
+      },
+    );
+    expect(capability("xiaomi_mimo", "mimo-v2.5")).toMatchObject({
+      input_modalities: ["text", "image", "audio", "video"],
+      tasks: { image_understanding: "native", transcription: "general" },
+    });
+    expect(capability("xiaomi_mimo", "mimo-v2.5-pro")).toMatchObject({
+      input_modalities: ["text"],
+      tasks: { image_understanding: "none", transcription: "none" },
+    });
+    expect(capability("xiaomi_mimo", "mimo-v2.5-asr")).toMatchObject({
+      model_kind: "transcription",
+      input_modalities: ["audio"],
+      output_modalities: ["text"],
+      max_output_tokens: 2_048,
+      streaming: false,
+      tools: false,
+      structured_output: "none",
+      tasks: { transcription: "dedicated", speech_synthesis: "none" },
+    });
+    expect(capability("xiaomi_mimo", "mimo-v2.5-tts")).toMatchObject({
+      model_kind: "speech_synthesis",
+      input_modalities: ["text"],
+      output_modalities: ["audio"],
+      max_output_tokens: 8_192,
+      streaming: false,
+      tools: false,
+      structured_output: "none",
+      tasks: { transcription: "none", speech_synthesis: "dedicated" },
+    });
+    expect(capability("cohere", "command-a-plus-05-2026").vision).toBe(true);
+    expect(capability("xai", "grok-build-0.1").vision).toBe(true);
+    expect(capability("mistral", "mistral-large-latest").vision).toBe(true);
+    expect(capability("groq", "qwen/qwen3.6-27b").vision).toBe(true);
+    expect(capability("perplexity", "sonar-pro").vision).toBe(true);
+    expect(capability("alibaba_qwen", "qwen3.6-flash").vision).toBe(true);
+    expect(capability("moonshot_kimi", "kimi-k2.6").vision).toBe(true);
+    expect(
+      capability("volcengine_ark", "doubao-seed-2-0-lite-260215").vision,
+    ).toBe(true);
+    expect(capability("volcengine_ark", "ark-code-latest").model_kind).toBe(
+      "routing",
+    );
+    expect(capability("stepfun", "step-router-v1").model_kind).toBe("routing");
+    expect(
+      models.some(
+        ({ capabilities }) =>
+          capabilities.tasks.speech_synthesis !== "none" ||
+          capabilities.model_kind === "speech_synthesis",
+      ),
+    ).toBe(true);
+  });
+
   it("maps supported effort and rejects it for unsupported models", async () => {
     const test = await testContainer();
     container = test.container;
@@ -73,6 +177,210 @@ describe("provider registry", () => {
         model_settings: { reasoning_effort: "high" },
       }),
     ).rejects.toBeInstanceOf(ValidationError);
+    await expect(
+      container.providers.resolveConfig({
+        provider: { connection_id: mimo.id },
+        model: "mimo-v2.5-asr",
+      }),
+    ).rejects.toThrow("cannot back an Agent deployment");
+  });
+
+  it("deletes an unused connection together with its discovered models", async () => {
+    const test = await testContainer();
+    container = test.container;
+    cleanup = test.close;
+    const connection = await container.providers.create({
+      name: "Disposable provider",
+      provider: "xiaomi_mimo",
+      api_key: "test-only-key",
+    });
+    await container.providers.listModels(connection.id);
+    expect(await container.providers.listModels(connection.id)).not.toHaveLength(
+      0,
+    );
+
+    await container.providers.delete(connection.id);
+
+    await expect(container.providers.get(connection.id)).rejects.toThrow();
+    const models = await container.db.query<{ id: string }>(
+      "SELECT id FROM resources WHERE kind='provider_model' AND parent_id=$1",
+      [connection.id],
+    );
+    expect(models.rows).toEqual([]);
+  });
+
+  it("refuses to delete a connection referenced by an Agent deployment", async () => {
+    const test = await testContainer();
+    container = test.container;
+    cleanup = test.close;
+    const connection = await container.providers.create({
+      name: "Bound provider",
+      provider: "xiaomi_mimo",
+      api_key: "test-only-key",
+    });
+    await container.definitions.deploy({
+      config: {
+        name: "Bound agent",
+        instructions: "Answer accurately.",
+        provider: { connection_id: connection.id },
+        model: "mimo-v2.5",
+        model_settings: {},
+        tools: [],
+        skills: [],
+        mcp_servers: [],
+        compaction: { enabled: false },
+      },
+    });
+
+    await expect(container.providers.delete(connection.id)).rejects.toBeInstanceOf(
+      ConflictError,
+    );
+    await expect(container.providers.get(connection.id)).resolves.toMatchObject({
+      id: connection.id,
+    });
+  });
+
+  it("invokes MiMo dedicated ASR and TTS without exposing credentials", async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { content: "测试语音" } }],
+            usage: { prompt_tokens: 12, completion_tokens: 4, seconds: 2 },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { audio: { data: "UklGRg==" } } }],
+            usage: { prompt_tokens: 5, completion_tokens: 8 },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetcher);
+    const test = await testContainer();
+    container = test.container;
+    cleanup = test.close;
+    const secret = "test-only-mimo-audio-key";
+    const connection = await container.providers.create({
+      name: "MiMo Audio",
+      provider: "xiaomi_mimo",
+      api_key: secret,
+    });
+
+    const transcription = await container.providers.transcribeAudio(
+      connection.id,
+      {
+        model: "mimo-v2.5-asr",
+        audio: { data: "UklGRg==", format: "wav" },
+        language: "zh",
+      },
+    );
+    expect(transcription).toEqual({
+      model: "mimo-v2.5-asr",
+      text: "测试语音",
+      usage: { prompt_tokens: 12, completion_tokens: 4, seconds: 2 },
+    });
+    const asrRequest = fetcher.mock.calls[0]!;
+    expect(String(asrRequest[0])).toBe(
+      "https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
+    );
+    const asrInit = asrRequest[1] as RequestInit;
+    const asrBody = JSON.parse(String(asrInit.body));
+    expect(asrBody).toMatchObject({
+      model: "mimo-v2.5-asr",
+      stream: false,
+      asr_options: { language: "zh" },
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_audio",
+              input_audio: { data: "data:audio/wav;base64,UklGRg==" },
+            },
+          ],
+        },
+      ],
+    });
+
+    const speech = await container.providers.synthesizeSpeech(connection.id, {
+      model: "mimo-v2.5-tts",
+      input: "你好",
+      voice: "mimo_default",
+      format: "wav",
+      instructions: "温柔地朗读",
+    });
+    expect(speech).toEqual({
+      model: "mimo-v2.5-tts",
+      audio: {
+        data: "UklGRg==",
+        format: "wav",
+        mime_type: "audio/wav",
+      },
+      usage: { prompt_tokens: 5, completion_tokens: 8 },
+    });
+    const ttsBody = JSON.parse(String(fetcher.mock.calls[1]![1]!.body));
+    expect(ttsBody).toMatchObject({
+      model: "mimo-v2.5-tts",
+      stream: false,
+      messages: [
+        { role: "user", content: "温柔地朗读" },
+        { role: "assistant", content: "你好" },
+      ],
+      audio: { format: "wav", voice: "mimo_default" },
+    });
+    expect(JSON.stringify({ transcription, speech })).not.toContain(secret);
+  });
+
+  it("normalizes persisted pre-modality model records on list and page reads", async () => {
+    const test = await testContainer();
+    container = test.container;
+    cleanup = test.close;
+    const connection = await container.providers.create({
+      name: "OpenAI",
+      provider: "openai",
+      api_key: "test-only-key",
+    });
+    const original = (await container.providers.listModels(connection.id))[0]!;
+    const legacyCapabilities = {
+      ...original.capabilities,
+    } as Record<string, unknown>;
+    delete legacyCapabilities.model_kind;
+    delete legacyCapabilities.input_modalities;
+    delete legacyCapabilities.output_modalities;
+    delete legacyCapabilities.tasks;
+    await container.db.query(
+      "UPDATE resources SET data=$2::jsonb WHERE id=$1",
+      [
+        original.id,
+        JSON.stringify({
+          ...original.data,
+          capabilities: legacyCapabilities,
+        }),
+      ],
+    );
+
+    const listed = (await container.providers.listModels(connection.id)).find(
+      (item) => item.id === original.id,
+    );
+    expect(listed?.capabilities).toMatchObject({
+      model_kind: "agent",
+      input_modalities: ["text", "image"],
+      output_modalities: ["text"],
+      tasks: { image_understanding: "native" },
+    });
+    const page = await container.providers.pageModels(connection.id);
+    expect(
+      page.data.find((item) => item.id === original.id)?.capabilities,
+    ).toMatchObject({
+      input_modalities: ["text", "image"],
+      tasks: { image_understanding: "native" },
+    });
   });
 
   it("rejects unknown endpoint profiles and known-Provider URL overrides without changing the connection", async () => {
@@ -241,10 +549,48 @@ describe("provider registry", () => {
       },
     });
 
+    await container.providers.addModel(connection.id, {
+      model_id: "legacy-vision-override",
+      capabilities: { vision: true },
+    });
+    const legacyVision = (
+      await container.providers.listModels(connection.id)
+    ).find((item) => item.model_id === "legacy-vision-override");
+    expect(legacyVision?.capabilities).toMatchObject({
+      vision: true,
+      input_modalities: ["text", "image"],
+      tasks: { image_understanding: "native" },
+    });
+
+    await container.providers.addModel(connection.id, {
+      model_id: "manual-tts-model",
+      capabilities: {
+        model_kind: "speech_synthesis",
+        input_modalities: ["text"],
+        output_modalities: ["audio"],
+        tasks: { speech_synthesis: "dedicated" },
+      },
+    });
+    const tts = (await container.providers.listModels(connection.id)).find(
+      (item) => item.model_id === "manual-tts-model",
+    );
+    expect(tts?.capabilities).toMatchObject({
+      model_kind: "speech_synthesis",
+      input_modalities: ["text"],
+      output_modalities: ["audio"],
+      tasks: { speech_synthesis: "dedicated" },
+    });
+
     await expect(
       container.providers.addModel(connection.id, {
         model_id: "invalid-reasoning-model",
         capabilities: { reasoning: { supported: true } },
+      }),
+    ).rejects.toBeInstanceOf(ValidationError);
+    await expect(
+      container.providers.addModel(connection.id, {
+        model_id: "conflicting-image-model",
+        capabilities: { vision: true, input_modalities: ["text"] },
       }),
     ).rejects.toBeInstanceOf(ValidationError);
   });
@@ -294,6 +640,14 @@ describe("provider registry", () => {
       "new-model-b",
     ]);
     expect(models[0]!.capabilities).toMatchObject({
+      model_kind: "agent",
+      input_modalities: ["text"],
+      output_modalities: ["text"],
+      tasks: {
+        image_understanding: "none",
+        transcription: "none",
+        speech_synthesis: "none",
+      },
       tools: false,
       streaming: false,
       capability_source: "remote",

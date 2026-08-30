@@ -80,6 +80,8 @@ export function createOpenApiDocument(): JsonSchema {
         "422": response(422, ErrorResponseSchema),
         "429": response(429, ErrorResponseSchema),
         "500": response(500, ErrorResponseSchema),
+        "502": response(502, ErrorResponseSchema),
+        "503": response(503, ErrorResponseSchema),
         "507": response(507, ErrorResponseSchema),
       },
     };

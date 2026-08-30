@@ -1,30 +1,47 @@
 import OpenAI from "openai";
-import { OpenAIProvider } from "@openai/agents-openai";
+import { OpenAIProvider, OpenAIResponsesModel } from "@openai/agents-openai";
 import { aisdk } from "@openai/agents-extensions/ai-sdk";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
-import type { Model } from "@openai/agents";
+import {
+  NoopTrace,
+  withTrace,
+  type Model,
+  type ModelRequest,
+} from "@openai/agents";
 import type { Database, SqlExecutor } from "./database.js";
 import { CredentialCipher } from "./crypto.js";
-import { ValidationError } from "./database.js";
+import { ConflictError, ValidationError } from "./database.js";
 import {
   ModelCapabilityOverrideSchema,
   ModelCapabilitySchema,
   ProviderSettingsSchema,
   mergeModelCapabilities,
+  normalizeModelCapabilities,
   type ContextCompactionCapability,
+  type InputTokenCountingCapability,
   type ModelCapability,
+  type ModelTaskCapability,
   type ReasoningCapability,
 } from "./provider-capabilities.js";
 import { ResourceStore, type Resource } from "./resources.js";
 import { hashJson } from "./serialization.js";
 import type { PageOptions } from "./pagination.js";
+import {
+  countWithOfficialTokenizer,
+  localTokenizerRequestHasMultimodalInput,
+} from "./local-tokenizers.js";
 
 export type ProviderProtocol =
   "responses" | "chat_completions" | "anthropic" | "google_gemini";
 export type {
   ContextCompactionCapability,
+  InputTokenCountingCapability,
   ModelCapability,
+  ModelInputModality,
+  ModelKind,
+  ModelOutputModality,
+  ModelTaskCapability,
   ReasoningCapability,
 } from "./provider-capabilities.js";
 export interface ProviderModelDefinition {
@@ -71,7 +88,7 @@ interface ProviderOperationError {
   message: string;
 }
 
-const CATALOG_REVIEWED_AT = "2026-08-28";
+const CATALOG_REVIEWED_AT = "2026-08-30";
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 15_000;
 const DEFAULT_DISCOVERY_MAX_RETRIES = 2;
 const MAX_DISCOVERY_PAGES = 100;
@@ -92,6 +109,119 @@ class ProviderDiscoveryError extends Error {
   ) {
     super(message);
     this.name = "ProviderDiscoveryError";
+  }
+}
+
+class ProviderInvocationError extends Error {
+  constructor(
+    message: string,
+    readonly statusCode = 502,
+  ) {
+    super(message);
+    this.name = "ProviderInvocationError";
+  }
+}
+
+export class InputTokenCountingProviderError extends Error {
+  readonly statusCode: number;
+  readonly errorCode = "input_token_counting_provider_unavailable";
+  constructor(message: string, statusCode = 503) {
+    super(message);
+    this.name = "InputTokenCountingProviderError";
+    this.statusCode = statusCode;
+  }
+}
+
+export interface ProviderInputTokenCount {
+  input_tokens: number;
+}
+
+interface CapturedWireRequest {
+  url: string;
+  headers: Headers;
+  body: Record<string, unknown>;
+}
+
+class InputCountingOpenAIResponsesModel extends OpenAIResponsesModel {
+  buildCountRequest(request: ModelRequest): Record<string, unknown> {
+    return this._buildResponsesCreateRequest(request, false).requestData;
+  }
+}
+
+const MAX_PROVIDER_JSON_BYTES = 100_000_000;
+const MIMO_AUDIO_TIMEOUT_MS = 120_000;
+const INPUT_TOKEN_COUNT_TIMEOUT_MS = 30_000;
+
+const jsonBody = async (
+  response: Response,
+): Promise<Record<string, unknown>> => {
+  let value: unknown;
+  try {
+    value = await response.json();
+  } catch {
+    throw new InputTokenCountingProviderError(
+      "Provider Token count response was not valid JSON",
+    );
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new InputTokenCountingProviderError(
+      "Provider Token count response was not an object",
+    );
+  return value as Record<string, unknown>;
+};
+
+const countFrom = (value: unknown, field: string): number => {
+  const count = Number(value);
+  if (!Number.isSafeInteger(count) || count < 0)
+    throw new InputTokenCountingProviderError(
+      `Provider Token count response did not contain a valid ${field}`,
+    );
+  return count;
+};
+
+async function boundedJsonResponse(
+  response: Response,
+): Promise<Record<string, unknown>> {
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (
+    Number.isFinite(declaredLength) &&
+    declaredLength > MAX_PROVIDER_JSON_BYTES
+  )
+    throw new ProviderInvocationError(
+      "Provider audio response exceeded the Runtime size limit",
+    );
+  if (!response.body)
+    throw new ProviderInvocationError("Provider returned an empty response");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_PROVIDER_JSON_BYTES) {
+      await reader.cancel();
+      throw new ProviderInvocationError(
+        "Provider audio response exceeded the Runtime size limit",
+      );
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(bytes));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+      throw new Error("not an object");
+    return parsed as Record<string, unknown>;
+  } catch {
+    throw new ProviderInvocationError(
+      "Provider returned an invalid audio response",
+    );
   }
 }
 
@@ -165,6 +295,32 @@ const noReasoning = (): ReasoningCapability => ({
 const noContextCompaction = (): ContextCompactionCapability => ({
   supported: false,
 });
+const noInputTokenCounting = (): InputTokenCountingCapability => ({
+  status: "unavailable",
+});
+const providerInputTokenCounting = (
+  method: Exclude<InputTokenCountingCapability["method"], undefined>,
+  accuracy: Exclude<InputTokenCountingCapability["accuracy"], undefined>,
+): InputTokenCountingCapability => ({
+  status: "qualified",
+  scope: "assembled_model_input",
+  method,
+  accuracy,
+  reviewed_at: CATALOG_REVIEWED_AT,
+});
+const localTokenizerInputCounting = (
+  tokenizer_id: string,
+  tokenizer_revision: string,
+): InputTokenCountingCapability => ({
+  status: "qualified",
+  scope: "assembled_model_input",
+  method: "official_local_tokenizer",
+  accuracy: "verified_local",
+  tokenizer_id,
+  tokenizer_revision,
+  supported_input_modalities: ["text"],
+  reviewed_at: CATALOG_REVIEWED_AT,
+});
 const responsesCompaction = (): ContextCompactionCapability => ({
   supported: true,
   method: "responses_compact",
@@ -176,15 +332,32 @@ const standard = (
   adapter: "reasoning_effort",
   effort_values,
 });
+const noModelTasks = (): ModelTaskCapability => ({
+  image_understanding: "none",
+  transcription: "none",
+  speech_synthesis: "none",
+});
+type ModelOptions = Omit<Partial<ModelCapability>, "tasks"> & {
+  tasks?: Partial<ModelTaskCapability>;
+};
 const model = (
   id: string,
   context_window?: number,
-  options: Partial<ModelCapability> = {},
+  options: ModelOptions = {},
 ): ProviderModelDefinition => {
+  const imageUnderstanding =
+    options.tasks?.image_understanding ??
+    (options.vision || options.input_modalities?.includes("image")
+      ? "native"
+      : "none");
+  const inputModalities = options.input_modalities
+    ? [...options.input_modalities]
+    : imageUnderstanding === "native"
+      ? (["text", "image"] as const)
+      : (["text"] as const);
   const capabilities = ModelCapabilitySchema.parse({
     streaming: true,
     tools: true,
-    vision: false,
     structured_output: "prompt",
     context_window,
     context_window_type: "total",
@@ -192,7 +365,17 @@ const model = (
     capability_status: "catalog",
     reasoning: noReasoning(),
     context_compaction: noContextCompaction(),
+    input_token_counting: noInputTokenCounting(),
     ...options,
+    model_kind: options.model_kind ?? "agent",
+    input_modalities: inputModalities,
+    output_modalities: options.output_modalities ?? ["text"],
+    tasks: {
+      ...noModelTasks(),
+      ...options.tasks,
+      image_understanding: imageUnderstanding,
+    },
+    vision: imageUnderstanding === "native",
   });
   return {
     id,
@@ -203,6 +386,10 @@ const model = (
 };
 const unknownModelCapabilities = (): ModelCapability =>
   ModelCapabilitySchema.parse({
+    model_kind: "agent",
+    input_modalities: ["text"],
+    output_modalities: ["text"],
+    tasks: noModelTasks(),
     streaming: false,
     tools: false,
     vision: false,
@@ -212,6 +399,7 @@ const unknownModelCapabilities = (): ModelCapability =>
     capability_status: "unknown",
     reasoning: noReasoning(),
     context_compaction: noContextCompaction(),
+    input_token_counting: noInputTokenCounting(),
   });
 const provider = (
   id: string,
@@ -246,6 +434,10 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         [
           model("gpt-5.6-sol", 1_050_000, {
             max_output_tokens: 128_000,
+            input_token_counting: providerInputTokenCounting(
+              "openai_responses_input_tokens",
+              "authoritative_exact",
+            ),
             vision: true,
             structured_output: "native",
             context_compaction: responsesCompaction(),
@@ -260,6 +452,10 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
           }),
           model("gpt-5.6-terra", 1_050_000, {
             max_output_tokens: 128_000,
+            input_token_counting: providerInputTokenCounting(
+              "openai_responses_input_tokens",
+              "authoritative_exact",
+            ),
             vision: true,
             structured_output: "native",
             context_compaction: responsesCompaction(),
@@ -274,6 +470,10 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
           }),
           model("gpt-5.6-luna", 1_050_000, {
             max_output_tokens: 128_000,
+            input_token_counting: providerInputTokenCounting(
+              "openai_responses_input_tokens",
+              "authoritative_exact",
+            ),
             vision: true,
             structured_output: "native",
             context_compaction: responsesCompaction(),
@@ -288,6 +488,10 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
           }),
           model("gpt-5.4", 1_050_000, {
             max_output_tokens: 128_000,
+            input_token_counting: providerInputTokenCounting(
+              "openai_responses_input_tokens",
+              "authoritative_exact",
+            ),
             vision: true,
             structured_output: "native",
             context_compaction: responsesCompaction(),
@@ -358,21 +562,37 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
             max_input_tokens: 1_000_000,
             context_window_type: "input",
             vision: true,
+            input_token_counting: providerInputTokenCounting(
+              "anthropic_messages_count_tokens",
+              "provider_estimate",
+            ),
           }),
           model("claude-sonnet-5", 1_000_000, {
             max_input_tokens: 1_000_000,
             context_window_type: "input",
             vision: true,
+            input_token_counting: providerInputTokenCounting(
+              "anthropic_messages_count_tokens",
+              "provider_estimate",
+            ),
           }),
           model("claude-opus-4-6", 1_000_000, {
             max_input_tokens: 1_000_000,
             context_window_type: "input",
             vision: true,
+            input_token_counting: providerInputTokenCounting(
+              "anthropic_messages_count_tokens",
+              "provider_estimate",
+            ),
           }),
           model("claude-sonnet-4-6", 1_000_000, {
             max_input_tokens: 1_000_000,
             context_window_type: "input",
             vision: true,
+            input_token_counting: providerInputTokenCounting(
+              "anthropic_messages_count_tokens",
+              "provider_estimate",
+            ),
           }),
           model("claude-haiku-4-5-20251001", 200_000, {
             max_input_tokens: 200_000,
@@ -392,19 +612,43 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
             max_input_tokens: 1_000_000,
             max_output_tokens: 64_000,
             context_window_type: "input",
-            vision: true,
+            input_modalities: ["text", "image", "audio", "video"],
+            tasks: {
+              image_understanding: "native",
+              transcription: "general",
+            },
+            input_token_counting: providerInputTokenCounting(
+              "gemini_count_tokens",
+              "provider_estimate",
+            ),
           }),
           model("gemini-3-flash-preview", 1_000_000, {
             max_input_tokens: 1_000_000,
             max_output_tokens: 64_000,
             context_window_type: "input",
-            vision: true,
+            input_modalities: ["text", "image", "audio", "video"],
+            tasks: {
+              image_understanding: "native",
+              transcription: "general",
+            },
+            input_token_counting: providerInputTokenCounting(
+              "gemini_count_tokens",
+              "provider_estimate",
+            ),
           }),
           model("gemini-3.1-flash-lite", 1_000_000, {
             max_input_tokens: 1_000_000,
             max_output_tokens: 64_000,
             context_window_type: "input",
-            vision: true,
+            input_modalities: ["text", "image", "audio", "video"],
+            tasks: {
+              image_understanding: "native",
+              transcription: "general",
+            },
+            input_token_counting: providerInputTokenCounting(
+              "gemini_count_tokens",
+              "provider_estimate",
+            ),
           }),
         ],
       ),
@@ -417,6 +661,7 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         [
           model("command-a-plus-05-2026", 128_000, {
             max_output_tokens: 64_000,
+            vision: true,
           }),
           model("command-a-03-2025", 256_000),
         ],
@@ -430,7 +675,7 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         [
           model("grok-4.3", 1_000_000, { vision: true }),
           model("grok-4.5", 500_000, { vision: true }),
-          model("grok-build-0.1", 256_000),
+          model("grok-build-0.1", 256_000, { vision: true }),
         ],
       ),
       provider(
@@ -440,8 +685,8 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "https://api.mistral.ai/v1",
         "chat_completions",
         [
-          model("mistral-large-latest", 256_000),
-          model("mistral-small-latest", 256_000),
+          model("mistral-large-latest", 256_000, { vision: true }),
+          model("mistral-small-latest", 256_000, { vision: true }),
           model("codestral-latest", 128_000),
         ],
       ),
@@ -453,7 +698,10 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "chat_completions",
         [
           model("openai/gpt-oss-120b", 131_072, { max_output_tokens: 65_536 }),
-          model("qwen/qwen3.6-27b", 131_072, { max_output_tokens: 16_384 }),
+          model("qwen/qwen3.6-27b", 131_072, {
+            max_output_tokens: 16_384,
+            vision: true,
+          }),
           model("minimaxai/minimax-m2.7", 196_608, {
             max_output_tokens: 131_072,
           }),
@@ -486,7 +734,10 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "US",
         "https://api.perplexity.ai",
         "chat_completions",
-        [model("sonar", 128_000), model("sonar-pro", 200_000)],
+        [
+          model("sonar", 128_000, { vision: true }),
+          model("sonar-pro", 200_000, { vision: true }),
+        ],
       ),
       provider(
         "cerebras",
@@ -505,11 +756,44 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         [
           model("mimo-v2.5", 1_048_576, {
             max_output_tokens: 32_768,
+            input_token_counting: localTokenizerInputCounting(
+              "XiaomiMiMo/MiMo-V2.5",
+              "63651580ca774f8504f676040460aed3e1244ac1",
+            ),
+            input_modalities: ["text", "image", "audio", "video"],
+            tasks: {
+              image_understanding: "native",
+              transcription: "general",
+            },
             reasoning: standard(["none", "high"]),
           }),
           model("mimo-v2.5-pro", 1_048_576, {
             max_output_tokens: 131_072,
+            input_token_counting: localTokenizerInputCounting(
+              "XiaomiMiMo/MiMo-V2.5-Pro",
+              "21d1ecfecd7bd70f31be25ca49d7edd21f003659",
+            ),
             reasoning: standard(["none", "high"]),
+          }),
+          model("mimo-v2.5-asr", 8_192, {
+            model_kind: "transcription",
+            input_modalities: ["audio"],
+            output_modalities: ["text"],
+            tasks: { transcription: "dedicated" },
+            max_output_tokens: 2_048,
+            streaming: false,
+            tools: false,
+            structured_output: "none",
+          }),
+          model("mimo-v2.5-tts", 8_192, {
+            model_kind: "speech_synthesis",
+            input_modalities: ["text"],
+            output_modalities: ["audio"],
+            tasks: { speech_synthesis: "dedicated" },
+            max_output_tokens: 8_192,
+            streaming: false,
+            tools: false,
+            structured_output: "none",
           }),
         ],
         {
@@ -534,9 +818,17 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "responses",
         [
           model("deepseek-v4-pro", 1_000_000, {
+            input_token_counting: localTokenizerInputCounting(
+              "deepseek-ai/DeepSeek-V4-Pro",
+              "b5968e9190ef611bbf34a7229255be88a0e937c1",
+            ),
             reasoning: standard(["low", "high", "max"]),
           }),
           model("deepseek-v4-flash", 1_000_000, {
+            input_token_counting: localTokenizerInputCounting(
+              "deepseek-ai/DeepSeek-V4-Flash",
+              "60d8d70770c6776ff598c94bb586a859a38244f1",
+            ),
             reasoning: standard(["low", "high", "max"]),
           }),
         ],
@@ -548,10 +840,16 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "chat_completions",
         [
-          model("qwen3.8-max-preview", 1_000_000, { vision: true }),
+          model("qwen3.8-max-preview", 1_000_000, {
+            vision: true,
+            input_token_counting: localTokenizerInputCounting(
+              "Qwen/Qwen3.8-2.4T-A95B",
+              "207bd685a7e3696cfaff12ded7c6a7ea0f88c996",
+            ),
+          }),
           model("qwen3.7-max", 1_000_000, { vision: true }),
           model("qwen3.7-plus", 1_000_000, { vision: true }),
-          model("qwen3.6-flash", 1_000_000),
+          model("qwen3.6-flash", 1_000_000, { vision: true }),
         ],
       ),
       provider(
@@ -575,8 +873,8 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "chat_completions",
         [
           model("kimi-k2.7-code", 262_144),
-          model("kimi-k2.6", 262_144),
-          model("kimi-k2.5", 262_144),
+          model("kimi-k2.6", 262_144, { vision: true }),
+          model("kimi-k2.5", 262_144, { vision: true }),
         ],
         {
           cn: {
@@ -597,7 +895,10 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "CN",
         "https://ark.cn-beijing.volces.com/api/v3",
         "responses",
-        [model("doubao-seed-2-0-lite-260215"), model("ark-code-latest")],
+        [
+          model("doubao-seed-2-0-lite-260215", undefined, { vision: true }),
+          model("ark-code-latest", undefined, { model_kind: "routing" }),
+        ],
       ),
       provider(
         "baidu_qianfan",
@@ -651,7 +952,7 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         [
           model("step-3.5-flash", 262_144),
           model("step-3.5-flash-2603", 262_144),
-          model("step-router-v1"),
+          model("step-router-v1", undefined, { model_kind: "routing" }),
         ],
       ),
       provider(
@@ -740,6 +1041,22 @@ interface ProviderModelData extends Record<string, unknown> {
   };
 }
 
+function normalizedProviderModel(
+  row: Resource<ProviderModelData> & ProviderModelData,
+): Resource<ProviderModelData> & ProviderModelData {
+  return {
+    ...row,
+    capabilities: normalizeModelCapabilities(row.capabilities),
+    ...(row.catalog_capabilities
+      ? {
+          catalog_capabilities: normalizeModelCapabilities(
+            row.catalog_capabilities,
+          ),
+        }
+      : {}),
+  };
+}
+
 interface DiscoveryResult {
   ids: string[];
   status: "succeeded" | "empty";
@@ -759,6 +1076,30 @@ export class ProviderService {
 
   catalog(): ProviderDefinition[] {
     return Object.values(PROVIDER_CATALOG);
+  }
+
+  inputTokenCountingModels(minimumContextWindow = 1_000_000) {
+    return this.catalog().flatMap((definition) =>
+      definition.models
+        .filter(
+          (item) =>
+            Number(item.capabilities.context_window ?? 0) >=
+              minimumContextWindow &&
+            item.capabilities.input_token_counting.status === "qualified",
+        )
+        .map((item) => ({
+          provider: definition.id,
+          provider_name: definition.name,
+          model_id: item.id,
+          display_name: item.display_name,
+          context_window_tokens: item.capabilities.context_window!,
+          context_window_type: item.capabilities.context_window_type,
+          max_input_tokens: item.capabilities.max_input_tokens,
+          max_output_tokens: item.capabilities.max_output_tokens,
+          input_token_counting: item.capabilities.input_token_counting,
+          capability_reviewed_at: item.capability_reviewed_at,
+        })),
+    );
   }
 
   private definition(id: string): ProviderDefinition {
@@ -835,6 +1176,26 @@ export class ProviderService {
   }
   async get(id: string) {
     return this.store.get<ConnectionData>("provider_connection", id);
+  }
+
+  async delete(id: string) {
+    const current = await this.get(id);
+    const referenced = await this.db.query<{ id: string }>(
+      `SELECT id FROM resources WHERE kind='agent_deployment'
+       AND data->'config'->'provider'->>'connection_id'=$1 LIMIT 1`,
+      [current.id],
+    );
+    if (referenced.rows.length)
+      throw new ConflictError(
+        `Provider connection ${current.id} is referenced by an Agent deployment`,
+      );
+    const models = await this.store.list("provider_model", {
+      parentId: current.id,
+      limit: 2_000,
+    });
+    for (const model of models)
+      await this.store.delete("provider_model", model.id);
+    await this.store.delete("provider_connection", current.id);
   }
 
   async verifyStoredCredentialEncryption(): Promise<number> {
@@ -950,6 +1311,312 @@ export class ProviderService {
       .toString();
   }
 
+  private async providerCountJson(
+    url: string,
+    init: RequestInit,
+  ): Promise<Record<string, unknown>> {
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        ...init,
+        signal: AbortSignal.timeout(INPUT_TOKEN_COUNT_TIMEOUT_MS),
+      });
+    } catch {
+      throw new InputTokenCountingProviderError(
+        "Provider input Token count request failed",
+      );
+    }
+    if (!response.ok)
+      throw new InputTokenCountingProviderError(
+        `Provider input Token count request failed with HTTP ${response.status}`,
+        response.status === 429 ? 429 : response.status >= 500 ? 503 : 502,
+      );
+    return jsonBody(response);
+  }
+
+  private async captureAiSdkWireRequest(
+    protocol: "anthropic" | "google_gemini",
+    connection: ConnectionData,
+    modelId: string,
+    request: ModelRequest,
+  ): Promise<CapturedWireRequest> {
+    let captured: CapturedWireRequest | undefined;
+    const captureFetch = async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      const outgoing = new Request(input, init);
+      const raw = await outgoing.clone().text();
+      const parsed = raw ? (JSON.parse(raw) as unknown) : {};
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+        throw new Error("Provider request body was not an object");
+      captured = {
+        url: outgoing.url,
+        headers: new Headers(outgoing.headers),
+        body: parsed as Record<string, unknown>,
+      };
+      throw new Error("OMOIKANE_PROVIDER_REQUEST_CAPTURED");
+    };
+    const providerModel =
+      protocol === "anthropic"
+        ? createAnthropic({
+            apiKey: "capture-only",
+            baseURL: connection.base_url,
+            fetch: captureFetch,
+          })(modelId)
+        : createGoogleGenerativeAI({
+            apiKey: "capture-only",
+            baseURL: connection.base_url,
+            fetch: captureFetch,
+          })(modelId);
+    try {
+      await withTrace(new NoopTrace(), () =>
+        aisdk(providerModel).getResponse({
+          ...request,
+          signal: undefined,
+        }),
+      );
+    } catch {
+      // The capture transport deliberately stops before external I/O.
+    }
+    if (!captured)
+      throw new InputTokenCountingProviderError(
+        "Could not compile the assembled input into the Provider request",
+      );
+    return captured;
+  }
+
+  private async captureOpenAiChatWireRequest(
+    modelId: string,
+    request: ModelRequest,
+  ): Promise<CapturedWireRequest> {
+    let captured: CapturedWireRequest | undefined;
+    const captureFetch = async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      const outgoing = new Request(input, init);
+      const raw = await outgoing.clone().text();
+      const parsed = raw ? (JSON.parse(raw) as unknown) : {};
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+        throw new Error("Provider request body was not an object");
+      captured = {
+        url: outgoing.url,
+        headers: new Headers(outgoing.headers),
+        body: parsed as Record<string, unknown>,
+      };
+      throw new Error("OMOIKANE_PROVIDER_REQUEST_CAPTURED");
+    };
+    const client = new OpenAI({
+      apiKey: "capture-only",
+      baseURL: "http://127.0.0.1:1/v1",
+      fetch: captureFetch,
+      maxRetries: 0,
+    });
+    const provider = new OpenAIProvider({
+      openAIClient: client,
+      useResponses: false,
+    });
+    try {
+      const model = await provider.getModel(modelId);
+      await withTrace(new NoopTrace(), () =>
+        model.getResponse({ ...request, signal: undefined }),
+      );
+    } catch {
+      // The capture transport deliberately stops before external I/O.
+    } finally {
+      await provider.close();
+    }
+    if (!captured)
+      throw new InputTokenCountingProviderError(
+        "Could not compile the assembled input into OpenAI-compatible messages",
+      );
+    return captured;
+  }
+
+  private async countOpenAiResponsesInput(
+    connection: ConnectionData,
+    modelId: string,
+    request: ModelRequest,
+  ): Promise<number> {
+    const client = new OpenAI({
+      apiKey: this.key(connection),
+      baseURL: connection.base_url,
+      maxRetries: 0,
+    });
+    const requestData = new InputCountingOpenAIResponsesModel(
+      client,
+      modelId,
+    ).buildCountRequest(request);
+    const supportedFields = new Set([
+      "conversation",
+      "input",
+      "instructions",
+      "model",
+      "parallel_tool_calls",
+      "personality",
+      "previous_response_id",
+      "reasoning",
+      "text",
+      "tool_choice",
+      "tools",
+      "truncation",
+    ]);
+    const countRequest = Object.fromEntries(
+      Object.entries(requestData).filter(
+        ([key, value]) => supportedFields.has(key) && value !== undefined,
+      ),
+    );
+    try {
+      const result = await client.responses.inputTokens.count(
+        countRequest as never,
+        { timeout: INPUT_TOKEN_COUNT_TIMEOUT_MS, maxRetries: 0 },
+      );
+      return countFrom(result.input_tokens, "input_tokens");
+    } catch (error) {
+      if (error instanceof InputTokenCountingProviderError) throw error;
+      const status = Number((error as { status?: unknown }).status);
+      throw new InputTokenCountingProviderError(
+        Number.isFinite(status)
+          ? `Provider input Token count request failed with HTTP ${status}`
+          : "Provider input Token count request failed",
+        status === 429 ? 429 : status >= 500 ? 503 : 502,
+      );
+    }
+  }
+
+  private async countAnthropicInput(
+    connection: ConnectionData,
+    modelId: string,
+    request: ModelRequest,
+  ): Promise<number> {
+    const wire = await this.captureAiSdkWireRequest(
+      "anthropic",
+      connection,
+      modelId,
+      request,
+    );
+    const supportedFields = new Set([
+      "model",
+      "messages",
+      "system",
+      "tools",
+      "tool_choice",
+      "thinking",
+      "output_config",
+    ]);
+    const body = Object.fromEntries(
+      Object.entries(wire.body).filter(
+        ([key, value]) => supportedFields.has(key) && value !== undefined,
+      ),
+    );
+    const beta = wire.headers.get("anthropic-beta");
+    const result = await this.providerCountJson(
+      `${connection.base_url}/messages/count_tokens`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": this.key(connection),
+          "anthropic-version":
+            wire.headers.get("anthropic-version") ?? "2023-06-01",
+          ...(beta ? { "anthropic-beta": beta } : {}),
+        },
+        body: JSON.stringify(body),
+      },
+    );
+    return countFrom(result.input_tokens, "input_tokens");
+  }
+
+  private async countGeminiInput(
+    connection: ConnectionData,
+    modelId: string,
+    request: ModelRequest,
+  ): Promise<number> {
+    const wire = await this.captureAiSdkWireRequest(
+      "google_gemini",
+      connection,
+      modelId,
+      request,
+    );
+    const result = await this.providerCountJson(
+      `${connection.base_url}/models/${encodeURIComponent(modelId)}:countTokens`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": this.key(connection),
+        },
+        body: JSON.stringify({ generateContentRequest: wire.body }),
+      },
+    );
+    return countFrom(result.totalTokens, "totalTokens");
+  }
+
+  private async countOfficialLocalTokenizerInput(
+    modelId: string,
+    request: ModelRequest,
+    capability: InputTokenCountingCapability,
+  ): Promise<number> {
+    if (!capability.tokenizer_id || !capability.tokenizer_revision)
+      throw new InputTokenCountingProviderError(
+        `model ${modelId} does not declare an immutable official Tokenizer`,
+        422,
+      );
+    if (localTokenizerRequestHasMultimodalInput(request))
+      throw new InputTokenCountingProviderError(
+        `model ${modelId} local Tokenizer supports text input only`,
+        422,
+      );
+    const wire = await this.captureOpenAiChatWireRequest(modelId, request);
+    try {
+      return await countWithOfficialTokenizer(wire.body, {
+        tokenizer_id: capability.tokenizer_id,
+        tokenizer_revision: capability.tokenizer_revision,
+      });
+    } catch (error) {
+      throw new InputTokenCountingProviderError(
+        error instanceof Error
+          ? `official local Tokenizer failed: ${error.message}`
+          : "official local Tokenizer failed",
+        503,
+      );
+    }
+  }
+
+  async countModelInputTokens(
+    connection: ConnectionData,
+    modelId: string,
+    request: ModelRequest,
+    capability: InputTokenCountingCapability,
+  ): Promise<ProviderInputTokenCount> {
+    if (capability.status !== "qualified" || !capability.method)
+      throw new InputTokenCountingProviderError(
+        `model ${modelId} does not have qualified input Token counting`,
+        422,
+      );
+    const inputTokens =
+      capability.method === "openai_responses_input_tokens"
+        ? await this.countOpenAiResponsesInput(connection, modelId, request)
+        : capability.method === "anthropic_messages_count_tokens"
+          ? await this.countAnthropicInput(connection, modelId, request)
+          : capability.method === "gemini_count_tokens"
+            ? await this.countGeminiInput(connection, modelId, request)
+            : capability.method === "official_local_tokenizer"
+              ? await this.countOfficialLocalTokenizerInput(
+                  modelId,
+                  request,
+                  capability,
+                )
+              : undefined;
+    if (inputTokens === undefined)
+      throw new InputTokenCountingProviderError(
+        `input Token counting adapter is unavailable for ${capability.method}`,
+        422,
+      );
+    return { input_tokens: inputTokens };
+  }
+
   compactionIssuerFingerprint(
     connection: ConnectionData,
     modelId: string,
@@ -986,6 +1653,193 @@ export class ProviderService {
       },
       options.signal ? { signal: options.signal } : undefined,
     )) as unknown as Record<string, unknown>;
+  }
+
+  private async dedicatedAudioModel(
+    connectionId: string,
+    modelId: string,
+    task: "transcription" | "speech_synthesis",
+  ) {
+    const connection = await this.get(connectionId);
+    if (connection.provider !== "xiaomi_mimo")
+      throw new ValidationError(
+        `provider ${connection.provider} does not implement the MiMo audio adapter`,
+      );
+    const selected = (await this.listModels(connectionId)).find(
+      (item) => item.model_id === modelId,
+    );
+    if (!selected)
+      throw new ValidationError(
+        `model ${modelId} is not active for Provider connection ${connectionId}`,
+      );
+    const capability = selected.capabilities as ModelCapability;
+    if (capability.tasks[task] !== "dedicated")
+      throw new ValidationError(
+        `model ${modelId} does not provide dedicated ${task}`,
+      );
+    return connection;
+  }
+
+  private async mimoAudioCompletion(
+    connectionId: string,
+    modelId: string,
+    task: "transcription" | "speech_synthesis",
+    body: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const connection = await this.dedicatedAudioModel(
+      connectionId,
+      modelId,
+      task,
+    );
+    let response: Response;
+    try {
+      response = await fetch(`${connection.base_url}/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.key(connection)}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ ...body, model: modelId, stream: false }),
+        signal: AbortSignal.timeout(MIMO_AUDIO_TIMEOUT_MS),
+      });
+    } catch (error) {
+      const timeout =
+        error instanceof Error &&
+        (error.name === "AbortError" || error.name === "TimeoutError");
+      throw new ProviderInvocationError(
+        timeout
+          ? "Provider audio request timed out"
+          : "Provider audio request failed",
+        503,
+      );
+    }
+    if (!response.ok) {
+      if (response.status === 429)
+        throw new ProviderInvocationError(
+          "Provider rate-limited the audio request",
+          429,
+        );
+      throw new ProviderInvocationError(
+        `Provider audio request failed with HTTP ${response.status}`,
+        response.status >= 500 ? 503 : 502,
+      );
+    }
+    return boundedJsonResponse(response);
+  }
+
+  async transcribeAudio(
+    connectionId: string,
+    input: {
+      model: string;
+      audio: { data: string; format: "mp3" | "wav" };
+      language: "auto" | "zh" | "en";
+    },
+  ): Promise<{
+    model: string;
+    text: string;
+    usage?: Record<string, unknown>;
+  }> {
+    const mimeType = input.audio.format === "mp3" ? "audio/mpeg" : "audio/wav";
+    const result = await this.mimoAudioCompletion(
+      connectionId,
+      input.model,
+      "transcription",
+      {
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_audio",
+                input_audio: {
+                  data: `data:${mimeType};base64,${input.audio.data}`,
+                },
+              },
+            ],
+          },
+        ],
+        asr_options: { language: input.language },
+      },
+    );
+    const choices = Array.isArray(result.choices) ? result.choices : [];
+    const first = choices[0] as Record<string, unknown> | undefined;
+    const message =
+      first?.message && typeof first.message === "object"
+        ? (first.message as Record<string, unknown>)
+        : undefined;
+    if (typeof message?.content !== "string")
+      throw new ProviderInvocationError(
+        "Provider transcription response did not contain text",
+      );
+    return {
+      model: input.model,
+      text: message.content,
+      ...(result.usage &&
+      typeof result.usage === "object" &&
+      !Array.isArray(result.usage)
+        ? { usage: result.usage as Record<string, unknown> }
+        : {}),
+    };
+  }
+
+  async synthesizeSpeech(
+    connectionId: string,
+    input: {
+      model: string;
+      input: string;
+      voice?: string;
+      format: "wav" | "mp3";
+      instructions?: string;
+    },
+  ): Promise<{
+    model: string;
+    audio: { data: string; format: "wav" | "mp3"; mime_type: string };
+    usage?: Record<string, unknown>;
+  }> {
+    const result = await this.mimoAudioCompletion(
+      connectionId,
+      input.model,
+      "speech_synthesis",
+      {
+        messages: [
+          ...(input.instructions
+            ? [{ role: "user", content: input.instructions }]
+            : []),
+          { role: "assistant", content: input.input },
+        ],
+        audio: {
+          format: input.format,
+          ...(input.voice ? { voice: input.voice } : {}),
+        },
+      },
+    );
+    const choices = Array.isArray(result.choices) ? result.choices : [];
+    const first = choices[0] as Record<string, unknown> | undefined;
+    const message =
+      first?.message && typeof first.message === "object"
+        ? (first.message as Record<string, unknown>)
+        : undefined;
+    const audio =
+      message?.audio && typeof message.audio === "object"
+        ? (message.audio as Record<string, unknown>)
+        : undefined;
+    if (typeof audio?.data !== "string" || !audio.data)
+      throw new ProviderInvocationError(
+        "Provider speech response did not contain audio",
+      );
+    return {
+      model: input.model,
+      audio: {
+        data: audio.data,
+        format: input.format,
+        mime_type: input.format === "mp3" ? "audio/mpeg" : "audio/wav",
+      },
+      ...(result.usage &&
+      typeof result.usage === "object" &&
+      !Array.isArray(result.usage)
+        ? { usage: result.usage as Record<string, unknown> }
+        : {}),
+    };
   }
 
   private discoveryOptions(connection: ConnectionData) {
@@ -1515,17 +2369,20 @@ export class ProviderService {
       status: "active",
       limit: 2_000,
     });
-    if (rows.length) return rows;
-    return this.ensureCatalogModels(await this.get(connectionId));
+    if (rows.length) return rows.map(normalizedProviderModel);
+    return (await this.ensureCatalogModels(await this.get(connectionId))).map(
+      normalizedProviderModel,
+    );
   }
 
   async pageModels(connectionId: string, options: PageOptions = {}) {
     await this.listModels(connectionId);
-    return this.store.page<ProviderModelData>("provider_model", {
+    const page = await this.store.page<ProviderModelData>("provider_model", {
       ...options,
       parentId: connectionId,
       status: "active",
     });
+    return { ...page, data: page.data.map(normalizedProviderModel) };
   }
 
   async addModel(connectionId: string, input: Record<string, unknown>) {
@@ -1566,6 +2423,14 @@ export class ProviderService {
                   {}),
                 ...((incoming.context_compaction as Record<string, unknown>) ??
                   {}),
+              },
+            }
+          : {}),
+        ...(previous.tasks || incoming.tasks
+          ? {
+              tasks: {
+                ...((previous.tasks as Record<string, unknown>) ?? {}),
+                ...((incoming.tasks as Record<string, unknown>) ?? {}),
               },
             }
           : {}),
@@ -1747,6 +2612,13 @@ export class ProviderService {
         `model ${modelId} is not active for Provider connection ${connectionId}; synchronize models or add it explicitly`,
       );
     const capability = selectedModel.capabilities as ModelCapability;
+    if (
+      capability.model_kind === "transcription" ||
+      capability.model_kind === "speech_synthesis"
+    )
+      throw new ValidationError(
+        `model ${modelId} is a dedicated ${capability.model_kind} model and cannot back an Agent deployment`,
+      );
     const settings = {
       ...((config.model_settings as Record<string, unknown>) ?? {}),
     };

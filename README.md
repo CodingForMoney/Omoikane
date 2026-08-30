@@ -91,7 +91,7 @@ saveToBusinessStore(completed.output, completed.new_items);
 | ---------- | ---------------------------------------------------------------------------------------------------------------------- |
 | Runtime    | durable queue, leases, retry/cancel, restart recovery, paged Run listing, ordered Events, bounded REST/SSE             |
 | Agents     | immutable `AGENT.md`/JSON Deployments, model settings, Handoffs                                                        |
-| Providers  | built-in catalog, connection validation, model synchronization, capability defaults                                    |
+| Providers  | built-in catalog, model sync/capabilities, qualified complete-input Token counting, MiMo V2.5 ASR/TTS adapters         |
 | Tools      | Function Tools; Runtime-managed MCP Tools with policy, snapshots, approvals, and reconciliation                        |
 | Skills     | immutable bundles, explicit version binding, checksum verification, instruction injection                              |
 | Context    | caller-supplied conversation; native/portable temporary Projection; no Session or memory store                         |
@@ -100,6 +100,8 @@ saveToBusinessStore(completed.output, completed.new_items);
 | Operations | PGlite snapshot/restore/safe upgrade, optional PostgreSQL, Usage, Runtime status, metadata-only SDK tracing            |
 
 The MCP product contract intentionally covers Runtime-managed Tools, not a general-purpose MCP Host. Resources, Prompts, client callbacks, OAuth ownership, and Provider-hosted MCP are outside the current boundary rather than incomplete Tool support. Context compaction remains lossy and its reliability boundary is documented explicitly.
+
+Complete-input Token counting is capability-gated per model. Omoikane uses Provider count endpoints where available and pinned official open-source chat serializers and Tokenizers for qualified MiMo, DeepSeek, and Qwen models. Local Tokenizer counting covers text requests only and fails closed for unsupported modalities or unavailable assets; see the Provider guide for the exact model list and accuracy class.
 
 There are deliberately no users, tenants, authentication tokens, managed Sessions, long-term memories, supported Sandbox/model-directed shell execution, Webhooks, release channels, or permanent business file storage. Experimental Sandbox code remains in the repository for possible future evaluation, but it is not a product capability or compatibility commitment.
 
@@ -114,7 +116,7 @@ npm run check:docs
 npm run build
 ```
 
-Optional supported suites cover PostgreSQL recovery, live Providers, MiMo 100K portable compaction, and Codex Bridge native compaction plus continuation. They read secrets only from ignored environment files or the process environment.
+Optional supported suites cover PostgreSQL recovery, live Providers, MiMo ASR/TTS round trips, MiMo 100K portable compaction, and Codex Bridge native compaction plus continuation. They read secrets only from ignored environment files or the process environment.
 
 ## Documentation map
 
@@ -124,7 +126,7 @@ Each document has one job; implementation status is not duplicated across topic 
 | -------------------------------------------------------- | ------------------------------------------------------------------------------------- |
 | [Developer guide](docs/DEVELOPER_GUIDE.md)               | end-to-end installation, configuration, API use, recovery, tests, and troubleshooting |
 | [Architecture and state ownership](docs/ARCHITECTURE.md) | product boundary, topology, lifecycle, persistence, retention, and trust model        |
-| [Provider and model catalog](docs/PROVIDERS.md)          | protocols, model synchronization, Reasoning Effort, context defaults, and credentials |
+| [Provider and model catalog](docs/PROVIDERS.md)          | protocols, model capabilities, modalities, audio, Token counting, and credentials     |
 | [Context compaction](docs/CONTEXT_COMPACTION.md)         | compaction contract, algorithm, API, reliability boundary, and evaluation             |
 
 License: MIT.

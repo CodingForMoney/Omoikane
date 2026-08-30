@@ -377,6 +377,9 @@ export async function createApp(
       post_commit_event_wakeup: true,
       run_usage: true,
       resource_limits: true,
+      audio_transcription: true,
+      speech_synthesis: true,
+      assembled_input_token_counting: true,
     },
   }));
 
@@ -417,6 +420,14 @@ export async function createApp(
       ),
     );
   });
+  app.delete(
+    "/v1/provider-connections/:connectionId",
+    async (request, reply) => {
+      const { connectionId } = requestParams(request, "deleteProvider");
+      await container.providers.delete(connectionId);
+      return reply.code(204).send();
+    },
+  );
   app.post(
     "/v1/provider-connections/:connectionId/validate",
     async (request) => {
@@ -442,6 +453,26 @@ export async function createApp(
             requestBody(request, "createProviderModel"),
           ),
         );
+    },
+  );
+  app.post(
+    "/v1/provider-connections/:connectionId/audio/transcriptions",
+    async (request) => {
+      const { connectionId } = requestParams(request, "transcribeAudio");
+      return container.providers.transcribeAudio(
+        connectionId,
+        requestBody(request, "transcribeAudio"),
+      );
+    },
+  );
+  app.post(
+    "/v1/provider-connections/:connectionId/audio/speech",
+    async (request) => {
+      const { connectionId } = requestParams(request, "createSpeech");
+      return container.providers.synthesizeSpeech(
+        connectionId,
+        requestBody(request, "createSpeech"),
+      );
     },
   );
 
@@ -480,6 +511,22 @@ export async function createApp(
     const { deploymentId } = requestParams(request, "getDeployment");
     return container.definitions.deployment(deploymentId);
   });
+  app.post(
+    "/v1/deployments/:deploymentId/input-token-count",
+    async (request) => {
+      const { deploymentId } = requestParams(
+        request,
+        "countDeploymentInputTokens",
+      );
+      return container.inputTokenCounting.count(
+        deploymentId,
+        requestBody(request, "countDeploymentInputTokens") as never,
+      );
+    },
+  );
+  app.get("/v1/input-token-counting/models", async () => ({
+    data: container.providers.inputTokenCountingModels(),
+  }));
   app.post("/v1/context/compact", async (request) => {
     const data = requestBody(request, "compactContext");
     const deployment = await container.definitions.deployment(

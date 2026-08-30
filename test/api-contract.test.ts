@@ -219,6 +219,19 @@ describe("REST contract", () => {
     expect(
       document.paths["/v1/runs/{runId}/cancel"].post.requestBody.required,
     ).toBe(false);
+    expect(
+      document.paths[
+        "/v1/provider-connections/{connectionId}/audio/transcriptions"
+      ].post,
+    ).toBeTruthy();
+    expect(
+      document.paths["/v1/provider-connections/{connectionId}/audio/speech"]
+        .post,
+    ).toBeTruthy();
+    const serializedDocument = JSON.stringify(document);
+    expect(serializedDocument).toContain("model_kind");
+    expect(serializedDocument).toContain("input_modalities");
+    expect(serializedDocument).toContain("speech_synthesis");
 
     for (const rawContract of Object.values(API_CONTRACTS)) {
       const contract: ApiRouteContract = rawContract;

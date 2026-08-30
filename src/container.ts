@@ -18,6 +18,7 @@ import { McpService } from "./mcp.js";
 import { NO_FAULT_INJECTOR, type FaultInjector } from "./recovery.js";
 import { GuardrailService } from "./guardrails.js";
 import { ObservabilityService } from "./observability.js";
+import { InputTokenCountingService } from "./input-token-counting.js";
 
 export interface ContainerOptions {
   startWorker?: boolean;
@@ -39,6 +40,7 @@ export class Container {
   readonly events: EventStore;
   readonly usage: UsageService;
   readonly compaction: CompactionService;
+  readonly inputTokenCounting: InputTokenCountingService;
   readonly runner: RunnerService;
   private readonly abort = new AbortController();
   private readonly workers: Promise<void>[] = [];
@@ -76,6 +78,12 @@ export class Container {
     );
     this.usage = new UsageService(db);
     this.compaction = new CompactionService(this.providers);
+    this.inputTokenCounting = new InputTokenCountingService(
+      db,
+      this.factory,
+      this.providers,
+      this.compaction,
+    );
     this.runner = new RunnerService(
       db,
       settings,

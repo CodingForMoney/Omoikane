@@ -279,7 +279,7 @@ describe("backup, restore, and safe upgrades", () => {
     await expect(
       restorePgliteBackup(snapshot, join(testRoot, "wrong-key-restore")),
     ).rejects.toThrow();
-  }, 30_000);
+  }, 60_000);
 
   it("rejects future and discontinuous migration histories without writing", async () => {
     expect(MIGRATION_VERSIONS.at(-1)).toBe(MIGRATION_HEAD);

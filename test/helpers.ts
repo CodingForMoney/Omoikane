@@ -50,6 +50,7 @@ export async function publishedAgent(
     skills?: unknown[];
     sandbox?: boolean | Record<string, unknown>;
     mcpServers?: unknown[];
+    handoffs?: unknown[];
     outputSchema?: Record<string, unknown>;
     compaction?: Record<string, unknown>;
     modelContextWindow?: number;
@@ -76,6 +77,7 @@ export async function publishedAgent(
       tools: options.tools ?? [],
       skills: options.skills ?? [],
       mcp_servers: options.mcpServers ?? [],
+      handoffs: options.handoffs ?? [],
       output_schema: options.outputSchema,
       compaction: options.compaction ?? { enabled: false },
       ...(options.guardrails ? { guardrails: options.guardrails } : {}),
