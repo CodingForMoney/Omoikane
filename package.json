@@ -1,6 +1,6 @@
 {
   "name": "omoikane",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "description": "Durable TypeScript Agent Runtime built on the OpenAI Agents SDK",
   "type": "module",
   "main": "./dist/index.js",
@@ -17,6 +17,14 @@
     "./contracts": {
       "types": "./dist/contracts.d.ts",
       "import": "./dist/contracts.js"
+    },
+    "./runtime": {
+      "types": "./dist/runtime.d.ts",
+      "import": "./dist/runtime.js"
+    },
+    "./deployment": {
+      "types": "./dist/deployment.d.ts",
+      "import": "./dist/deployment.js"
     }
   },
   "bin": {

@@ -511,6 +511,10 @@ export class SkillService {
             { parentId: skill.id },
             tx,
           );
+          const existing = versions.find(
+            (item) => String(item.content_hash) === digest,
+          );
+          if (existing) return { skill, version: existing, reused: true };
           const version =
             Math.max(0, ...versions.map((item) => Number(item.version))) + 1;
           const parent = resolve(this.settings.skillRoot, skill.id);
@@ -555,7 +559,7 @@ export class SkillService {
             },
             tx,
           );
-          return { skill, version: skillVersion };
+          return { skill, version: skillVersion, reused: false };
         });
       } catch (error) {
         if (stage) await removeTree(stage);

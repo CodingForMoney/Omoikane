@@ -88,9 +88,19 @@ describe("REST contract", () => {
       request: {
         method: "POST",
         url: "/v1/runs",
+        headers: { "idempotency-key": "contract-missing-field" },
         payload: { input: "hello" },
       },
       path: "deployment_id",
+    },
+    {
+      name: "missing Run idempotency key",
+      request: {
+        method: "POST",
+        url: "/v1/runs",
+        payload: { deployment_id: "deployment", input: "hello" },
+      },
+      path: "idempotency-key",
     },
     {
       name: "string boolean",
@@ -174,6 +184,7 @@ describe("REST contract", () => {
     const run = await app.inject({
       method: "POST",
       url: "/v1/runs",
+      headers: { "idempotency-key": "contract-dynamic-run" },
       payload: {
         deployment_id: fixture.version.id,
         input: "hello",
@@ -187,6 +198,7 @@ describe("REST contract", () => {
     const unknownEnvelope = await app.inject({
       method: "POST",
       url: "/v1/runs",
+      headers: { "idempotency-key": "contract-unknown-envelope" },
       payload: {
         deployment_id: fixture.version.id,
         input: "hello",

@@ -393,7 +393,8 @@ describe("SKILL.md execution contract", () => {
       importedConcurrently
         .map((item) => Number(item.version.version))
         .sort((left, right) => left - right),
-    ).toEqual([1, 2]);
+    ).toEqual([1, 1]);
+    expect(importedConcurrently.filter((item) => item.reused)).toHaveLength(1);
 
     const local = await mkdtemp(join(tmpdir(), "omoikane-skill-source-"));
     try {

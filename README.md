@@ -23,6 +23,15 @@ npm install omoikane
 npx omoikane-runtime
 ```
 
+The supported npm integration surfaces are intentionally small:
+
+- `omoikane/client` is the recommended and only normal dependency of a business application;
+- `omoikane/runtime` is for the local Runtime wrapper that registers business-owned Function Tool, Guardrail, or Trace implementations before calling `startRuntime()`;
+- `omoikane/deployment` exposes the same declarative deployment operation used by `omoikane apply`;
+- `omoikane/contracts` contains shared REST contracts for infrastructure adapters.
+
+The root `omoikane` export remains available for pre-1.0 compatibility and advanced maintenance code, but new application code should not depend on its internal service classes.
+
 The local defaults are:
 
 - REST/SSE at `http://127.0.0.1:8000`;
@@ -36,9 +45,32 @@ A non-loopback bind is rejected unless `OMOIKANE_ALLOW_REMOTE=true`. PostgreSQL 
 
 The complete OpenAPI 3.1 contract is served at `GET /openapi.json`. Runtime validation, exported npm request types, and OpenAPI are derived from the same Zod schemas. Runtime control envelopes reject unknown fields; explicitly dynamic business values such as Run `context`, model input items, Function Tool arguments, and JSON Schema remain open.
 
-## Minimal workflow
+## Recommended project workflow
 
-Configure a Provider, deploy an Agent, then create a self-contained Run:
+Create a business-owned integration project and declaratively apply its Provider and Agent resources:
+
+```bash
+npx omoikane init ./agent-runtime
+cd ./agent-runtime
+# edit omoikane.yaml and agents/assistant/AGENT.md
+npx omoikane apply ./omoikane.yaml
+```
+
+`omoikane.yaml` references credentials by environment-variable name and never accepts a plaintext Provider key. `apply` synchronizes new Provider models by default, creates immutable Tool and Skill definitions, updates MCP configuration, validates Agents, and reuses an existing Deployment with the same `config_hash`. Its JSON result contains the exact Deployment IDs for the business system to promote through its own configuration.
+
+If the project has custom in-process extensions, build and run the generated `runtime/server.ts` wrapper instead of the stock executable:
+
+```ts
+import { registerToolImplementation, startRuntime } from "omoikane/runtime";
+
+registerToolImplementation("business.lookup", async (args, context) => {
+  return lookupAuthorizedBusinessData(args, context);
+});
+
+await startRuntime();
+```
+
+The business application then creates a self-contained Run through the client package:
 
 ```ts
 import { OmoikaneClient } from "omoikane/client";
@@ -47,33 +79,19 @@ const client = new OmoikaneClient({
   baseUrl: "http://127.0.0.1:8000",
 });
 
-const provider = await client.createProvider({
-  name: "MiMo",
-  provider: "xiaomi_mimo",
-  endpoint_profile: "token_plan_cn",
-  api_key_env: "MIMO_API_KEY",
-});
-
-const deployment = await client.deployDefinition(`---
-apiVersion: agentsdk/v1
-kind: Agent
-metadata:
-  slug: research-assistant
-  name: Research Assistant
-spec:
-  provider:
-    connection_id: ${provider.id}
-  model: mimo-v2.5
----
-You are a careful research assistant.`);
-
-const run = await client.createRun({
-  deployment_id: String(deployment.id),
-  external_session_id: "business-conversation-42",
-  conversation: previousModelItems,
-  input: "Continue the analysis.",
-  context: { business_object_id: "company-42" },
-});
+const run = await client.createRun(
+  {
+    deployment_id: configuredDeploymentId,
+    external_session_id: "business-conversation-42",
+    conversation: previousModelItems,
+    input: "Continue the analysis.",
+    context: { business_object_id: "company-42" },
+  },
+  {
+    // Stable across every retry of this business operation.
+    idempotencyKey: "message:business-conversation-42:8841",
+  },
+);
 
 for await (const event of client.streamRun(String(run.id))) {
   console.log(event.type, event.data);
@@ -87,17 +105,17 @@ saveToBusinessStore(completed.output, completed.new_items);
 
 ## Capability summary
 
-| Area       | Current capability                                                                                                     |
-| ---------- | ---------------------------------------------------------------------------------------------------------------------- |
-| Runtime    | durable queue, leases, retry/cancel, restart recovery, paged Run listing, ordered Events, bounded REST/SSE             |
-| Agents     | immutable `AGENT.md`/JSON Deployments, model settings, Handoffs                                                        |
-| Providers  | built-in catalog, model sync/capabilities, qualified complete-input Token counting, MiMo V2.5 ASR/TTS adapters         |
-| Tools      | Function Tools; Runtime-managed MCP Tools with OAuth, policy, snapshots, approvals, and reconciliation                 |
-| Skills     | immutable bundles, explicit version binding, checksum verification, instruction injection                              |
-| Context    | caller-supplied conversation; native/portable temporary Projection; no Session or memory store                         |
-| Output     | validated structured output; typed pluggable Input/Output Guardrails with safe output buffering                        |
-| Execution  | Function Tools and MCP Tools; paged, checksummed, quota-bounded temporary Run Artifacts; no supported built-in Sandbox |
-| Operations | PGlite snapshot/restore/safe upgrade, optional PostgreSQL, Usage, Runtime status, metadata-only SDK tracing            |
+| Area       | Current capability                                                                                                                 |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Runtime    | durable queue, leases, retry/cancel, restart recovery, paged Run listing, ordered Events, bounded REST/SSE                         |
+| Agents     | immutable `AGENT.md`/JSON Deployments, model settings, Handoffs                                                                    |
+| Providers  | built-in catalog, model sync/capabilities, qualified complete-input Token counting, MiMo V2.5 ASR/TTS adapters                     |
+| Tools      | Function Tools; Runtime-managed MCP Tools with OAuth, policy, snapshots, approvals, reconciliation, and model-free read invocation |
+| Skills     | immutable bundles, explicit version binding, checksum verification, instruction injection                                          |
+| Context    | caller-supplied conversation; native/portable temporary Projection; no Session or memory store                                     |
+| Output     | validated structured output; typed pluggable Input/Output Guardrails with safe output buffering                                    |
+| Execution  | Function Tools and MCP Tools; paged, checksummed, quota-bounded temporary Run Artifacts; no supported built-in Sandbox             |
+| Operations | PGlite snapshot/restore/safe upgrade, optional PostgreSQL, Usage, Runtime status, metadata-only SDK tracing                        |
 
 The MCP product contract covers Runtime-managed Tools, including generic OAuth discovery, public/confidential/URL-based OAuth clients, browser authorization, encrypted token refresh, disconnect for remote HTTP servers, and generic write-scope protection. Resources, Prompts, Elicitation, and Provider-hosted MCP remain outside the current boundary.
 

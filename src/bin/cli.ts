@@ -6,6 +6,7 @@ import YAML from "yaml";
 import { OmoikaneClient } from "../client/index.js";
 import { parseAgentMarkdown } from "../agent-definitions.js";
 import { OMOIKANE_VERSION } from "../runtime-versions.js";
+import { applyRuntimeDeployment } from "../deployment.js";
 import { configuredCredentialSecret, getSettings } from "../config.js";
 import {
   createPgliteBackup,
@@ -43,6 +44,9 @@ program
   .action(async (directory) => {
     const root = resolve(directory);
     await mkdir(resolve(root, "agents", "assistant"), { recursive: true });
+    await mkdir(resolve(root, "runtime"), { recursive: true });
+    await mkdir(resolve(root, "tools"), { recursive: true });
+    await mkdir(resolve(root, "mcp"), { recursive: true });
     await mkdir(resolve(root, "skills"), { recursive: true });
     await writeFile(
       resolve(root, "omoikane.yaml"),
@@ -50,21 +54,58 @@ program
         apiVersion: "omoikane.io/v1",
         kind: "RuntimeDeployment",
         project: "my-agent-project",
+        providers: {
+          primary: {
+            name: "Primary OpenAI",
+            provider: "openai",
+            api_key_env: "OPENAI_API_KEY",
+          },
+        },
         resources: {
-          agents: { assistant: "agents/assistant/AGENT.md" },
+          tools: {},
           skills: {},
           mcpServers: {},
-          schemas: {},
+          agents: {
+            assistant: {
+              path: "agents/assistant/AGENT.md",
+              provider: "primary",
+            },
+          },
         },
       }),
       { flag: "wx" },
     ).catch(() => {});
     await writeFile(
       resolve(root, "agents", "assistant", "AGENT.md"),
-      `---\napiVersion: agentsdk/v1\nkind: Agent\nmetadata:\n  slug: assistant\n  name: Assistant\nspec:\n  provider:\n    connection_id: replace-me\n  model: replace-me\n---\n\nYou are a helpful assistant.\n`,
+      `---\napiVersion: agentsdk/v1\nkind: Agent\nmetadata:\n  slug: assistant\n  name: Assistant\nspec:\n  model: gpt-5.4\n---\n\nYou are a helpful assistant.\n`,
+      { flag: "wx" },
+    ).catch(() => {});
+    await writeFile(
+      resolve(root, "runtime", "server.ts"),
+      `import {
+  registerGuardrailImplementation,
+  registerToolImplementation,
+  startRuntime,
+} from "omoikane/runtime";
+
+// Register business-owned Function Tool and Guardrail implementations here.
+// registerToolImplementation("business.lookup", async (args, context) => ({}));
+// registerGuardrailImplementation("business.policy", async (input, context) => ({ tripwire_triggered: false }));
+
+await startRuntime();
+`,
       { flag: "wx" },
     ).catch(() => {});
     process.stdout.write(`Initialized ${root}\n`);
+  });
+program
+  .command("apply")
+  .description("Declaratively apply Providers and Runtime resources")
+  .argument("[manifest]", "RuntimeDeployment manifest", "omoikane.yaml")
+  .option("--url <url>")
+  .action(async (manifest, options) => {
+    const result = await applyRuntimeDeployment(client(options), manifest);
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   });
 program
   .command("validate")
@@ -108,15 +149,22 @@ program
   .command("run")
   .requiredOption("--deployment <id>")
   .requiredOption("--input <text>")
+  .requiredOption(
+    "--idempotency-key <key>",
+    "stable business operation identifier",
+  )
   .option("--external-session <id>")
   .option("--url <url>")
   .action(async (options) => {
     const runtime = client(options);
-    const created = await runtime.createRun({
-      deployment_id: options.deployment,
-      input: options.input,
-      external_session_id: options.externalSession,
-    });
+    const created = await runtime.createRun(
+      {
+        deployment_id: options.deployment,
+        input: options.input,
+        external_session_id: options.externalSession,
+      },
+      { idempotencyKey: options.idempotencyKey },
+    );
     const runId = String(created.id);
     for await (const event of runtime.streamRun(runId))
       process.stdout.write(`${JSON.stringify(event)}\n`);

@@ -54,13 +54,16 @@ async function runAndStream(
   input: string,
   conversation: Record<string, unknown>[] = [],
 ): Promise<RunResult> {
-  const created = await client.createRun({
-    deployment_id: deploymentId,
-    input,
-    conversation,
-    external_session_id: "business-owned-live-session",
-    limits: { max_turns: 5, max_duration_seconds: 180 },
-  });
+  const created = await client.createRun(
+    {
+      deployment_id: deploymentId,
+      input,
+      conversation,
+      external_session_id: "business-owned-live-session",
+      limits: { max_turns: 5, max_duration_seconds: 180 },
+    },
+    { idempotencyKey: crypto.randomUUID() },
+  );
   const runId = recordId(created);
   const events: RuntimeEvent[] = [];
   for await (const event of client.streamRun(runId)) events.push(event);
@@ -359,12 +362,15 @@ For WORKSPACE_CHECK, call the declared entrypoint through sandbox_exec exactly o
   });
 
   it("executes a materialized Skill workspace after explicit approval", async () => {
-    const created = await client.createRun({
-      deployment_id: workspaceDeploymentId,
-      input: "WORKSPACE_CHECK",
-      external_session_id: "business-owned-live-session",
-      limits: { max_turns: 5, max_duration_seconds: 180 },
-    });
+    const created = await client.createRun(
+      {
+        deployment_id: workspaceDeploymentId,
+        input: "WORKSPACE_CHECK",
+        external_session_id: "business-owned-live-session",
+        limits: { max_turns: 5, max_duration_seconds: 180 },
+      },
+      { idempotencyKey: crypto.randomUUID() },
+    );
     const runId = recordId(created);
     const firstEvents: RuntimeEvent[] = [];
     for await (const event of client.streamRun(runId)) firstEvents.push(event);

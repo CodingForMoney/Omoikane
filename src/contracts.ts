@@ -235,7 +235,7 @@ export const ContextCompactSchema = z
 
 export const RunHeadersSchema = z
   .object({
-    "idempotency-key": z.string().trim().min(1).max(512).optional(),
+    "idempotency-key": z.string().trim().min(1).max(512),
   })
   .passthrough();
 export const StreamHeadersSchema = z
@@ -437,6 +437,16 @@ export const McpServerUpdateSchema = z.union([
 export const McpToolCallSchema = z
   .object({ arguments: JsonObjectSchema.optional() })
   .strict();
+export const McpToolInvocationSchema = z
+  .object({
+    arguments: JsonObjectSchema.optional(),
+    operation_id: identifier.optional(),
+    expected_fingerprint: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+  })
+  .strict();
 export const McpOAuthCallbackSchema = z
   .object({
     code: z.string().min(1).max(16_384).optional(),
@@ -601,6 +611,7 @@ export const SkillImportResponseSchema = z
   .object({
     skill: ResourceRecordSchema,
     version: ResourceRecordSchema,
+    reused: z.boolean().optional(),
   })
   .strict();
 export const ProviderDefinitionSchema = z
@@ -830,6 +841,20 @@ export const McpCallResponseSchema = z
     output_sha256: z.string(),
   })
   .strict();
+export const McpInvocationResponseSchema = z
+  .object({
+    invocation_id: z.string(),
+    operation_id: z.string().nullable(),
+    server_id: z.string(),
+    tool_name: z.string(),
+    fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    output: z.unknown(),
+    output_size: z.number().int().nonnegative(),
+    output_sha256: z.string(),
+    started_at: z.string().datetime(),
+    completed_at: z.string().datetime(),
+  })
+  .strict();
 export const ArtifactRecordSchema = z
   .object({
     id: z.string(),
@@ -936,6 +961,7 @@ export type McpOAuthClientMetadata = z.infer<
 export type McpHealth = z.infer<typeof McpHealthSchema>;
 export type McpToolsResponse = z.infer<typeof McpToolsResponseSchema>;
 export type McpCallResponse = z.infer<typeof McpCallResponseSchema>;
+export type McpInvocationResponse = z.infer<typeof McpInvocationResponseSchema>;
 export type ArtifactRecord = z.infer<typeof ArtifactRecordSchema>;
 export type CompactionResponse = z.infer<typeof CompactionResponseSchema>;
 export type RuntimeEvent<T = unknown> = Omit<
@@ -1365,6 +1391,14 @@ export const API_CONTRACTS = {
     params: mcpCallParams,
     body: McpToolCallSchema,
     response: McpCallResponseSchema,
+  },
+  invokeMcpTool: {
+    method: "post",
+    path: "/v1/mcp-servers/:serverId/tools/:toolName/invoke",
+    summary: "Invoke an allowed read-only MCP Tool without a model Run",
+    params: mcpCallParams,
+    body: McpToolInvocationSchema,
+    response: McpInvocationResponseSchema,
   },
   importSkill: {
     method: "post",

@@ -47,6 +47,29 @@ const client = new OmoikaneClient({ baseUrl: "http://127.0.0.1:8000" });
 await client.handshake();
 ```
 
+Use the npm entry point that matches the caller:
+
+| Entry point           | Supported caller and purpose                                                               |
+| --------------------- | ------------------------------------------------------------------------------------------ |
+| `omoikane/client`     | business application; REST/SSE calls, typed errors, cancellation, timeout, and request IDs |
+| `omoikane/runtime`    | local Runtime wrapper; register in-process Tool, Guardrail, and Trace implementations      |
+| `omoikane/deployment` | deployment tooling; load/apply the same manifest used by the CLI                           |
+| `omoikane/contracts`  | adapters that need the shared REST schemas and TypeScript contract types                   |
+
+The package-root export is a pre-1.0 compatibility umbrella. New business application code should depend only on `omoikane/client`; it must not instantiate `Container`, database, worker, or resource-service classes.
+
+Every normal client operation can inherit cancellation, timeout, and correlation metadata from a scoped client:
+
+```ts
+const requestClient = client.withOptions({
+  signal: requestAbortSignal,
+  timeoutMs: 30_000,
+  requestId: businessRequestId,
+});
+```
+
+Per-call options override these defaults. A stream timeout bounds the entire stream operation, including reconnects.
+
 ### API contract and validation
 
 `GET /openapi.json` returns the complete OpenAPI 3.1 document. REST validators, OpenAPI request schemas, and endpoint-specific types exported by `omoikane/client` and `omoikane/contracts` use the same Zod schema source.
@@ -79,6 +102,42 @@ Strict envelopes do not make Omoikane the owner of business schemas. Run `contex
 Top-level Runtime lists use bounded keyset pagination. Provider Connections, Provider models, Deployments, Runs, Function Tools, MCP servers, Skills, Skill versions, Approvals, and Run Artifacts accept `limit` plus an opaque `cursor` and return `{ data, next_cursor }`. Resource lists also accept `status`; Runs additionally accept `deployment_id`, `external_session_id`, and `parent_run_id`; Artifacts require `run_id` and optionally accept a lifecycle `status`. Preserve the same filters while following a cursor: cursors are scoped to the endpoint and filter set, and an incompatible or malformed cursor returns HTTP 422. Run Events keep their natural per-Run `after` sequence cursor.
 
 ## 2. Configure a Provider first
+
+For a maintained integration, prefer the declarative project workflow. `npx omoikane init ./agent-runtime` creates `omoikane.yaml`, an `AGENT.md`, and `runtime/server.ts`. A typical manifest is:
+
+```yaml
+apiVersion: omoikane.io/v1
+kind: RuntimeDeployment
+project: investment-service
+providers:
+  primary:
+    name: MiMo Token Plan
+    provider: xiaomi_mimo
+    endpoint_profile: token_plan_cn
+    api_key_env: MIMO_API_KEY
+resources:
+  tools:
+    company_lookup: tools/company-lookup.yaml
+  mcpServers:
+    market_data: mcp/market-data.yaml
+  skills:
+    analyst: skills/analyst
+  agents:
+    analyst:
+      path: agents/analyst/AGENT.md
+      provider: primary
+      tools: [company_lookup]
+      mcpServers: [market_data]
+      skills: [analyst]
+      overrides: {}
+      compilation_settings: {}
+```
+
+Run `npx omoikane apply ./omoikane.yaml --url http://127.0.0.1:8000`. Paths are resolved relative to the manifest. Provider aliases are replaced with connection IDs, Tool aliases with immutable Tool IDs, Skill aliases with immutable version IDs, and MCP aliases with server IDs before the Agent is compiled. New Providers synchronize models automatically. Provider and Function Tool definitions are reused only when their execution-relevant configuration matches; conflicting immutable definitions fail closed. Identical Skill content and Agent `config_hash` values are reused, so rerunning `apply` does not create version churn. MCP resources use update semantics because their endpoints, OAuth, and policy are mutable Runtime configuration.
+
+The manifest accepts only `api_key_env`, never `api_key`. The named secret must be available to the Runtime process. Commit the manifest and resource definitions; do not commit `.env`, Provider keys, OAuth secrets, Runtime data, or generated credential files. The command prints a machine-readable resource map. Persist or promote the returned Agent Deployment ID in the business system; `project` and aliases organize deployment input but do not create a second Omoikane control plane.
+
+The direct REST/client calls below remain supported for interactive setup and specialized deployment automation.
 
 List built-in Provider definitions, then create a connection:
 
@@ -194,7 +253,7 @@ curl -X POST http://127.0.0.1:8000/v1/mcp-servers/remote-tools/oauth/start \
 curl http://127.0.0.1:8000/v1/mcp-servers/remote-tools/oauth/status
 ```
 
-The start response contains `authorization_url`. OAuth state and PKCE verifier expire after 15 minutes. The Runtime refreshes credentials after a protected server returns `401`; it never returns access tokens, refresh tokens, registered client secrets, pre-registered secrets, or PKCE material through resource/status APIs. `DELETE /v1/mcp-servers/:id/oauth` removes the local authorization. Provider-side revocation remains a separate account action.
+The start response contains `authorization_url`. OAuth state and PKCE verifier expire after 15 minutes. A browser `GET` callback that accepts `text/html` receives a small completion page, removes the authorization query from browser history, and attempts to close itself; callers that request JSON and the `POST` callback retain the structured API response. The embedding product should poll `/oauth/status` and continue its own connection workflow instead of parsing callback-page content. The Runtime refreshes credentials after a protected server returns `401`; it never returns access tokens, refresh tokens, registered client secrets, pre-registered secrets, or PKCE material through resource/status APIs. `DELETE /v1/mcp-servers/:id/oauth` removes the local authorization. Provider-side revocation remains a separate account action.
 
 `auth.write_scopes` marks provider-specific write authorities such as `order:write`, `trade:write`, and `trading.write`. Requesting one of those scopes requires `policy.approval.mode: always`. Automatic scope mode can request every scope advertised by a server, so it also requires approval for every Tool call.
 
@@ -220,7 +279,10 @@ The REST inspection surface is:
 - `POST /v1/mcp-servers/:id/oauth/start`, `GET /oauth/status`, browser/JSON `GET/POST /oauth/callback`, `GET /oauth/client-metadata`, and `DELETE /oauth`;
 - `POST /v1/mcp-servers/:id/health` for discovered/effective/blocked Tools and the current fingerprint;
 - `GET /v1/mcp-servers/:id/tools` for effective schemas;
+- `POST /v1/mcp-servers/:id/tools/:tool/invoke` for production, model-free invocation of an allowed read-only Tool. The caller may bind the call to an `operation_id` and the last inspected `expected_fingerprint`; schema or policy drift returns HTTP 409 before dispatch. The response includes an invocation ID, the effective fingerprint, output size, SHA-256, and timestamps. The business system owns scheduling, source-account mapping, idempotency, raw-output retention, normalization, and business audit;
 - `POST /v1/mcp-servers/:id/tools/:tool/call` for non-side-effecting, non-approval test calls only.
+
+The production invocation endpoint deliberately rejects approval-required and side-effecting Tools. It creates no model Run and cannot be used to bypass the Run approval/reconciliation contract for writes. It is intended for deterministic connector work such as a business system periodically reading an authenticated external account after it has frozen an exact read-only Tool set.
 
 ### MCP capability boundary
 
@@ -335,20 +397,31 @@ model_settings:
 Every Run is self-contained. Supply the canonical prior model items and any business-authorized context explicitly:
 
 ```ts
-const run = await client.createRun({
-  deployment_id: deploymentId,
-  external_session_id: businessConversationId,
-  conversation: priorModelItems,
-  input: "Prepare the next answer.",
-  context: { business_object_id: "company-42", authorized_facts: facts },
-  limits: {
-    max_turns: 20,
-    max_tool_calls: 50,
-    max_duration_seconds: 900,
+const run = await client.createRun(
+  {
+    deployment_id: deploymentId,
+    external_session_id: businessConversationId,
+    conversation: priorModelItems,
+    input: "Prepare the next answer.",
+    context: { business_object_id: "company-42", authorized_facts: facts },
+    limits: {
+      max_turns: 20,
+      max_tool_calls: 50,
+      max_duration_seconds: 900,
+    },
   },
-});
+  {
+    idempotencyKey: `message:${businessConversationId}:${messageId}`,
+    signal: requestAbortSignal,
+    timeoutMs: 15 * 60_000,
+    requestId: businessRequestId,
+  },
+);
 
-for await (const event of client.streamRun(String(run.id))) {
+for await (const event of client.streamRun(String(run.id), {
+  signal: requestAbortSignal,
+  after: lastPersistedEventSequence,
+})) {
   render(event);
 }
 
@@ -373,7 +446,7 @@ do {
 
 `RunSummary` deliberately excludes input, conversation, context, output, new model items, Tool values, SDK checkpoints, and detailed errors. Fetch one Run explicitly when its governed execution result is required.
 
-The client supplies an `Idempotency-Key`. Repeating the same key with the same effective request returns the original Run; changing the request returns a conflict. `external_session_id` is correlation metadata and never causes Omoikane to load previous messages.
+The caller must supply an `Idempotency-Key`; neither the npm client nor REST API invents one. Derive it from the stable business operation, message, or job ID and reuse it after timeout, process restart, or network uncertainty. Repeating the same key with the same effective request returns the original Run; changing the request returns a conflict. A random key generated independently on every retry defeats this guarantee. `external_session_id` is correlation metadata and never causes Omoikane to load previous messages.
 
 SSE Event sequence numbers are ordered per Run and replayable through `Last-Event-ID` while Event retention remains active. A transaction wakes local SSE waiters only after its Event commit; a low-frequency database poll remains as a correctness fallback. The TypeScript client reconnects a truncated or retryable HTTP stream from the last sequence number, rejects a sequence gap, deduplicates replayed Events by `seq`, and uses jittered exponential retry bounded at five seconds. The server applies stream backpressure, caps total and per-Run connections, returns retryable HTTP 429 with `Retry-After` at capacity, and sends an internal `stream.end` control frame when the current Run state closes the stream. Always fetch the Run for its terminal result and copy accepted results to the business store before TTL cleanup.
 
@@ -464,7 +537,7 @@ Register a business-owned TypeScript implementation before deploying an Agent
 that references it:
 
 ```ts
-import { registerGuardrailImplementation } from "omoikane";
+import { registerGuardrailImplementation } from "omoikane/runtime";
 
 registerGuardrailImplementation(
   "business.account-policy",
@@ -488,10 +561,12 @@ registerGuardrailImplementation(
 ```
 
 Registration must happen inside the Runtime process. The stock
-`omoikane-runtime` executable contains only `builtin.regex`; a project that uses
-custom implementations starts a small wrapper which registers its handlers,
-then creates `Container` and serves `createApp(container)`. This is the same
-process-level extension model used by custom Function Tool implementations.
+`omoikane-runtime` executable contains only built-ins; a project that uses
+custom implementations starts the generated `runtime/server.ts` wrapper,
+registers handlers, then calls `startRuntime()` from `omoikane/runtime`. This is
+the same process-level extension model used by custom Function Tool and Trace
+implementations. The wrapper should be built and supervised like any other
+local Node.js service.
 
 The decision contract is deliberately only `allow` or `block`; Guardrails do
 not rewrite model input or output. A block produces stable terminal codes
@@ -611,7 +686,7 @@ export OMOIKANE_TRACING_EXPORTER=openai
 export OMOIKANE_TRACING_API_KEY_ENV=OPENAI_TRACING_API_KEY
 ```
 
-This key is separate from Provider Connections. Selecting MiMo, Codex Bridge, Anthropic, or another model Provider never causes traces to be sent to OpenAI. A custom in-process integration registers a `TracingExporter` with `registerTraceExporter("name", factory)` before `Container.create()`, then selects `OMOIKANE_TRACING_EXPORTER=custom:name`. The stock executable cannot load project-specific custom code; use the same small Runtime wrapper pattern as custom Function Tools and Guardrails.
+This key is separate from Provider Connections. Selecting MiMo, Codex Bridge, Anthropic, or another model Provider never causes traces to be sent to OpenAI. A custom in-process integration imports `registerTraceExporter` and `startRuntime` from `omoikane/runtime`, registers `registerTraceExporter("name", factory)` before `startRuntime()`, then selects `OMOIKANE_TRACING_EXPORTER=custom:name`. The stock executable cannot load project-specific custom code; use the same small Runtime wrapper pattern as custom Function Tools and Guardrails.
 
 Trace content is always `metadata_only`; there is no full-content switch. Omoikane sets both the SDK global sensitive-data logger and each Runner to exclude model input/output, Tool arguments/results, rejected Guardrail output, and credentials. Trace metadata contains `run_id`, stable `run_trace_id`, `execution_attempt`, `deployment_id`, `provider`, and `model`. It never automatically includes `external_session_id`. Each attempt's SDK Trace ID is stored in the corresponding `run.started` Event.
 

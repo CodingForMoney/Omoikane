@@ -137,14 +137,17 @@ Use only the supplied session context. When asked for the early, middle and late
       JSON.stringify(items).length * 0.2,
     );
 
-    const created = await client.createRun({
-      deployment_id: deploymentId,
-      external_session_id: "business-owned-100k-session",
-      projection,
-      input:
-        "Return the exact early, middle and late validation markers as JSON.",
-      limits: { max_turns: 3, max_duration_seconds: 300 },
-    });
+    const created = await client.createRun(
+      {
+        deployment_id: deploymentId,
+        external_session_id: "business-owned-100k-session",
+        projection,
+        input:
+          "Return the exact early, middle and late validation markers as JSON.",
+        limits: { max_turns: 3, max_duration_seconds: 300 },
+      },
+      { idempotencyKey: "mimo-compaction-100k-projection" },
+    );
     const events: RuntimeEvent[] = [];
     for await (const event of client.streamRun(id(created))) events.push(event);
     const run = await client.getRun(id(created));

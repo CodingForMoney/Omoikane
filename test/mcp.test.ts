@@ -468,6 +468,34 @@ describe("Runtime-managed MCP", () => {
       });
       expect(called.statusCode).toBe(200);
       expect(JSON.stringify(called.json().output)).toContain("MCP_ECHO_OK:api");
+      const invoked = await app.inject({
+        method: "POST",
+        url: `/v1/mcp-servers/${id}/tools/mcp_echo/invoke`,
+        payload: {
+          operation_id: "broker-sync-1",
+          expected_fingerprint: tools.json().fingerprint,
+          arguments: { value: "scheduled" },
+        },
+      });
+      expect(invoked.statusCode).toBe(200);
+      expect(invoked.json()).toMatchObject({
+        operation_id: "broker-sync-1",
+        server_id: id,
+        tool_name: "mcp_echo",
+        fingerprint: tools.json().fingerprint,
+      });
+      expect(JSON.stringify(invoked.json().output)).toContain(
+        "MCP_ECHO_OK:scheduled",
+      );
+      const changed = await app.inject({
+        method: "POST",
+        url: `/v1/mcp-servers/${id}/tools/mcp_echo/invoke`,
+        payload: {
+          expected_fingerprint: "0".repeat(64),
+          arguments: {},
+        },
+      });
+      expect(changed.statusCode).toBe(409);
       expect(
         (await app.inject({ method: "DELETE", url: `/v1/mcp-servers/${id}` }))
           .statusCode,

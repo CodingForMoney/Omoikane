@@ -1,5 +1,6 @@
 import type {
   ApprovalRecord,
+  AgentDefinitionValidate,
   ArtifactRecord,
   AudioTranscriptionCreate,
   AudioTranscriptionResponse,
@@ -15,6 +16,7 @@ import type {
   JsonObject,
   McpCallResponse,
   McpHealth,
+  McpInvocationResponse,
   McpOAuthClientMetadata,
   McpOAuthCallbackInput,
   McpOAuthStatus,
@@ -41,12 +43,14 @@ import type {
   SkillBundle,
   SkillImport,
   SkillImportResponse,
+  ToolCreate,
   VersionResponse,
 } from "../contracts.js";
 import type { ProviderDefinition } from "../providers.js";
 
 export type {
   ApprovalRecord,
+  AgentDefinitionValidate,
   ArtifactRecord,
   AudioTranscriptionCreate,
   AudioTranscriptionResponse,
@@ -62,6 +66,7 @@ export type {
   JsonObject,
   McpCallResponse,
   McpHealth,
+  McpInvocationResponse,
   McpOAuthClientMetadata,
   McpOAuthCallbackInput,
   McpOAuthStatus,
@@ -88,6 +93,7 @@ export type {
   SkillBundle,
   SkillImport,
   SkillImportResponse,
+  ToolCreate,
   VersionResponse,
 } from "../contracts.js";
 
@@ -114,9 +120,29 @@ export interface UsageRecord {
 export type McpTransport = "stdio" | "streamable_http" | "sse";
 export type McpApprovalMode = "never" | "selected" | "always";
 
-export interface ClientOptions {
+export interface ClientRequestOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  requestId?: string;
+}
+
+export interface ClientOptions extends ClientRequestOptions {
   baseUrl: string;
   fetch?: typeof globalThis.fetch;
+}
+
+export interface CreateRunOptions extends ClientRequestOptions {
+  idempotencyKey: string;
+}
+
+export interface StreamRunOptions extends ClientRequestOptions {
+  after?: number;
+}
+
+export interface AgentDefinitionCompilation {
+  config: JsonObject;
+  config_hash: string;
+  document: JsonObject;
 }
 
 export interface ListPageOptions {
@@ -176,12 +202,26 @@ export class OmoikaneClient {
   private readonly baseUrl: string;
   private readonly headers: Record<string, string>;
   private readonly fetcher: typeof globalThis.fetch;
+  private readonly defaultRequestOptions: ClientRequestOptions;
   constructor(options: ClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
     this.headers = {
       Accept: "application/json",
     };
     this.fetcher = options.fetch ?? globalThis.fetch.bind(globalThis);
+    this.defaultRequestOptions = {
+      signal: options.signal,
+      timeoutMs: options.timeoutMs,
+      requestId: options.requestId,
+    };
+  }
+  withOptions(options: ClientRequestOptions): OmoikaneClient {
+    return new OmoikaneClient({
+      baseUrl: this.baseUrl,
+      fetch: this.fetcher,
+      ...this.defaultRequestOptions,
+      ...options,
+    });
   }
   private async checked<T>(response: Response): Promise<T> {
     if (!response.ok) {
@@ -203,15 +243,65 @@ export class OmoikaneClient {
     if (response.status === 204) return {} as T;
     return response.json() as Promise<T>;
   }
-  async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  async request<T>(
+    path: string,
+    init: RequestInit = {},
+    options: ClientRequestOptions = {},
+  ): Promise<T> {
+    const effective = { ...this.defaultRequestOptions, ...options };
+    if (
+      effective.timeoutMs !== undefined &&
+      (!Number.isFinite(effective.timeoutMs) || effective.timeoutMs <= 0)
+    )
+      throw new OmoikaneError(
+        "timeoutMs must be a positive number",
+        "invalid_client_options",
+      );
     const headers = new Headers(this.headers);
-    headers.set("X-Request-ID", crypto.randomUUID());
+    headers.set("X-Request-ID", effective.requestId ?? crypto.randomUUID());
     new Headers(init.headers).forEach((value, key) => headers.set(key, value));
     if (init.body && !(init.body instanceof FormData))
       headers.set("Content-Type", "application/json");
-    return this.checked<T>(
-      await this.fetcher(`${this.baseUrl}${path}`, { ...init, headers }),
+    const timeoutController = new AbortController();
+    const signals = [init.signal, effective.signal].filter(
+      (signal): signal is AbortSignal => Boolean(signal),
     );
+    if (effective.timeoutMs !== undefined)
+      signals.push(timeoutController.signal);
+    const signal =
+      signals.length === 0
+        ? undefined
+        : signals.length === 1
+          ? signals[0]
+          : AbortSignal.any(signals);
+    let timedOut = false;
+    const timeout =
+      effective.timeoutMs === undefined
+        ? undefined
+        : setTimeout(() => {
+            timedOut = true;
+            timeoutController.abort();
+          }, effective.timeoutMs);
+    try {
+      return await this.checked<T>(
+        await this.fetcher(`${this.baseUrl}${path}`, {
+          ...init,
+          headers,
+          signal,
+        }),
+      );
+    } catch (error) {
+      if (timedOut)
+        throw new OmoikaneError(
+          `Omoikane request timed out after ${effective.timeoutMs}ms`,
+          "client_timeout",
+          408,
+          headers.get("X-Request-ID") ?? undefined,
+        );
+      throw error;
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
   }
   async handshake() {
     const version = await this.request<VersionResponse>("/version");
@@ -311,6 +401,12 @@ export class OmoikaneClient {
       body: JSON.stringify(input),
     });
   }
+  validateAgentDefinition(input: AgentDefinitionValidate) {
+    return this.request<AgentDefinitionCompilation>(
+      "/v1/agent-definitions/validate",
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
   createMcpServer(input: McpServerInput) {
     return this.request<McpServerRecord>("/v1/mcp-servers", {
       method: "POST",
@@ -388,6 +484,33 @@ export class OmoikaneClient {
       { method: "POST", body: JSON.stringify({ arguments: argumentsValue }) },
     );
   }
+  invokeMcpTool(
+    serverId: string,
+    toolName: string,
+    input: {
+      arguments?: Record<string, unknown>;
+      operationId?: string;
+      expectedFingerprint?: string;
+    } = {},
+  ) {
+    return this.request<McpInvocationResponse>(
+      `/v1/mcp-servers/${encodeURIComponent(serverId)}/tools/${encodeURIComponent(toolName)}/invoke`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          ...(input.arguments === undefined
+            ? {}
+            : { arguments: input.arguments }),
+          ...(input.operationId === undefined
+            ? {}
+            : { operation_id: input.operationId }),
+          ...(input.expectedFingerprint === undefined
+            ? {}
+            : { expected_fingerprint: input.expectedFingerprint }),
+        }),
+      },
+    );
+  }
   deployDefinition(
     document: string,
     options: {
@@ -432,12 +555,28 @@ export class OmoikaneClient {
       `/v1/tools${query(options)}`,
     );
   }
-  createRun(input: RunCreate, idempotencyKey = crypto.randomUUID()) {
-    return this.request<RunRecord>("/v1/runs", {
+  createTool(input: ToolCreate) {
+    return this.request<ResourceRecord>("/v1/tools", {
       method: "POST",
-      headers: { "Idempotency-Key": idempotencyKey },
-      body: JSON.stringify({ context: {}, limits: {}, ...input }),
+      body: JSON.stringify(input),
     });
+  }
+  createRun(input: RunCreate, options: CreateRunOptions) {
+    const idempotencyKey = options?.idempotencyKey?.trim();
+    if (!idempotencyKey || idempotencyKey.length > 512)
+      throw new OmoikaneError(
+        "createRun requires an idempotencyKey between 1 and 512 characters",
+        "invalid_client_options",
+      );
+    return this.request<RunRecord>(
+      "/v1/runs",
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+        body: JSON.stringify({ context: {}, limits: {}, ...input }),
+      },
+      options,
+    );
   }
   listRuns(options: RunListOptions = {}) {
     return this.request<PageResponse<RunSummary>>(
@@ -495,9 +634,40 @@ export class OmoikaneClient {
   }
   async *streamRun(
     runId: string,
-    after = 0,
-    signal?: AbortSignal,
+    options: StreamRunOptions | number = {},
+    legacySignal?: AbortSignal,
   ): AsyncGenerator<RuntimeEvent> {
+    const normalizedOptions: StreamRunOptions =
+      typeof options === "number"
+        ? { after: options, signal: legacySignal }
+        : options;
+    const effective = {
+      ...this.defaultRequestOptions,
+      ...normalizedOptions,
+    };
+    if (
+      effective.timeoutMs !== undefined &&
+      (!Number.isFinite(effective.timeoutMs) || effective.timeoutMs <= 0)
+    )
+      throw new OmoikaneError(
+        "timeoutMs must be a positive number",
+        "invalid_client_options",
+      );
+    const timeoutController = new AbortController();
+    let timedOut = false;
+    const timeout =
+      effective.timeoutMs === undefined
+        ? undefined
+        : setTimeout(() => {
+            timedOut = true;
+            timeoutController.abort();
+          }, effective.timeoutMs);
+    const signal = effective.timeoutMs
+      ? effective.signal
+        ? AbortSignal.any([effective.signal, timeoutController.signal])
+        : timeoutController.signal
+      : effective.signal;
+    const after = normalizedOptions.after ?? 0;
     let cursor = after;
     let retryAttempt = 0;
     const closesStream = new Set([
@@ -507,82 +677,93 @@ export class OmoikaneClient {
       "approval.required",
       "tool.reconciliation_required",
     ]);
-    while (!signal?.aborted) {
-      let terminalEventObserved = false;
-      try {
-        const response = await this.fetcher(
-          `${this.baseUrl}/v1/runs/${encodeURIComponent(runId)}/stream`,
-          {
-            headers: {
-              ...this.headers,
-              "X-Request-ID": crypto.randomUUID(),
-              "Last-Event-ID": String(cursor),
+    try {
+      while (!signal?.aborted) {
+        let terminalEventObserved = false;
+        try {
+          const response = await this.fetcher(
+            `${this.baseUrl}/v1/runs/${encodeURIComponent(runId)}/stream`,
+            {
+              headers: {
+                ...this.headers,
+                "X-Request-ID": effective.requestId ?? crypto.randomUUID(),
+                "Last-Event-ID": String(cursor),
+              },
+              signal,
             },
-            signal,
-          },
-        );
-        if (!response.ok) await this.checked(response);
-        retryAttempt = 0;
-        if (!response.body)
-          throw new OmoikaneError("SSE response has no body", "invalid_sse");
-        const reader = response.body
-          .pipeThrough(new TextDecoderStream())
-          .getReader();
-        let buffer = "";
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += value.replace(/\r\n/g, "\n");
-          let boundary: number;
-          while ((boundary = buffer.indexOf("\n\n")) >= 0) {
-            const block = buffer.slice(0, boundary);
-            buffer = buffer.slice(boundary + 2);
-            const eventName = block
-              .split("\n")
-              .find((line) => line.startsWith("event:"))
-              ?.slice(6)
-              .trim();
-            const data = block
-              .split("\n")
-              .filter((line) => line.startsWith("data:"))
-              .map((line) => line.slice(5).trimStart())
-              .join("\n");
-            if (!data) continue;
-            if (eventName === "stream.end") {
-              terminalEventObserved = true;
-              continue;
+          );
+          if (!response.ok) await this.checked(response);
+          retryAttempt = 0;
+          if (!response.body)
+            throw new OmoikaneError("SSE response has no body", "invalid_sse");
+          const reader = response.body
+            .pipeThrough(new TextDecoderStream())
+            .getReader();
+          let buffer = "";
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += value.replace(/\r\n/g, "\n");
+            let boundary: number;
+            while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+              const block = buffer.slice(0, boundary);
+              buffer = buffer.slice(boundary + 2);
+              const eventName = block
+                .split("\n")
+                .find((line) => line.startsWith("event:"))
+                ?.slice(6)
+                .trim();
+              const data = block
+                .split("\n")
+                .filter((line) => line.startsWith("data:"))
+                .map((line) => line.slice(5).trimStart())
+                .join("\n");
+              if (!data) continue;
+              if (eventName === "stream.end") {
+                terminalEventObserved = true;
+                continue;
+              }
+              const event = JSON.parse(data) as RuntimeEvent;
+              if (event.seq <= cursor) continue;
+              if (event.seq !== cursor + 1)
+                throw new OmoikaneError(
+                  `SSE event sequence gap: expected ${cursor + 1}, received ${event.seq}`,
+                  "sse_sequence_gap",
+                );
+              cursor = event.seq;
+              retryAttempt = 0;
+              terminalEventObserved ||= closesStream.has(event.type);
+              yield event;
             }
-            const event = JSON.parse(data) as RuntimeEvent;
-            if (event.seq <= cursor) continue;
-            if (event.seq !== cursor + 1)
-              throw new OmoikaneError(
-                `SSE event sequence gap: expected ${cursor + 1}, received ${event.seq}`,
-                "sse_sequence_gap",
-              );
-            cursor = event.seq;
-            retryAttempt = 0;
-            terminalEventObserved ||= closesStream.has(event.type);
-            yield event;
           }
+          if (terminalEventObserved) return;
+        } catch (error) {
+          if (timedOut)
+            throw new OmoikaneError(
+              `Omoikane stream timed out after ${effective.timeoutMs}ms`,
+              "client_timeout",
+              408,
+              effective.requestId,
+            );
+          if (signal?.aborted) return;
+          if (error instanceof OmoikaneError && !error.retryable) throw error;
         }
-        if (terminalEventObserved) return;
-      } catch (error) {
-        if (signal?.aborted) return;
-        if (error instanceof OmoikaneError && !error.retryable) throw error;
+        if (!signal?.aborted) {
+          const delay = sseRetryDelay(retryAttempt);
+          retryAttempt += 1;
+          await new Promise<void>((resolve) => {
+            const finish = () => {
+              clearTimeout(timeout);
+              signal?.removeEventListener("abort", finish);
+              resolve();
+            };
+            const timeout = setTimeout(finish, delay);
+            signal?.addEventListener("abort", finish, { once: true });
+          });
+        }
       }
-      if (!signal?.aborted) {
-        const delay = sseRetryDelay(retryAttempt);
-        retryAttempt += 1;
-        await new Promise<void>((resolve) => {
-          const finish = () => {
-            clearTimeout(timeout);
-            signal?.removeEventListener("abort", finish);
-            resolve();
-          };
-          const timeout = setTimeout(finish, delay);
-          signal?.addEventListener("abort", finish, { once: true });
-        });
-      }
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
     }
   }
   async uploadArtifact(file: Blob, filename: string, runId: string) {
@@ -608,13 +789,54 @@ export class OmoikaneClient {
       `/v1/artifacts/${encodeURIComponent(artifactId)}`,
     );
   }
-  async downloadArtifact(artifactId: string) {
-    const response = await this.fetcher(
-      `${this.baseUrl}/v1/artifacts/${encodeURIComponent(artifactId)}/download`,
-      { headers: this.headers },
-    );
-    if (!response.ok) await this.checked(response);
-    return response.blob();
+  async downloadArtifact(
+    artifactId: string,
+    options: ClientRequestOptions = {},
+  ) {
+    const effective = { ...this.defaultRequestOptions, ...options };
+    if (
+      effective.timeoutMs !== undefined &&
+      (!Number.isFinite(effective.timeoutMs) || effective.timeoutMs <= 0)
+    )
+      throw new OmoikaneError(
+        "timeoutMs must be a positive number",
+        "invalid_client_options",
+      );
+    const headers = new Headers(this.headers);
+    headers.set("X-Request-ID", effective.requestId ?? crypto.randomUUID());
+    const timeoutController = new AbortController();
+    const signal = effective.timeoutMs
+      ? effective.signal
+        ? AbortSignal.any([effective.signal, timeoutController.signal])
+        : timeoutController.signal
+      : effective.signal;
+    let timedOut = false;
+    const timeout =
+      effective.timeoutMs === undefined
+        ? undefined
+        : setTimeout(() => {
+            timedOut = true;
+            timeoutController.abort();
+          }, effective.timeoutMs);
+    try {
+      const response = await this.fetcher(
+        `${this.baseUrl}/v1/artifacts/${encodeURIComponent(artifactId)}/download`,
+        { headers, signal },
+      );
+      if (!response.ok) await this.checked(response);
+      return await response.blob();
+    } catch (error) {
+      if (timedOut)
+        throw new OmoikaneError(
+          `Omoikane request timed out after ${effective.timeoutMs}ms`,
+          "client_timeout",
+          408,
+          headers.get("X-Request-ID") ?? undefined,
+        );
+      throw error;
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
   }
   deleteArtifact(artifactId: string) {
     return this.request<void>(

@@ -37,6 +37,10 @@ class SseCapacityError extends Error {
   }
 }
 
+function mcpOAuthCompletionHtml(): string {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorization complete</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f5f1;color:#171914;font-family:ui-sans-serif,system-ui,-apple-system,sans-serif}.card{width:min(420px,calc(100vw - 48px));padding:36px;border:1px solid #d9dbd4;border-radius:18px;background:#fff;box-shadow:0 18px 60px rgba(20,24,18,.08);text-align:center}.mark{display:grid;place-items:center;width:48px;height:48px;margin:0 auto 18px;border-radius:50%;background:#e4f3e8;color:#1f6b39;font-size:26px;font-weight:700}h1{margin:0 0 10px;font-size:24px}p{margin:0;color:#62675e;line-height:1.6}</style></head><body><main class="card"><div class="mark">✓</div><h1>Authorization complete</h1><p>You can close this page and return to the application. This window will close automatically when the browser allows it.</p></main><script>history.replaceState(null,"",location.pathname);setTimeout(()=>window.close(),900);</script></body></html>`;
+}
+
 async function writeSseChunk(
   response: NodeJS.WritableStream & { destroyed?: boolean },
   chunk: string,
@@ -827,7 +831,17 @@ export async function createApp(
       const callback = requestQuery(request, "completeMcpOAuthRedirect");
       reply.header("Cache-Control", "no-store");
       reply.header("Referrer-Policy", "no-referrer");
-      return container.mcp.completeOAuth(serverId, callback);
+      const status = await container.mcp.completeOAuth(serverId, callback);
+      if (request.headers.accept?.includes("text/html")) {
+        reply.header(
+          "Content-Security-Policy",
+          "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        );
+        return reply
+          .type("text/html; charset=utf-8")
+          .send(mcpOAuthCompletionHtml());
+      }
+      return status;
     },
   );
   app.delete("/v1/mcp-servers/:serverId/oauth", async (request, reply) => {
@@ -850,6 +864,14 @@ export async function createApp(
       const { serverId, toolName } = requestParams(request, "callMcpTool");
       const data = requestBody(request, "callMcpTool");
       return container.mcp.testCall(serverId, toolName, data.arguments ?? {});
+    },
+  );
+  app.post(
+    "/v1/mcp-servers/:serverId/tools/:toolName/invoke",
+    async (request) => {
+      const { serverId, toolName } = requestParams(request, "invokeMcpTool");
+      const data = requestBody(request, "invokeMcpTool");
+      return container.mcp.invokeReadOnly(serverId, toolName, data);
     },
   );
   app.post("/v1/skills/import", async (request, reply) =>

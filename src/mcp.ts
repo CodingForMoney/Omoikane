@@ -487,9 +487,12 @@ function normalizeInput(
   }
   const policy = normalizePolicy(spec.policy, "MCP policy", current?.policy);
   if (auth.type === "oauth" && policy.approval.mode !== "always") {
-    if ((auth.scope_mode ?? "explicit") === "auto")
+    const frozenReadOnlyTools =
+      Boolean(policy.allowed_tools?.length) &&
+      policy.side_effecting_tools.length === 0;
+    if ((auth.scope_mode ?? "explicit") === "auto" && !frozenReadOnlyTools)
       throw new ValidationError(
-        "automatic MCP OAuth scopes require policy.approval.mode=always",
+        "automatic MCP OAuth scopes require policy.approval.mode=always until a non-empty read-only allowed_tools list is frozen",
       );
     const requestedWriteScopes = auth.scopes.filter((scope) =>
       (auth.write_scopes ?? ["mcp.write"]).includes(scope),
@@ -1267,6 +1270,26 @@ export class McpService {
   }
 
   async testCall(id: string, toolName: string, args: Record<string, unknown>) {
+    const invoked = await this.invokeReadOnly(id, toolName, {
+      arguments: args,
+    });
+    return {
+      output: invoked.output,
+      output_size: invoked.output_size,
+      output_sha256: invoked.output_sha256,
+    };
+  }
+
+  async invokeReadOnly(
+    id: string,
+    toolName: string,
+    input: {
+      arguments?: Record<string, unknown>;
+      operation_id?: string;
+      expected_fingerprint?: string;
+    },
+  ) {
+    const startedAt = new Date().toISOString();
     const record = await this.get(id);
     const policy = normalizePolicy(record.policy);
     if (
@@ -1287,6 +1310,12 @@ export class McpService {
         await timed(() => built.server.listTools(), policy.connect_timeout_ms),
         policy,
       );
+      const fingerprint = hashJson({ tools: listed.effective, policy });
+      if (
+        input.expected_fingerprint !== undefined &&
+        input.expected_fingerprint !== fingerprint
+      )
+        throw new ConflictError("MCP Tool fingerprint changed");
       const definition = listed.effective.find(
         (tool) => tool.name === toolName,
       );
@@ -1295,7 +1324,10 @@ export class McpService {
           `MCP tool not found or not allowed: ${toolName}`,
         );
       const output = await timed(
-        (signal) => built.server.callTool(toolName, args, null, { signal }),
+        (signal) =>
+          built.server.callTool(toolName, input.arguments ?? {}, null, {
+            signal,
+          }),
         policy.call_timeout_ms,
       );
       const measured = serializedOutput(output);
@@ -1306,11 +1338,19 @@ export class McpService {
           measured.sha256,
         );
       return {
+        invocation_id: newId(),
+        operation_id: input.operation_id ?? null,
+        server_id: record.id,
+        tool_name: toolName,
+        fingerprint,
         output,
         output_size: measured.size,
         output_sha256: measured.sha256,
+        started_at: startedAt,
+        completed_at: new Date().toISOString(),
       };
     } catch (error) {
+      if (error instanceof ConflictError) throw error;
       throw new ValidationError(redact(error, built.secretValues));
     } finally {
       await built.server.close().catch(() => undefined);

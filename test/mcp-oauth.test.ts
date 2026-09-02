@@ -226,6 +226,21 @@ describe("MCP OAuth", () => {
 
     await expect(
       container.mcp.create({
+        slug: "oauth-auto-frozen-read",
+        name: "OAuth auto scopes with frozen read tools",
+        transport: "streamable_http",
+        endpoint_config: { url: "https://example.com/mcp" },
+        auth: { type: "oauth" },
+        policy: {
+          allowed_tools: ["get_positions"],
+          approval: { mode: "never" },
+          side_effecting_tools: [],
+        },
+      }),
+    ).resolves.toMatchObject({ slug: "oauth-auto-frozen-read" });
+
+    await expect(
+      container.mcp.create({
         slug: "oauth-mixed-auth",
         name: "OAuth mixed auth",
         transport: "streamable_http",
@@ -432,8 +447,16 @@ describe("MCP OAuth", () => {
     const callback = await app.inject({
       method: "GET",
       url: `${redirect.pathname}${redirect.search}`,
+      headers: { accept: "text/html" },
     });
     expect(callback.statusCode).toBe(200);
-    expect(callback.json()).toMatchObject({ status: "connected" });
+    expect(callback.headers["content-type"]).toContain("text/html");
+    expect(callback.body).toContain("Authorization complete");
+    expect(callback.body).toContain("history.replaceState");
+    const status = await app.inject({
+      method: "GET",
+      url: `/v1/mcp-servers/${serverId}/oauth/status`,
+    });
+    expect(status.json()).toMatchObject({ status: "connected" });
   }, 20_000);
 });
