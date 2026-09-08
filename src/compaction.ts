@@ -169,10 +169,7 @@ function projectionChecksumValid(projection: Record<string, unknown>): boolean {
   );
 }
 
-function boundedByTokens<T>(
-  values: T[],
-  tokenBudget: number,
-): T[] {
+function boundedByTokens<T>(values: T[], tokenBudget: number): T[] {
   const result: T[] = [];
   let used = 0;
   for (const value of values) {
@@ -205,7 +202,10 @@ function mergeUserExcerpts(
   values: PortableCheckpointV4["user_excerpts"],
   tokenBudget: number,
 ): PortableCheckpointV4["user_excerpts"] {
-  const found = new Map<string, PortableCheckpointV4["user_excerpts"][number]>();
+  const found = new Map<
+    string,
+    PortableCheckpointV4["user_excerpts"][number]
+  >();
   for (const excerpt of values) {
     const key = `${excerpt.source_ref}:${excerpt.sha256}`;
     if (!found.has(key)) found.set(key, structuredClone(excerpt));
@@ -710,10 +710,7 @@ export class CompactionService {
       suffixTokens += unit.estimated_tokens;
       cutUnit = index;
     }
-    if (
-      cutUnit <= 0 ||
-      (cutUnit >= plan.units.length && tailBudget > 0)
-    )
+    if (cutUnit <= 0 || (cutUnit >= plan.units.length && tailBudget > 0))
       cutUnit = Math.max(1, Math.floor(plan.units.length * 0.75));
     const unresolved = plan.units.findIndex(
       (unit) => unit.unresolved_tool_call,
@@ -789,14 +786,8 @@ export class CompactionService {
     const rawSourceItems = originalSourceItems
       .map((item, offset) => ({ item, sourceRef: sourceFrom + offset }))
       .filter(({ item }) => !parsePortableCheckpointItem(item));
-    const anchorBudget = Math.max(
-      64,
-      Math.floor(maxCheckpointTokens * 0.2),
-    );
-    const excerptBudget = Math.max(
-      64,
-      Math.floor(maxCheckpointTokens * 0.25),
-    );
+    const anchorBudget = Math.max(64, Math.floor(maxCheckpointTokens * 0.2));
+    const excerptBudget = Math.max(64, Math.floor(maxCheckpointTokens * 0.25));
     const perExcerptBudget = Math.max(
       32,
       Math.floor(maxCheckpointTokens * 0.15),
@@ -1049,13 +1040,19 @@ export class CompactionService {
         nativeFallback = nativeFailureCode(error);
       }
     }
-    return this.compactPortable(
-      items,
-      resolved,
-      decision,
-      requested,
-      nativeFallback,
-      options,
-    );
+    try {
+      return await this.compactPortable(
+        items,
+        resolved,
+        decision,
+        requested,
+        nativeFallback,
+        options,
+      );
+    } catch (error) {
+      if (nativeFallback && error && typeof error === "object")
+        Object.assign(error, { nativeFallback });
+      throw error;
+    }
   }
 }

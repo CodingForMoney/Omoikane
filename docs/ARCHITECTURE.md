@@ -80,14 +80,38 @@ Temporary Run Artifacts use a filesystem/SQL recovery protocol because those two
 
 Every Run has a stable Omoikane `trace_id`. When Runtime-global tracing is enabled, each execution attempt gets a separate OpenAI Agents SDK Trace ID recorded in `run.started`. SDK Trace metadata contains only the Run ID, stable Run Trace ID, execution attempt, Deployment ID, Provider, and model. It deliberately excludes `external_session_id`. Input/output, Tool arguments/results, rejected Guardrail output, and credentials are disabled at both the Runtime Runner and SDK global logging layers.
 
+The model-event adapter consumes the OpenAI Agents SDK's Provider-independent
+`output_text_delta` envelope and, for information the SDK does not normalize,
+the nested raw `model.event` envelope. Request controls are selected from the
+model capability record and translated to Responses reasoning, Chat
+Completions Provider fields, Anthropic thinking, or Gemini thinking config.
+OpenAI-compatible aliases and Mistral thinking chunks are normalized before
+the SDK continues consuming the same chunk, preserving reasoning-item continuity
+through Function Tool turns.
+
+The Event layer publishes only catalog-allowlisted public reasoning-summary
+deltas and completed snapshots. Completed streamed text is authoritative over
+accumulated deltas, which are authoritative over an explicit `summary_text`
+fallback in a completed Responses reasoning item. Provider-private
+`reasoning_text`, `reasoning_content`, thinking blocks, and encrypted data are
+never copied into a Runtime Event. When a Provider emits a visible trace, the
+adapter publishes only
+`model.reasoning_metadata_started`, throttled cumulative `progress`, and a
+content-free `completed` snapshot. Counts are derived from deltas; a repeated
+`done` body is ignored unless no deltas arrived. Provider-reported Reasoning
+Tokens are used when available and are never estimated. Normalization state is
+scoped to one Run execution attempt and discarded on requeue.
+
 Input and Output Guardrails execute through the OpenAI Agents SDK lifecycle,
 while their typed local implementation registry, timeout/failure policy,
 structured audit Events, and delivery safety belong to Omoikane. Input checks
 finish before a model request starts. If a reachable Agent has an Output
-Guardrail, the Runtime withholds model text, reasoning, message items, and
+Guardrail, the Runtime withholds model text, reasoning summaries, message items, and
 `agent.completed` output until the final output passes. Accepted buffered text
-and the terminal Event commit atomically; rejected content never enters the Run
-Event stream. Function/MCP Tool arguments and outputs remain governed by Tool
+and completed public reasoning summaries commit atomically with the terminal Event;
+rejected content never enters the Run Event stream. Content-free reasoning
+activity metadata can stream before Guardrail completion because it cannot
+reveal the checked output or private reasoning text. Function/MCP Tool arguments and outputs remain governed by Tool
 schema, approval, and execution policy rather than Output Guardrails.
 
 ## Conversation and memory

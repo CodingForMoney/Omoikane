@@ -103,6 +103,27 @@ saveToBusinessStore(completed.output, completed.new_items);
 
 `external_session_id` is correlation metadata only. Omoikane never loads prior messages from it.
 
+### Reasoning models
+
+Reasoning is capability-driven rather than assumed from a Provider protocol. Each
+Provider Model reports whether reasoning is available, how it is activated,
+whether the model accepts an Effort, Token-budget, or Summary control, and what
+kind of output is observable. Configure only controls advertised by that model:
+
+```yaml
+model_settings:
+  reasoning_enabled: true
+  reasoning_effort: high
+  reasoning_summary: auto
+```
+
+Omoikane translates these generic settings to the selected Provider's request
+shape. Public summaries are emitted as `model.reasoning_summary_*` Events.
+Provider-visible private traces produce content-free
+`model.reasoning_metadata_*` Events; their text is not part of the public
+Runtime contract. See the [reasoning capability matrix](docs/PROVIDERS.md#reasoning)
+for model-specific controls and output behavior.
+
 ## Capability summary
 
 | Area       | Current capability                                                                                                                 |
@@ -113,7 +134,7 @@ saveToBusinessStore(completed.output, completed.new_items);
 | Tools      | Function Tools; Runtime-managed MCP Tools with OAuth, policy, snapshots, approvals, reconciliation, and model-free read invocation |
 | Skills     | immutable bundles, explicit version binding, checksum verification, instruction injection                                          |
 | Context    | caller-supplied conversation; native/portable temporary Projection; no Session or memory store                                     |
-| Output     | validated structured output; typed pluggable Input/Output Guardrails with safe output buffering                                    |
+| Output     | validated structured output; public reasoning summaries; content-free Raw CoT metadata; typed Input/Output Guardrails              |
 | Execution  | Function Tools and MCP Tools; paged, checksummed, quota-bounded temporary Run Artifacts; no supported built-in Sandbox             |
 | Operations | PGlite snapshot/restore/safe upgrade, optional PostgreSQL, Usage, Runtime status, metadata-only SDK tracing                        |
 

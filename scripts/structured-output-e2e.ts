@@ -12,6 +12,8 @@ interface Target {
   model: string;
   apiKeyEnv: string;
   expectedMode: "native" | "prompt";
+  reasoningEffort: string;
+  reasoningSummary?: string;
 }
 
 const schema = {
@@ -47,14 +49,17 @@ const targets: Target[] = [
     model: "mimo-v2.5",
     apiKeyEnv: "MIMO_API_KEY",
     expectedMode: "prompt",
+    reasoningEffort: "none",
   },
   {
     name: "Codex Bridge",
     provider: "codex_bridge",
     profile: "loopback",
-    model: "gpt-5.6-sol",
+    model: "gpt-6-astra",
     apiKeyEnv: "CODEX_BRIDGE_API_KEY",
     expectedMode: "native",
+    reasoningEffort: "low",
+    reasoningSummary: "auto",
   },
 ];
 
@@ -112,7 +117,13 @@ for (const target of targets) {
         instructions: "Follow the structured output contract exactly.",
         provider: { connection_id: connection.id },
         model: target.model,
-        model_settings: { max_tokens: 8192, reasoning_effort: "none" },
+        model_settings: {
+          max_tokens: 8192,
+          reasoning_effort: target.reasoningEffort,
+          ...(target.reasoningSummary
+            ? { reasoning_summary: target.reasoningSummary }
+            : {}),
+        },
         output_schema: schema,
         compaction: { enabled: false },
       },
@@ -131,15 +142,13 @@ for (const target of targets) {
     const output = run.output as { provider?: unknown; status?: unknown };
     if (output.provider !== target.provider || output.status !== "ok")
       throw new Error(`${target.name} returned unexpected validated values`);
-    const completed = (await container.events.list(run.id)).find(
-      (event) => event.type === "run.completed",
-    );
+    const events = await container.events.list(run.id);
+    const completed = events.find((event) => event.type === "run.completed");
     if (
       completed?.payload_json.structured_output_validated !== true ||
       completed.payload_json.structured_output_mode !== target.expectedMode
     )
       throw new Error(`${target.name} completion event was not validated`);
-
     results.push({
       provider: target.provider,
       model: target.model,

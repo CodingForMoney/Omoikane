@@ -42,6 +42,16 @@ import {
   pageLimit,
   type PageOptions,
 } from "./pagination.js";
+import {
+  ModelStreamEventNormalizer,
+  sanitizeReasoningItem,
+  sanitizeReasoningRunItem,
+  type NormalizedModelStreamEvent,
+} from "./model-stream-events.js";
+import {
+  collectReasoningMetadata,
+  providerReasoningTokensFromUsage,
+} from "./reasoning-metadata.js";
 
 export interface RunRow extends Record<string, unknown> {
   id: string;
@@ -419,6 +429,14 @@ export class RunnerService {
       ...safe,
       ...(run.payload_purged_at ? {} : this.result(run)),
     };
+  }
+  async reasoningMetadata(id: string) {
+    const run = await this.get(id);
+    return collectReasoningMetadata(
+      id,
+      await this.events.reasoningMetadata(id),
+      providerReasoningTokensFromUsage(run.usage_json),
+    );
   }
   async cancel(id: string) {
     this.controllers.get(id)?.abort("cancel requested");
@@ -928,6 +946,40 @@ export class RunnerService {
       responsesWithRawUsage: 0,
       rawUsage: [],
     };
+    let activeResult: StreamedRunResult<RuntimeContext, any> | undefined;
+    let usageRecorded = false;
+    const modelEventNormalizer = new ModelStreamEventNormalizer(
+      run.execution_attempt,
+      { reasoning: config._capabilities?.reasoning },
+    );
+    const bufferedReasoningEvents: NormalizedModelStreamEvent[] = [];
+    const publishModelEvents = async (
+      normalizedEvents: NormalizedModelStreamEvent[],
+    ) => {
+      for (const normalized of normalizedEvents) {
+        const reasoningMetadata = normalized.type.startsWith(
+          "model.reasoning_metadata_",
+        );
+        if (built.outputGuardrailsBuffered && !reasoningMetadata) {
+          // Delayed deltas have no streaming value after the Guardrail passes.
+          // Retain only the bounded canonical summary snapshot for terminal
+          // publication; the normalizer still accumulates any streamed deltas.
+          if (normalized.type === "model.reasoning_summary_completed")
+            bufferedReasoningEvents.push(normalized);
+          continue;
+        }
+        await this.events.append(
+          run.id,
+          normalized.type,
+          normalized.type === "model.output_delta"
+            ? {
+                ...normalized.data,
+                provisional: Boolean(built.structuredOutput),
+              }
+            : { ...normalized.data },
+        );
+      }
+    };
     sdkRunner.on("agent_start", async (_ctx, agent) => {
       await this.events.append(run.id, "agent.started", { agent: agent.name });
     });
@@ -980,7 +1032,7 @@ export class RunnerService {
     );
     try {
       const state = await this.loadState(run, built.agent, context);
-      const result = (await sdkRunner.run(
+      const result = (activeResult = (await sdkRunner.run(
         built.agent,
         (state ?? prepared.input) as any,
         {
@@ -989,7 +1041,7 @@ export class RunnerService {
           maxTurns: Number(run.limits_json.max_turns ?? 20),
           signal,
         } as any,
-      )) as StreamedRunResult<RuntimeContext, any>;
+      )) as StreamedRunResult<RuntimeContext, any>);
       for await (const event of result) {
         if (event.type === "raw_model_stream_event") {
           const data = event.data as unknown as Record<string, unknown>;
@@ -1008,23 +1060,7 @@ export class RunnerService {
               usageEvidence.rawUsage.push(rawUsage as Record<string, unknown>);
             }
           }
-          const delta = data.delta;
-          if (typeof delta === "string" && delta) {
-            const mapped =
-              type === "response.output_text.delta"
-                ? "model.output_delta"
-                : type.includes("reasoning_summary")
-                  ? "model.reasoning_summary_delta"
-                  : type.includes("reasoning")
-                    ? "model.reasoning_delta"
-                    : undefined;
-            if (mapped && !built.outputGuardrailsBuffered)
-              await this.events.append(run.id, mapped, {
-                delta,
-                source_type: type,
-                provisional: Boolean(built.structuredOutput),
-              });
-          }
+          await publishModelEvents(modelEventNormalizer.consume(data));
         } else if (event.type === "run_item_stream_event") {
           const bufferedGuardrailItem =
             built.outputGuardrailsBuffered &&
@@ -1044,8 +1080,17 @@ export class RunnerService {
                     item_available: false,
                     output_validation: "pending",
                   }
-                : { item: event.item.toJSON() },
+                : {
+                    item:
+                      event.name === "reasoning_item_created"
+                        ? sanitizeReasoningRunItem(event.item.toJSON())
+                        : event.item.toJSON(),
+                  },
           );
+          if (event.name === "reasoning_item_created")
+            await publishModelEvents(
+              modelEventNormalizer.consumeReasoningItem(event.item.rawItem),
+            );
         } else if (event.type === "agent_updated_stream_event")
           await this.events.append(run.id, "agent.updated", {
             agent: event.agent.name,
@@ -1058,7 +1103,9 @@ export class RunnerService {
           throw invalidStructuredOutputJson(built.structuredOutput.mode);
         throw error;
       }
+      await publishModelEvents(modelEventNormalizer.flush());
       await this.recordUsage(run, result, config, usageEvidence);
+      usageRecorded = true;
       if (result.interruptions.length) {
         await this.interrupt(run, result);
         return;
@@ -1077,7 +1124,7 @@ export class RunnerService {
         throw error;
       }
       const newItems = result.newItems
-        .map((item) => item.rawItem)
+        .map((item) => sanitizeReasoningItem(item.rawItem))
         .filter((item): item is AgentInputItem => Boolean(item));
       let committedStatus = "completed";
       await this.db.transaction(async (tx) => {
@@ -1100,6 +1147,13 @@ export class RunnerService {
           ],
         );
         await tx.query("DELETE FROM run_states WHERE run_id=$1", [run.id]);
+        if (!cancelled && built.outputGuardrailsBuffered)
+          for (const normalized of bufferedReasoningEvents)
+            await this.events.appendInTransaction(tx, run.id, normalized.type, {
+              ...normalized.data,
+              provisional: false,
+              buffered: true,
+            });
         if (!cancelled && built.outputGuardrailsBuffered) {
           const acceptedOutput =
             typeof output === "string"
@@ -1157,6 +1211,29 @@ export class RunnerService {
         run_id: run.id,
         status: committedStatus,
       });
+    } catch (error) {
+      const partialUsage = activeResult?.runContext.usage;
+      if (
+        activeResult &&
+        !usageRecorded &&
+        (usageEvidence.responses > 0 || Number(partialUsage?.requests ?? 0) > 0)
+      ) {
+        try {
+          await this.recordUsage(run, activeResult, config, usageEvidence);
+          usageRecorded = true;
+        } catch (usageError) {
+          this.observability.logger.write("error", "run_usage_persist_failed", {
+            run_id: run.id,
+            error_type: safeErrorType(usageError),
+          });
+        }
+      }
+      await publishModelEvents(
+        modelEventNormalizer.flushReasoningMetadata(
+          signal.reason === "cancel requested" ? "cancelled" : "failed",
+        ),
+      );
+      throw error;
     } finally {
       await built.close();
     }

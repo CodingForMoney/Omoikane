@@ -57,13 +57,15 @@ Known models receive reviewed context/output defaults from the Provider catalog.
 
 Omoikane requires a `response.compaction` envelope, one non-empty final encrypted `compaction` item, and exact preservation of all returned user messages. It rejects ineffective or unsafe-sized output. The opaque item is never decrypted, summarized, converted to Portable format, or edited.
 
+Before calling the endpoint, Omoikane compiles canonical OpenAI Agents SDK history into Responses wire items. In particular, SDK `function_call_result`/`callId` items become Responses `function_call_output`/`call_id` items. The Runtime never sends its internal item representation directly to `/responses/compact`.
+
 Projection v4 binds a native checkpoint to a fingerprint of protocol, Provider, base URL, model, and local credential identity. It is rejected when replayed through a different issuer. `auto` falls back to Portable only for a declared endpoint/capability incompatibility or malformed/ineffective native result. It does not hide authentication, authorization, quota, cancellation, timeout, network, or server failures behind a fallback.
 
 ### Portable structured checkpoint
 
 Portable compaction performs these operations:
 
-1. Normalize model items and group atomic units. A function call and all of its Tool outputs are never split across the checkpoint boundary.
+1. Normalize canonical Agents SDK and supported legacy model items, then pair calls and results by call ID. Sequential and parallel Function Tool transactions are never split across the checkpoint boundary.
 2. Deterministically prune eligible old or duplicate large Tool results. Recent unique results remain verbatim; replacements retain size, digest, and SHA-256 evidence.
 3. Keep a bounded recent raw tail and select the older prefix.
 4. Chunk the prefix without splitting normal turns or Tool transactions. Oversized atomic units are segmented only for summarization, not for the final projection boundary.
@@ -157,7 +159,9 @@ Content-Type: application/json
 
 For repeated compaction, send `projection` instead of `items`. To start a Run from an existing Projection, send `projection` instead of `conversation` to `POST /v1/runs`. The two fields are mutually exclusive. This retains all v4 compatibility and lineage metadata instead of reducing a Projection to its `items` array.
 
-Run-time projection changes are persisted atomically with their `context.compacted` Event. `runs.compaction_state_json` records revision, attempt count, last input checksum, calibration state, and verification state so a process restart does not lose the execution decision. Terminal payload cleanup removes this state with the Projection.
+Run-time projection changes are persisted atomically with their `context.compacted` Event. `context.compaction_started`, `context.compaction_fallback`, and `context.compaction_failed` expose attempt and fallback state without Tool payloads. `runs.compaction_state_json` records revision, attempt count, last input checksum, failure code, calibration state, and verification state so a process restart does not lose the execution decision. Terminal payload cleanup removes this state with the Projection.
+
+Provider/SDK Usage completed before a later compaction or model failure is persisted on the failed Run. An empty Usage object therefore means no completed response reported usable accounting, not that an already completed response was discarded because the overall Run failed.
 
 ## Reliability boundary
 
@@ -206,10 +210,10 @@ The default MiMo command reads `MIMO_API_KEY`; the Codex Bridge command reads `C
 
 The 2026-08-28 release qualification recorded in `evals/compaction/qualification-baselines.json` produced:
 
-| Subject | Generations | Result | Token reduction | Semantic result |
-| --- | ---: | --- | --- | --- |
-| MiMo `mimo-v2.5`, Portable | 3 | passed | 48,890 → 4,283 in generation 1; later generations remained below 4,700 | 22/22 each generation; maximum score drop 0 |
-| Codex Bridge `gpt-5.6-sol`, Native | 1 | passed | 48,890 → 2,444 | 22/22; false/stale fact rates 0 |
+| Subject                            | Generations | Result | Token reduction                                                        | Semantic result                             |
+| ---------------------------------- | ----------: | ------ | ---------------------------------------------------------------------- | ------------------------------------------- |
+| MiMo `mimo-v2.5`, Portable         |           3 | passed | 48,890 → 4,283 in generation 1; later generations remained below 4,700 | 22/22 each generation; maximum score drop 0 |
+| Codex Bridge `gpt-5.6-sol`, Native |           1 | passed | 48,890 → 2,444                                                         | 22/22; false/stale fact rates 0             |
 
 The broader corpus exposed and now guards two defects that the former marker-only tests missed: Tool `call_id` anchors were incorrectly validated as message text, and repeated Portable compaction rejected inherited source references and failed to carry deterministic evidence forward. Portable compaction now inherits prior source refs, anchors, user excerpts, and Tool ledger entries. A structurally invalid generated checkpoint receives one explicit validation-repair attempt; the metric `summary_validation_retries` records whether it was used.
 
@@ -217,7 +221,7 @@ The broader corpus exposed and now guards two defects that the former marker-onl
 
 The offline suite covers v4 schema/citation validation, atomic Tool transactions, deterministic pruning, exact evidence, cross-generation evidence inheritance, bounded checkpoint repair, semantic scoring, release thresholds, native issuer/fallback rules, per-call overflow retry, threshold planning, ineffective output, Run persistence, and checksum integrity.
 
-Optional live suites cover MiMo portable 100K input and Codex Bridge native compaction plus continuation:
+Optional live suites cover MiMo portable 100K input and GPT-6 Astra through Codex Bridge v0.1.7 native compaction plus continuation:
 
 ```bash
 npm run test:e2e:compaction-100k

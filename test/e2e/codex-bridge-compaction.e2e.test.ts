@@ -46,7 +46,7 @@ describe.sequential("Codex Bridge native compaction E2E", () => {
     if (root) await rm(root, { recursive: true, force: true });
   });
 
-  it("compacts through /responses/compact and continues through /responses", async () => {
+  it("compacts canonical Function Tool history through /responses/compact and continues", async () => {
     const runtime = container!;
     const connection = await runtime.providers.create({
       name: "Local Codex Bridge E2E",
@@ -59,9 +59,9 @@ describe.sequential("Codex Bridge native compaction E2E", () => {
         instructions:
           "Preserve exact verification codes. When asked for one, return only that code.",
         provider: { connection_id: connection.id },
-        model: "gpt-5.6-sol",
+        model: "gpt-6-astra",
         model_context_window: 258_400,
-        model_settings: { reasoning_effort: "none", max_tokens: 128 },
+        model_settings: { reasoning_effort: "low", max_tokens: 128 },
         tools: [],
         skills: [],
         mcp_servers: [],
@@ -85,6 +85,23 @@ describe.sequential("Codex Bridge native compaction E2E", () => {
       {
         role: "assistant",
         content: [{ type: "output_text", text: filler }],
+      },
+      {
+        type: "function_call",
+        callId: "bridge-native-tool-call",
+        name: "load_verification_record",
+        arguments: '{"record":"7429"}',
+        status: "completed",
+      },
+      {
+        type: "function_call_result",
+        callId: "bridge-native-tool-call",
+        name: "load_verification_record",
+        status: "completed",
+        output: {
+          type: "text",
+          text: `The stored verification code is ${marker}.`,
+        },
       },
       {
         role: "user",
@@ -136,5 +153,50 @@ describe.sequential("Codex Bridge native compaction E2E", () => {
       "completed",
     );
     expect(String(completed.output)).toContain(marker);
+  });
+
+  it("publishes GPT-6 Astra public reasoning summaries", async () => {
+    const runtime = container!;
+    const connection = await runtime.providers.create({
+      name: "Local Codex Bridge Astra reasoning E2E",
+      provider: "codex_bridge",
+      api_key: process.env.CODEX_BRIDGE_API_KEY,
+    });
+    const deployment = await runtime.definitions.deploy({
+      config: {
+        name: "Codex Bridge Astra reasoning verifier",
+        instructions:
+          "Reason carefully, then provide a concise recommendation with its main tradeoff.",
+        provider: { connection_id: connection.id },
+        model: "gpt-6-astra",
+        model_settings: {
+          reasoning_effort: "max",
+          reasoning_summary: "auto",
+          max_tokens: 2_048,
+        },
+        tools: [],
+        skills: [],
+        mcp_servers: [],
+        compaction: { enabled: false },
+      },
+    });
+    const run = await runtime.runner.create({
+      deploymentId: deployment.id,
+      input:
+        "Compare blue-green and canary deployment for a stateful payment service. Identify one failure mode for each and recommend one.",
+      limits: { max_turns: 3, max_duration_seconds: 180 },
+    });
+
+    await runtime.runner.processNext();
+
+    const completed = await runtime.runner.publicRun(run.id);
+    expect(completed.status, JSON.stringify(completed.error_json)).toBe(
+      "completed",
+    );
+    const summaries = (await runtime.events.list(run.id)).filter(
+      (event) => event.type === "model.reasoning_summary_completed",
+    );
+    expect(summaries.length).toBeGreaterThan(0);
+    expect(summaries.every((event) => event.payload_json.text)).toBe(true);
   });
 });

@@ -1,8 +1,8 @@
 # Provider and model catalog
 
-> Implementation source of truth: `src/providers.ts`. Catalog last reviewed: 2026-08-30.
+> Implementation source of truth: `src/providers.ts`. Catalog last reviewed: 2026-09-05.
 
-This document describes Provider definitions, protocols, model discovery, Reasoning Effort, structured output, context defaults, and credentials. For the creation workflow, see [Configure a Provider first](DEVELOPER_GUIDE.md#2-configure-a-provider-first).
+This document describes Provider definitions, protocols, model discovery, reasoning capabilities, structured output, context defaults, and credentials. For the creation workflow, see [Configure a Provider first](DEVELOPER_GUIDE.md#2-configure-a-provider-first).
 
 ## Resource model
 
@@ -88,11 +88,13 @@ The current catalog includes dedicated MiMo V2.5 ASR and TTS models backed by ex
 
 | Provider                | Model                         | Kind               | Input                     | Output | Image understanding | STT       | TTS       |
 | ----------------------- | ----------------------------- | ------------------ | ------------------------- | ------ | ------------------- | --------- | --------- |
+| OpenAI                  | `gpt-6-astra`                 | `agent`            | text, image               | text   | native              | —         | —         |
 | OpenAI                  | `gpt-5.6-sol`                 | `agent`            | text, image               | text   | native              | —         | —         |
 | OpenAI                  | `gpt-5.6-terra`               | `agent`            | text, image               | text   | native              | —         | —         |
 | OpenAI                  | `gpt-5.6-luna`                | `agent`            | text, image               | text   | native              | —         | —         |
 | OpenAI                  | `gpt-5.4`                     | `agent`            | text, image               | text   | native              | —         | —         |
 | OpenAI                  | `gpt-5.4-mini`                | `agent`            | text, image               | text   | native              | —         | —         |
+| Codex Bridge (local)    | `gpt-6-astra`                 | `agent`            | text, image               | text   | native              | —         | —         |
 | Codex Bridge (local)    | `gpt-5.6-sol`                 | `agent`            | text, image               | text   | native              | —         | —         |
 | Codex Bridge (local)    | `gpt-5.6-luna`                | `agent`            | text, image               | text   | native              | —         | —         |
 | Anthropic Claude        | `claude-opus-5`               | `agent`            | text, image               | text   | native              | —         | —         |
@@ -125,7 +127,7 @@ The current catalog includes dedicated MiMo V2.5 ASR and TTS models backed by ex
 | Xiaomi MiMo             | `mimo-v2.5-tts`               | `speech_synthesis` | text                      | audio  | —                   | —         | dedicated |
 | DeepSeek                | `deepseek-v4-pro`             | `agent`            | text                      | text   | —                   | —         | —         |
 | DeepSeek                | `deepseek-v4-flash`           | `agent`            | text                      | text   | —                   | —         | —         |
-| Alibaba Qwen            | `qwen3.8-max-preview`         | `agent`            | text, image               | text   | native              | —         | —         |
+| Alibaba Qwen            | `qwen3.8-max`                 | `agent`            | text, image               | text   | native              | —         | —         |
 | Alibaba Qwen            | `qwen3.7-max`                 | `agent`            | text, image               | text   | native              | —         | —         |
 | Alibaba Qwen            | `qwen3.7-plus`                | `agent`            | text, image               | text   | native              | —         | —         |
 | Alibaba Qwen            | `qwen3.6-flash`               | `agent`            | text, image               | text   | native              | —         | —         |
@@ -143,6 +145,7 @@ The current catalog includes dedicated MiMo V2.5 ASR and TTS models backed by ex
 | Tencent Hunyuan         | `hunyuan-turbos-latest`       | `agent`            | text                      | text   | —                   | —         | —         |
 | Tencent Hunyuan         | `hunyuan-lite`                | `agent`            | text                      | text   | —                   | —         | —         |
 | Tencent Hunyuan         | `hunyuan-vision`              | `agent`            | text, image               | text   | native              | —         | —         |
+| Tencent Hunyuan         | `hunyuan-t1-latest`           | `agent`            | text                      | text   | —                   | —         | —         |
 | MiniMax                 | `MiniMax-M2.7`                | `agent`            | text                      | text   | —                   | —         | —         |
 | MiniMax                 | `MiniMax-M2.5`                | `agent`            | text                      | text   | —                   | —         | —         |
 | MiniMax                 | `MiniMax-M2.1`                | `agent`            | text                      | text   | —                   | —         | —         |
@@ -169,26 +172,63 @@ Both Token Plan and PAYG MiMo profiles use their existing connection credential.
 
 These operations are currently non-streaming and hold no Session or conversation state. The Provider models can stream natively, but Omoikane advertises `streaming: false` for these effective adapters until bounded SSE audio forwarding and cancellation are part of the public Runtime contract. Audio bytes and transcripts are not stored by this path; the caller owns any permanent recording, transcript, playback file, consent, and retention policy.
 
-## Reasoning Effort
+## Reasoning
 
-Reasoning Effort is a model capability, not a uniform property of the OpenAI, Anthropic, or Gemini protocols. A UI must read the selected model's capability record:
+Reasoning support and Reasoning Effort are different capabilities. Some models reason but expose no Effort selector; some return a public summary, some return a Provider-visible reasoning trace, and some keep reasoning private. A UI must use the selected model's complete capability record:
 
 ```json
 {
   "supported": true,
+  "activation": "optional",
+  "visibility": "provider_trace",
+  "controls": {
+    "toggle": true,
+    "effort": true,
+    "budget_tokens": false,
+    "summary": false
+  },
   "effort_values": ["none", "low", "medium", "high"],
-  "adapter": "reasoning_effort"
+  "summary_values": [],
+  "request_adapters": ["chat_reasoning_effort"],
+  "response_adapter": "chat_reasoning_fields",
+  "replay": "reasoning_item"
 }
 ```
 
-If `supported` is false, do not show an Effort selector. The server rejects values not declared by that model. Agent configuration uses one platform field:
+The UI rules are direct: show the master reasoning switch only when `controls.toggle` is true, Effort only when `controls.effort` is true, the Token budget only when `controls.budget_tokens` is true, and Summary only when `controls.summary` is true. The server rejects undeclared controls and values rather than forwarding guesses.
+
+Agent configuration uses Provider-independent fields:
 
 ```yaml
 model_settings:
+  reasoning_enabled: true
   reasoning_effort: high
+  reasoning_budget_tokens: 4096
+  reasoning_summary: auto
 ```
 
-Before execution, Omoikane maps this to the selected adapter's SDK model settings and applies a `value_map` when the Provider uses different names.
+Specify only controls advertised by the chosen model. Before execution, Omoikane maps them to OpenAI `reasoning`, root `reasoning_effort`, Anthropic `thinking`, Gemini `thinkingConfig`, `enable_thinking`, `reasoning_format`, `reasoning_split`, or the corresponding Provider request shape. `value_map` handles Providers whose labels differ.
+
+| Output semantics                                   | Providers/models in the fixed catalog                                                                                                                                                                                             |
+| -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Public summary                                     | OpenAI GPT-6 Astra and GPT-5.4/5.6; Codex Bridge GPT-6 Astra and GPT-5.6; all cataloged Claude models; all cataloged Gemini models                                                                                                |
+| Content-free metadata for a Provider-visible trace | Cohere Command A+; Mistral Small; Groq reasoning models; Together GPT-OSS; Cerebras GPT-OSS; MiMo 2.5/Pro; DeepSeek V4; Qwen 3.7/3.8; GLM; Kimi; Doubao Seed 2.0 Lite; ERNIE X1.1; Hunyuan T1; MiniMax M2.x; StepFun 3.5; Spark-X |
+| Private reasoning, controls only                   | xAI Grok 4.3 and 4.5                                                                                                                                                                                                              |
+| Service reasoning steps                            | Perplexity Sonar Pro                                                                                                                                                                                                              |
+
+The Effort selector is available only for OpenAI/Codex, Gemini, xAI Grok 4.3/4.5, Mistral Small, Groq GPT-OSS/Qwen, Together GPT-OSS, Cerebras GPT-OSS, MiMo 2.5/Pro, DeepSeek V4, GLM 5.2, and StepFun 3.5 Flash 2603. Direct OpenAI GPT-6 Astra accepts `low`, `medium`, `high`, `xhigh`, and `max`; the Codex Bridge profile additionally accepts `none`. Codex Bridge exposes only the `auto` public-summary setting. Models such as Claude, Qwen's direct API, Kimi, MiniMax, ERNIE X1.1, and Spark-X still have reasoning support but deliberately expose no fake Effort choices.
+
+Reasoning capability records may additionally declare
+`raw_trace_metadata` and `native_summary` as
+`supported`, `not_observed`, or `unknown`. The former means Omoikane has
+an allowlisted content-free metadata extractor for that wire shape; it
+does not mean Raw CoT text is part of the public Runtime contract. Live testing
+currently marks `mimo-v2.5` as Raw CoT metadata-capable and its native public
+summary as `not_observed`.
+
+OpenAI-compatible reasoning aliases (`reasoning`, `reasoning_content`, `reasoning_details`) and Mistral thinking chunks are normalized before the OpenAI Agents SDK resumes consuming the streamed chunk. This preserves reasoning items required for in-Run tool-call continuity. Omoikane removes Provider-private reasoning text from Events, terminal `new_items`, and public Run records, and emits only counts, timing, completion state, and Provider-reported reasoning-token usage. A temporary SDK approval-resume checkpoint may contain Provider reasoning data because exact tool continuation requires it; that checkpoint is local, never returned by the public API, and is deleted when the Run becomes terminal. Anthropic and Gemini public summaries are normalized from the AI SDK reasoning stream into `model.reasoning_summary_*` Events.
+
+Unknown models discovered through OpenRouter, SiliconFlow, ModelScope, or a custom compatible endpoint remain conservative unknowns. Add an explicit capability override only after verifying that model's request and response shape; Omoikane never infers reasoning support from a model name.
 
 ## Structured output
 
@@ -217,7 +257,7 @@ Native context compaction is a model capability and is never inferred from `prot
 }
 ```
 
-The catalog enables it for known OpenAI Responses models and the supported local Codex Bridge models. Unknown models and generic OpenAI-compatible Providers default to unsupported until verified. Codex Bridge v0.1.5 or later is required: it must implement `POST /v1/responses/compact` and accept the returned `compaction` item on a later `POST /v1/responses` request.
+The catalog enables it for known OpenAI Responses models and the supported local Codex Bridge models. Unknown models and generic OpenAI-compatible Providers default to unsupported until verified. Codex Bridge v0.1.5 or later is required for this contract; GPT-6 Astra specifically requires Codex Bridge v0.1.7 or later. The Bridge must implement `POST /v1/responses/compact` and accept the returned `compaction` item on a later `POST /v1/responses` request.
 
 Model discovery does not establish this capability. The Omoikane `auto` strategy uses the catalog declaration and falls back to portable checkpoint compaction on a compatible native failure. Explicit `native` mode fails when the capability or endpoint is unavailable. See [Context compaction](CONTEXT_COMPACTION.md).
 
@@ -229,12 +269,12 @@ The qualified set uses either a Provider count endpoint or an immutable official
 
 | Provider     | Qualified models                                                            | Method                                              | Accuracy            | Input scope |
 | ------------ | --------------------------------------------------------------------------- | --------------------------------------------------- | ------------------- | ----------- |
-| OpenAI       | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.4`                   | OpenAI Responses input Tokens                       | authoritative exact | model       |
+| OpenAI       | `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.4`    | OpenAI Responses input Tokens                       | authoritative exact | model       |
 | Anthropic    | `claude-opus-5`, `claude-sonnet-5`, `claude-opus-4-6`, `claude-sonnet-4-6`  | Anthropic Messages count Tokens                     | Provider estimate   | model       |
 | Google       | `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-3.1-flash-lite` | Gemini count Tokens                                 | Provider estimate   | model       |
 | Xiaomi MiMo  | `mimo-v2.5`, `mimo-v2.5-pro`                                                | pinned official chat template and Tokenizer         | verified local      | text only   |
 | DeepSeek     | `deepseek-v4-pro`, `deepseek-v4-flash`                                      | pinned official V4 Prompt Encoder and Tokenizer     | verified local      | text only   |
-| Alibaba Qwen | `qwen3.8-max-preview`                                                       | pinned official Qwen3.8 chat template and Tokenizer | verified local      | text only   |
+| Alibaba Qwen | `qwen3.8-max`                                                               | pinned official Qwen3.8 chat template and Tokenizer | verified local      | text only   |
 
 For local counting, Omoikane first asks the OpenAI Agents SDK to compile the complete logical input into OpenAI-compatible messages and Tools. It then serializes system instructions, history, current input, Tool/Handoff schemas, Tool calls/results, and prompt-based structured-output instructions with the official model template before tokenization. Tokenizer repositories and Git revisions are returned in the capability and count response. Assets are downloaded from Hugging Face by immutable revision on first use and cached in memory; download or template failure is closed. These paths are `verified_local`, not Provider billing authority. Multimodal input is rejected because an open text Tokenizer cannot reproduce Provider-side image, audio, or video accounting.
 
@@ -246,28 +286,28 @@ GLM `glm-5.2`, xAI `grok-4.3`, the older Qwen catalog IDs, and other models rema
 
 Known values initialize Agent configuration and context-compaction thresholds. A user can still override `model_context_window` for a Deployment.
 
-| Provider      | Model examples                                 | Default context tokens | Note                                   |
-| ------------- | ---------------------------------------------- | ---------------------: | -------------------------------------- |
-| OpenAI        | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` |              1,050,000 | catalog default                        |
-| OpenAI        | `gpt-5.4`                                      |              1,050,000 | catalog default                        |
-| OpenAI        | `gpt-5.4-mini`                                 |                400,000 | catalog default                        |
-| Codex Bridge  | supported Codex models                         |            **258,400** | explicit local Bridge contract         |
-| Xiaomi MiMo   | `mimo-v2.5`, `mimo-v2.5-pro`                   |              1,048,576 | Token Plan and PAYG profiles           |
-| Xiaomi MiMo   | `mimo-v2.5-asr`, `mimo-v2.5-tts`               |                  8,192 | dedicated non-Agent audio adapters     |
-| Anthropic     | cataloged Claude Opus/Sonnet models            |        1,000,000 input | input-window value                     |
-| Anthropic     | cataloged Claude Haiku model                   |          200,000 input | input-window value                     |
-| Google        | cataloged Gemini 3 models                      |        1,000,000 input | output limit stored separately         |
-| xAI           | `grok-4.3`                                     |              1,000,000 | catalog default                        |
-| xAI           | `grok-4.5`                                     |                500,000 | catalog default                        |
-| Mistral       | large/small latest                             |                256,000 | catalog default                        |
-| Groq          | `openai/gpt-oss-120b` and related              |                131,072 | output limits vary                     |
-| DeepSeek      | cataloged v4 models                            |              1,000,000 | catalog default                        |
-| Alibaba Qwen  | cataloged Qwen 3 models                        |              1,000,000 | catalog default                        |
-| Zhipu         | `glm-5.2`                                      |              1,000,000 | other cataloged GLM models may be 200K |
-| Moonshot/Kimi | cataloged K2 models                            |                262,144 | catalog default                        |
-| MiniMax       | cataloged M2 models                            |                204,800 | catalog default                        |
-| StepFun       | Step 3.5 Flash                                 |                262,144 | catalog default                        |
-| Cohere        | Command A Plus                                 |                128,000 | Command A is cataloged separately      |
+| Provider      | Model examples                                                | Default context tokens | Note                                   |
+| ------------- | ------------------------------------------------------------- | ---------------------: | -------------------------------------- |
+| OpenAI        | `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` |              1,050,000 | catalog default                        |
+| OpenAI        | `gpt-5.4`                                                     |              1,050,000 | catalog default                        |
+| OpenAI        | `gpt-5.4-mini`                                                |                400,000 | catalog default                        |
+| Codex Bridge  | supported Codex models                                        |            **258,400** | explicit local Bridge contract         |
+| Xiaomi MiMo   | `mimo-v2.5`, `mimo-v2.5-pro`                                  |              1,048,576 | Token Plan and PAYG profiles           |
+| Xiaomi MiMo   | `mimo-v2.5-asr`, `mimo-v2.5-tts`                              |                  8,192 | dedicated non-Agent audio adapters     |
+| Anthropic     | cataloged Claude Opus/Sonnet models                           |        1,000,000 input | input-window value                     |
+| Anthropic     | cataloged Claude Haiku model                                  |          200,000 input | input-window value                     |
+| Google        | cataloged Gemini 3 models                                     |        1,000,000 input | output limit stored separately         |
+| xAI           | `grok-4.3`                                                    |              1,000,000 | catalog default                        |
+| xAI           | `grok-4.5`                                                    |                500,000 | catalog default                        |
+| Mistral       | large/small latest                                            |                256,000 | catalog default                        |
+| Groq          | `openai/gpt-oss-120b` and related                             |                131,072 | output limits vary                     |
+| DeepSeek      | cataloged v4 models                                           |              1,000,000 | catalog default                        |
+| Alibaba Qwen  | cataloged Qwen 3 models                                       |              1,000,000 | catalog default                        |
+| Zhipu         | `glm-5.2`                                                     |              1,000,000 | other cataloged GLM models may be 200K |
+| Moonshot/Kimi | cataloged K2 models                                           |                262,144 | catalog default                        |
+| MiniMax       | cataloged M2 models                                           |                204,800 | catalog default                        |
+| StepFun       | Step 3.5 Flash                                                |                262,144 | catalog default                        |
+| Cohere        | Command A Plus                                                |                128,000 | Command A is cataloged separately      |
 
 Resolution is:
 

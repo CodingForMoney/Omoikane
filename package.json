@@ -1,6 +1,6 @@
 {
   "name": "omoikane",
-  "version": "0.0.7",
+  "version": "0.0.10",
   "description": "Durable TypeScript Agent Runtime built on the OpenAI Agents SDK",
   "type": "module",
   "main": "./dist/index.js",
@@ -48,7 +48,7 @@
     "test:watch": "vitest",
     "test:postgres": "vitest run --config vitest.postgres.config.ts",
     "test:postgres:docker": "node --import tsx scripts/postgres-test.ts",
-    "test:mimo": "node --import tsx scripts/mimo-e2e.ts",
+    "test:mimo": "node --env-file=.env --import tsx scripts/mimo-e2e.ts",
     "test:e2e:structured-output": "node --import tsx scripts/structured-output-e2e.ts",
     "test:e2e:mimo": "vitest run --config vitest.e2e.config.ts test/e2e/mimo-runtime.e2e.test.ts",
     "test:e2e:mimo-audio": "node --env-file=.env --import tsx scripts/mimo-audio-e2e.ts",

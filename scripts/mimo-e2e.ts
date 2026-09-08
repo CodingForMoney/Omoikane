@@ -33,17 +33,22 @@ try {
     config: {
       name: "MiMo E2E",
       instructions:
-        "Answer concisely. Return one sentence confirming the runtime works.",
+        "Solve carefully, keep private reasoning private, and answer concisely.",
       provider: { connection_id: connection.id },
       model: "mimo-v2.5",
-      model_settings: { max_tokens: 1024, reasoning_effort: "none" },
+      model_settings: {
+        max_tokens: 1024,
+        reasoning_effort: "high",
+        reasoning: { summary: "auto" },
+      },
       compaction: { enabled: false },
     },
   });
   const created = await container.runner.create({
     deploymentId: deployment.id,
     externalSessionId: "mimo-smoke-session",
-    input: "Confirm that this Omoikane TypeScript runtime call succeeded.",
+    input:
+      "Find the smallest positive integer n such that n mod 5 = 1, n mod 7 = 3, and n mod 9 = 8. Return the answer and one short justification.",
     limits: { max_turns: 3, max_duration_seconds: 180 },
   });
   await container.runner.processNext();
@@ -51,6 +56,12 @@ try {
   if (run.status !== "completed") {
     throw new Error(`MiMo run failed: ${JSON.stringify(run.error_json)}`);
   }
+  const reasoningMetadata = await container.runner.reasoningMetadata(run.id);
+  if (
+    !reasoningMetadata.raw_reasoning_observed ||
+    !reasoningMetadata.attempts.some((attempt) => attempt.delta_count > 0)
+  )
+    throw new Error("MiMo returned no observable raw-reasoning metadata");
   process.stdout.write(
     `${JSON.stringify(
       {
@@ -58,6 +69,7 @@ try {
         model_count: validation.model_count,
         run_status: run.status,
         output: run.output,
+        reasoning_metadata: reasoningMetadata,
         new_item_count: (run.new_items as unknown[]).length,
         events: (await container.events.list(run.id)).map(
           (event) => event.type,

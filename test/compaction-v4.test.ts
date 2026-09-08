@@ -11,27 +11,37 @@ import {
   validateToolIntegrity,
 } from "../src/compaction/items.js";
 import { isContextOverflow } from "../src/compaction/runtime.js";
-import { CompactionAwareModel } from "../src/compaction/runtime.js";
-import type { Model, ModelRequest } from "@openai/agents";
+import {
+  CompactionAwareModel,
+  CompactionRunController,
+} from "../src/compaction/runtime.js";
+import type { AgentInputItem, Model, ModelRequest } from "@openai/agents";
 import type { PortableCheckpointV4 } from "../src/compaction/types.js";
+import { publishedAgent, testContainer } from "./helpers.js";
 
 describe("compaction v4 invariants", () => {
   it("keeps a function call and its output in one atomic unit", () => {
-    const items = [
+    const items: AgentInputItem[] = [
       { role: "user", content: "inspect the file" },
       {
         type: "function_call",
-        call_id: "call-42",
+        callId: "call-42",
         name: "read_file",
         arguments: '{"path":"/tmp/demo.txt"}',
       },
       {
-        type: "function_call_output",
-        call_id: "call-42",
-        output: "contents",
+        type: "function_call_result",
+        callId: "call-42",
+        name: "read_file",
+        status: "completed",
+        output: { type: "text", text: "contents" },
       },
-      { role: "assistant", content: "done" },
-    ] as never[];
+      {
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: "done" }],
+      },
+    ];
     const plan = planCompactionUnits(items);
     expect(plan.orphan_tool_results).toEqual([]);
     expect(plan.units[1]).toMatchObject({
@@ -45,32 +55,104 @@ describe("compaction v4 invariants", () => {
     });
   });
 
+  it("keeps parallel function calls and their results in one atomic unit", () => {
+    const items: AgentInputItem[] = [
+      {
+        type: "function_call",
+        callId: "parallel-a",
+        name: "fetch",
+        arguments: '{"page":1}',
+      },
+      {
+        type: "function_call",
+        callId: "parallel-b",
+        name: "fetch",
+        arguments: '{"page":2}',
+      },
+      {
+        type: "function_call_result",
+        callId: "parallel-a",
+        name: "fetch",
+        status: "completed",
+        output: "A",
+      },
+      {
+        type: "function_call_result",
+        callId: "parallel-b",
+        name: "fetch",
+        status: "completed",
+        output: "B",
+      },
+    ];
+    const plan = planCompactionUnits(items);
+    expect(plan).toMatchObject({
+      orphan_tool_results: [],
+      units: [
+        {
+          kind: "tool_transaction",
+          from_index: 0,
+          to_index: 3,
+          unresolved_tool_call: false,
+        },
+      ],
+    });
+    expect(validateToolIntegrity(items)).toEqual({
+      valid: true,
+      orphan_results: [],
+      unresolved_calls: [],
+    });
+  });
+
   it("prunes only old or duplicate large tool results and keeps evidence", () => {
     const repeated = `RESULT-${"x".repeat(6_000)}`;
-    const items = [
-      { type: "function_call", call_id: "a", name: "fetch", arguments: "{}" },
-      { type: "function_call_output", call_id: "a", output: repeated },
-      { type: "function_call", call_id: "b", name: "fetch", arguments: "{}" },
-      { type: "function_call_output", call_id: "b", output: repeated },
-      { type: "function_call", call_id: "c", name: "fetch", arguments: "{}" },
+    const items: AgentInputItem[] = [
+      { type: "function_call", callId: "a", name: "fetch", arguments: "{}" },
       {
-        type: "function_call_output",
-        call_id: "c",
-        output: `LATEST-${"y".repeat(6_000)}`,
+        type: "function_call_result",
+        callId: "a",
+        name: "fetch",
+        status: "completed",
+        output: repeated,
       },
-    ] as never[];
+      { type: "function_call", callId: "b", name: "fetch", arguments: "{}" },
+      {
+        type: "function_call_result",
+        callId: "b",
+        name: "fetch",
+        status: "completed",
+        output: { type: "text", text: repeated },
+      },
+      { type: "function_call", callId: "c", name: "fetch", arguments: "{}" },
+      {
+        type: "function_call_result",
+        callId: "c",
+        name: "fetch",
+        status: "completed",
+        output: [{ type: "input_text", text: `LATEST-${"y".repeat(6_000)}` }],
+      },
+    ];
     const result = pruneToolResults(items, {
       keepRecentResults: 1,
       minReclaimTokens: 1,
     });
     expect(result.committed).toBe(true);
     expect(result.pruned_count).toBe(2);
-    expect(JSON.stringify(result.items[1])).toContain("sha256=");
+    expect(result.items[1]).toMatchObject({
+      type: "function_call_result",
+      callId: "a",
+      name: "fetch",
+      status: "completed",
+      output: expect.stringContaining("sha256="),
+    });
+    expect(result.items[3]).toMatchObject({
+      type: "function_call_result",
+      output: { type: "text", text: expect.stringContaining("sha256=") },
+    });
     expect(JSON.stringify(result.items.at(-1))).toContain("LATEST-");
   });
 
   it("extracts deterministic anchors, user excerpts, and tool ledger", () => {
-    const items = [
+    const items: AgentInputItem[] = [
       {
         role: "user",
         content:
@@ -78,12 +160,18 @@ describe("compaction v4 invariants", () => {
       },
       {
         type: "function_call",
-        call_id: "call-99",
+        callId: "call-99",
         name: "edit",
         arguments: "{}",
       },
-      { type: "function_call_output", call_id: "call-99", output: "completed" },
-    ] as never[];
+      {
+        type: "function_call_result",
+        callId: "call-99",
+        name: "edit",
+        status: "completed",
+        output: "completed",
+      },
+    ];
     expect(extractAnchors(items).map((entry) => entry.kind)).toEqual(
       expect.arrayContaining(["issue", "file", "version", "uuid", "call_id"]),
     );
@@ -197,5 +285,94 @@ describe("compaction v4 invariants", () => {
     expect(calls).toBe(2);
     expect(prepared).toHaveLength(2);
     expect(prepared[1]!.input).not.toEqual(prepared[0]!.input);
+  });
+
+  it("persists compaction attempts and native fallback diagnostics on failure", async () => {
+    const test = await testContainer();
+    try {
+      const fixture = await publishedAgent(test.container);
+      const run = await test.container.runner.create({
+        deploymentId: fixture.version.id,
+        input: "diagnose failed compaction",
+      });
+      const failure = Object.assign(new Error("portable compaction failed"), {
+        nativeFallback: "HTTP_400",
+      });
+      const service = {
+        evaluate: async () => ({
+          should_compact: true,
+          reason: "high_watermark_reached",
+          state: "high",
+          estimated_tokens: 140_162,
+          effective_input_budget_tokens: 200_000,
+          reserved_output_tokens: 16_000,
+          safety_margin_tokens: 2_000,
+          request_overhead_tokens: 500,
+          high_watermark_tokens: 130_000,
+          low_watermark_tokens: 90_000,
+          emergency_watermark_tokens: 180_000,
+        }),
+        compact: async () => {
+          throw failure;
+        },
+      };
+      const controller = new CompactionRunController(
+        run.id,
+        test.container.db,
+        test.container.events,
+        service as never,
+      );
+      const request = {
+        input: [
+          { role: "user", content: "one" },
+          {
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: "two" }],
+          },
+          { role: "user", content: "three" },
+          {
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: "four" }],
+          },
+        ],
+        systemInstructions: "",
+        modelSettings: {},
+        tools: [],
+        handoffs: [],
+        outputType: "text",
+        tracing: false,
+      } as ModelRequest;
+
+      await expect(
+        controller.prepare(request, {
+          compaction: { enabled: true, strategy: "auto" },
+        }),
+      ).rejects.toBe(failure);
+
+      const persisted = await test.container.runner.get(run.id);
+      expect(persisted.compaction_state_json).toMatchObject({
+        attempts: 1,
+        last_failure_code: "Error",
+      });
+      const events = await test.container.events.list(run.id);
+      expect(events.map((event) => event.type)).toEqual(
+        expect.arrayContaining([
+          "context.compaction_started",
+          "context.compaction_failed",
+        ]),
+      );
+      expect(
+        events.find((event) => event.type === "context.compaction_failed")
+          ?.payload_json,
+      ).toMatchObject({
+        attempt: 1,
+        native_fallback: "HTTP_400",
+        message: "portable compaction failed",
+      });
+    } finally {
+      await test.close();
+    }
   });
 });

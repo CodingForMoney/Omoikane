@@ -15,6 +15,18 @@ let container: Container | undefined;
 let cleanup: (() => Promise<void>) | undefined;
 const registered = new Set<string>();
 
+const reasoningSummary = (text: string) => ({
+  type: "reasoning" as const,
+  id: "guardrail-reasoning",
+  content: [
+    {
+      type: "input_text" as const,
+      text,
+      providerData: { type: "summary_text" },
+    },
+  ],
+});
+
 const register = (
   key: string,
   implementation: Parameters<typeof registerGuardrailImplementation>[1],
@@ -162,8 +174,12 @@ describe("Guardrail runtime contract", () => {
     container = test.container;
     cleanup = test.close;
     const rejected = "TOP_SECRET_OUTPUT";
+    const rejectedSummary = "TOP_SECRET_REASONING_SUMMARY";
     const model = new ScriptedModel([
-      modelResponse([assistantMessage(rejected)]),
+      modelResponse([
+        reasoningSummary(rejectedSummary),
+        assistantMessage(rejected),
+      ]),
     ]);
     const fixture = await publishedAgent(container, {
       model,
@@ -200,6 +216,7 @@ describe("Guardrail runtime contract", () => {
       false,
     );
     expect(JSON.stringify(events)).not.toContain(rejected);
+    expect(JSON.stringify(events)).not.toContain(rejectedSummary);
     const message = events.find(
       (event) => event.type === "message_output_created",
     );
@@ -215,8 +232,12 @@ describe("Guardrail runtime contract", () => {
     cleanup = test.close;
     register("test.output-allow", () => ({ decision: "allow" }));
     const accepted = "accepted output";
+    const acceptedSummary = "accepted public summary";
     const model = new ScriptedModel([
-      modelResponse([assistantMessage(accepted)]),
+      modelResponse([
+        reasoningSummary(acceptedSummary),
+        assistantMessage(accepted),
+      ]),
     ]);
     const fixture = await publishedAgent(container, {
       model,
@@ -250,18 +271,37 @@ describe("Guardrail runtime contract", () => {
       provisional: false,
       buffered: true,
     });
+    const summary = events.filter(
+      (event) => event.type === "model.reasoning_summary_completed",
+    );
+    expect(summary).toHaveLength(1);
+    expect(
+      events.some((event) => event.type === "model.reasoning_summary_delta"),
+    ).toBe(false);
+    expect(summary[0]?.payload_json).toMatchObject({
+      text: acceptedSummary,
+      source: "reasoning_item",
+      execution_attempt: 1,
+      provisional: false,
+      buffered: true,
+    });
     const passed = events.findIndex(
       (event) => event.type === "guardrail.passed",
     );
     const published = events.findIndex(
       (event) => event.type === "model.output_delta",
     );
+    const summaryPublished = events.findIndex(
+      (event) => event.type === "model.reasoning_summary_completed",
+    );
     const terminal = events.findIndex(
       (event) => event.type === "run.completed",
     );
     expect(passed).toBeGreaterThanOrEqual(0);
     expect(published).toBeGreaterThan(passed);
+    expect(summaryPublished).toBeGreaterThan(passed);
     expect(terminal).toBeGreaterThan(published);
+    expect(terminal).toBeGreaterThan(summaryPublished);
   });
 
   it("applies bounded timeout and explicit fail-open/fail-closed behavior", async () => {

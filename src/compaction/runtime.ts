@@ -152,6 +152,7 @@ export class CompactionRunController {
 
   private async persist(
     projection: Record<string, unknown> | null,
+    eventType?: string,
     event?: Record<string, unknown>,
   ): Promise<void> {
     await this.db.transaction(async (tx) => {
@@ -159,13 +160,8 @@ export class CompactionRunController {
         "UPDATE runs SET projection_json=$2::jsonb,compaction_state_json=$3::jsonb,updated_at=now() WHERE id=$1",
         [this.runId, JSON.stringify(projection), JSON.stringify(this.state)],
       );
-      if (event)
-        await this.events.appendInTransaction(
-          tx,
-          this.runId,
-          "context.compacted",
-          event,
-        );
+      if (eventType && event)
+        await this.events.appendInTransaction(tx, this.runId, eventType, event);
     });
   }
 
@@ -202,17 +198,49 @@ export class CompactionRunController {
       return { ...request, input };
     this.state.attempts += 1;
     this.state.last_input_checksum = checksum;
-    const compacted = await this.service.compact(input, config, {
-      force: true,
-      decision,
-      requestOverheadTokens: overhead,
+    await this.persist(this.latestProjection, "context.compaction_started", {
       trigger,
-      runId: this.runId,
-      sourceProjection: this.projection as Record<string, unknown> | undefined,
-      recoveryRef: { run_id: this.runId },
-      revision: this.state.revision + 1,
-      signal: request.signal,
+      attempt: this.state.attempts,
+      input_checksum: checksum,
+      estimated_input_tokens: decision.estimated_tokens,
+      requested_strategy: String(
+        (config.compaction as Record<string, unknown> | undefined)?.strategy ??
+          "auto",
+      ),
     });
+    let compacted;
+    try {
+      compacted = await this.service.compact(input, config, {
+        force: true,
+        decision,
+        requestOverheadTokens: overhead,
+        trigger,
+        runId: this.runId,
+        sourceProjection: this.projection as
+          Record<string, unknown> | undefined,
+        recoveryRef: { run_id: this.runId },
+        revision: this.state.revision + 1,
+        signal: request.signal,
+      });
+    } catch (error) {
+      const failure = asRecord(error);
+      this.state.last_failure_code = String(
+        failure?.code ?? (error instanceof Error ? error.name : "Error"),
+      );
+      await this.persist(this.latestProjection, "context.compaction_failed", {
+        trigger,
+        attempt: this.state.attempts,
+        error_code: this.state.last_failure_code,
+        ...(typeof failure?.nativeFallback === "string"
+          ? { native_fallback: failure.nativeFallback }
+          : {}),
+        message:
+          error instanceof Error
+            ? error.message.slice(0, 1_024)
+            : String(error).slice(0, 1_024),
+      });
+      throw error;
+    }
     if (compacted.status !== "completed" || !compacted.projection)
       return { ...request, input };
     this.projection = compacted.projection as unknown as Record<
@@ -223,9 +251,18 @@ export class CompactionRunController {
       compacted.projection.revision ?? this.state.revision + 1,
     );
     this.state.last_projection_id = compacted.id;
+    this.state.last_failure_code = undefined;
     this.state.last_effective_input_tokens = decision.estimated_tokens;
     this.state.verification_pending = true;
-    await this.persist(this.latestProjection, {
+    const nativeFallback = compacted.metrics_json?.native_fallback;
+    if (typeof nativeFallback === "string")
+      await this.events.append(this.runId, "context.compaction_fallback", {
+        trigger,
+        attempt: this.state.attempts,
+        native_failure_code: nativeFallback,
+        selected_strategy: compacted.strategy,
+      });
+    await this.persist(this.latestProjection, "context.compacted", {
       compaction_id: compacted.id,
       trigger,
       revision: this.state.revision,

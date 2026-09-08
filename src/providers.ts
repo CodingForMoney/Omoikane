@@ -31,6 +31,10 @@ import {
   countWithOfficialTokenizer,
   localTokenizerRequestHasMultimodalInput,
 } from "./local-tokenizers.js";
+import {
+  ReasoningCompatibleModel,
+  withChatReasoningReplayField,
+} from "./reasoning-model.js";
 
 export type ProviderProtocol =
   "responses" | "chat_completions" | "anthropic" | "google_gemini";
@@ -88,7 +92,7 @@ interface ProviderOperationError {
   message: string;
 }
 
-const CATALOG_REVIEWED_AT = "2026-08-30";
+const CATALOG_REVIEWED_AT = "2026-09-05";
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 15_000;
 const DEFAULT_DISCOVERY_MAX_RETRIES = 2;
 const MAX_DISCOVERY_PAGES = 100;
@@ -143,7 +147,7 @@ interface CapturedWireRequest {
 }
 
 class InputCountingOpenAIResponsesModel extends OpenAIResponsesModel {
-  buildCountRequest(request: ModelRequest): Record<string, unknown> {
+  buildWireRequest(request: ModelRequest): Record<string, unknown> {
     return this._buildResponsesCreateRequest(request, false).requestData;
   }
 }
@@ -290,7 +294,18 @@ function validatedProtocol(value: unknown): ProviderProtocol {
 
 const noReasoning = (): ReasoningCapability => ({
   supported: false,
+  activation: "none",
+  visibility: "none",
+  controls: {
+    toggle: false,
+    effort: false,
+    budget_tokens: false,
+    summary: false,
+  },
   effort_values: [],
+  summary_values: [],
+  request_adapters: [],
+  replay: "none",
 });
 const noContextCompaction = (): ContextCompactionCapability => ({
   supported: false,
@@ -325,13 +340,77 @@ const responsesCompaction = (): ContextCompactionCapability => ({
   supported: true,
   method: "responses_compact",
 });
-const standard = (
+type ReasoningOptions = Omit<Partial<ReasoningCapability>, "controls"> & {
+  controls?: Partial<ReasoningCapability["controls"]>;
+};
+const reasoning = (options: ReasoningOptions = {}): ReasoningCapability => {
+  const { controls, ...rest } = options;
+  return {
+    supported: true,
+    activation: "optional",
+    visibility: "provider_trace",
+    controls: {
+      toggle: false,
+      effort: false,
+      budget_tokens: false,
+      summary: false,
+      ...(controls ?? {}),
+    },
+    effort_values: [],
+    summary_values: [],
+    request_adapters: [],
+    response_adapter: "chat_reasoning_fields",
+    replay: "reasoning_item",
+    ...rest,
+  };
+};
+const responsesReasoning = (
   effort_values = ["none", "low", "medium", "high", "xhigh"],
-): ReasoningCapability => ({
-  supported: true,
-  adapter: "reasoning_effort",
-  effort_values,
-});
+  options: ReasoningOptions = {},
+): ReasoningCapability => {
+  const { controls, ...rest } = options;
+  return reasoning({
+    activation: "optional",
+    visibility: "summary",
+    controls: {
+      toggle: effort_values.includes("none"),
+      effort: true,
+      budget_tokens: false,
+      summary: true,
+      ...(controls ?? {}),
+    },
+    effort_values,
+    summary_values:
+      controls?.summary === false
+        ? []
+        : ["auto", "concise", "detailed", "none"],
+    request_adapters: ["responses_reasoning"],
+    response_adapter: "responses_reasoning",
+    replay: "provider_managed",
+    adapter: "reasoning_effort",
+    native_summary: "supported",
+    ...rest,
+  });
+};
+const chatEffortReasoning = (
+  effort_values: string[],
+  options: ReasoningOptions = {},
+): ReasoningCapability => {
+  const { controls, ...rest } = options;
+  return reasoning({
+    controls: {
+      toggle: effort_values.includes("none"),
+      effort: true,
+      budget_tokens: false,
+      summary: false,
+      ...(controls ?? {}),
+    },
+    effort_values,
+    request_adapters: ["chat_reasoning_effort"],
+    adapter: "reasoning_effort",
+    ...rest,
+  });
+};
 const noModelTasks = (): ModelTaskCapability => ({
   image_understanding: "none",
   transcription: "none",
@@ -432,6 +511,23 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "https://api.openai.com/v1",
         "responses",
         [
+          model("gpt-6-astra", 1_050_000, {
+            max_output_tokens: 128_000,
+            input_token_counting: providerInputTokenCounting(
+              "openai_responses_input_tokens",
+              "authoritative_exact",
+            ),
+            vision: true,
+            structured_output: "native",
+            context_compaction: responsesCompaction(),
+            reasoning: responsesReasoning([
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max",
+            ]),
+          }),
           model("gpt-5.6-sol", 1_050_000, {
             max_output_tokens: 128_000,
             input_token_counting: providerInputTokenCounting(
@@ -441,7 +537,7 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
             vision: true,
             structured_output: "native",
             context_compaction: responsesCompaction(),
-            reasoning: standard([
+            reasoning: responsesReasoning([
               "none",
               "low",
               "medium",
@@ -459,7 +555,7 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
             vision: true,
             structured_output: "native",
             context_compaction: responsesCompaction(),
-            reasoning: standard([
+            reasoning: responsesReasoning([
               "none",
               "low",
               "medium",
@@ -477,7 +573,7 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
             vision: true,
             structured_output: "native",
             context_compaction: responsesCompaction(),
-            reasoning: standard([
+            reasoning: responsesReasoning([
               "none",
               "low",
               "medium",
@@ -495,14 +591,14 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
             vision: true,
             structured_output: "native",
             context_compaction: responsesCompaction(),
-            reasoning: standard(),
+            reasoning: responsesReasoning(),
           }),
           model("gpt-5.4-mini", 400_000, {
             max_output_tokens: 128_000,
             vision: true,
             structured_output: "native",
             context_compaction: responsesCompaction(),
-            reasoning: standard(),
+            reasoning: responsesReasoning(),
           }),
         ],
       ),
@@ -513,33 +609,35 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "http://127.0.0.1:3456/v1",
         "responses",
         [
+          model("gpt-6-astra", 258_400, {
+            max_output_tokens: 128_000,
+            vision: true,
+            structured_output: "native",
+            context_compaction: responsesCompaction(),
+            reasoning: responsesReasoning(
+              ["none", "low", "medium", "high", "xhigh", "max"],
+              { summary_values: ["auto"] },
+            ),
+          }),
           model("gpt-5.6-sol", 258_400, {
             max_output_tokens: 128_000,
             vision: true,
             structured_output: "native",
             context_compaction: responsesCompaction(),
-            reasoning: standard([
-              "none",
-              "low",
-              "medium",
-              "high",
-              "xhigh",
-              "max",
-            ]),
+            reasoning: responsesReasoning(
+              ["none", "low", "medium", "high", "xhigh", "max"],
+              { summary_values: ["auto"] },
+            ),
           }),
           model("gpt-5.6-luna", 258_400, {
             max_output_tokens: 128_000,
             vision: true,
             structured_output: "native",
             context_compaction: responsesCompaction(),
-            reasoning: standard([
-              "none",
-              "low",
-              "medium",
-              "high",
-              "xhigh",
-              "max",
-            ]),
+            reasoning: responsesReasoning(
+              ["none", "low", "medium", "high", "xhigh", "max"],
+              { summary_values: ["auto"] },
+            ),
           }),
         ],
         {
@@ -566,6 +664,15 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
               "anthropic_messages_count_tokens",
               "provider_estimate",
             ),
+            reasoning: reasoning({
+              activation: "default",
+              visibility: "summary",
+              controls: { toggle: true, summary: true },
+              request_adapters: ["anthropic_adaptive_thinking"],
+              response_adapter: "ai_sdk_reasoning",
+              summary_values: ["auto", "none"],
+              native_summary: "supported",
+            }),
           }),
           model("claude-sonnet-5", 1_000_000, {
             max_input_tokens: 1_000_000,
@@ -575,6 +682,15 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
               "anthropic_messages_count_tokens",
               "provider_estimate",
             ),
+            reasoning: reasoning({
+              activation: "default",
+              visibility: "summary",
+              controls: { toggle: true, summary: true },
+              request_adapters: ["anthropic_adaptive_thinking"],
+              response_adapter: "ai_sdk_reasoning",
+              summary_values: ["auto", "none"],
+              native_summary: "supported",
+            }),
           }),
           model("claude-opus-4-6", 1_000_000, {
             max_input_tokens: 1_000_000,
@@ -584,6 +700,14 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
               "anthropic_messages_count_tokens",
               "provider_estimate",
             ),
+            reasoning: reasoning({
+              visibility: "summary",
+              controls: { toggle: true, summary: true },
+              request_adapters: ["anthropic_adaptive_thinking"],
+              response_adapter: "ai_sdk_reasoning",
+              summary_values: ["auto", "none"],
+              native_summary: "supported",
+            }),
           }),
           model("claude-sonnet-4-6", 1_000_000, {
             max_input_tokens: 1_000_000,
@@ -593,11 +717,30 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
               "anthropic_messages_count_tokens",
               "provider_estimate",
             ),
+            reasoning: reasoning({
+              visibility: "summary",
+              controls: { toggle: true, summary: true },
+              request_adapters: ["anthropic_adaptive_thinking"],
+              response_adapter: "ai_sdk_reasoning",
+              summary_values: ["auto", "none"],
+              native_summary: "supported",
+            }),
           }),
           model("claude-haiku-4-5-20251001", 200_000, {
             max_input_tokens: 200_000,
             context_window_type: "input",
             vision: true,
+            reasoning: reasoning({
+              visibility: "summary",
+              controls: {
+                toggle: true,
+                budget_tokens: true,
+              },
+              request_adapters: ["anthropic_budget_thinking"],
+              response_adapter: "ai_sdk_reasoning",
+              default_budget_tokens: 2_048,
+              native_summary: "supported",
+            }),
           }),
         ],
       ),
@@ -621,6 +764,16 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
               "gemini_count_tokens",
               "provider_estimate",
             ),
+            reasoning: reasoning({
+              activation: "default",
+              visibility: "summary",
+              controls: { effort: true, summary: true },
+              effort_values: ["minimal", "low", "medium", "high"],
+              request_adapters: ["google_thinking"],
+              response_adapter: "ai_sdk_reasoning",
+              summary_values: ["auto", "none"],
+              native_summary: "supported",
+            }),
           }),
           model("gemini-3-flash-preview", 1_000_000, {
             max_input_tokens: 1_000_000,
@@ -635,6 +788,16 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
               "gemini_count_tokens",
               "provider_estimate",
             ),
+            reasoning: reasoning({
+              activation: "default",
+              visibility: "summary",
+              controls: { effort: true, summary: true },
+              effort_values: ["minimal", "low", "medium", "high"],
+              request_adapters: ["google_thinking"],
+              response_adapter: "ai_sdk_reasoning",
+              summary_values: ["auto", "none"],
+              native_summary: "supported",
+            }),
           }),
           model("gemini-3.1-flash-lite", 1_000_000, {
             max_input_tokens: 1_000_000,
@@ -649,6 +812,16 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
               "gemini_count_tokens",
               "provider_estimate",
             ),
+            reasoning: reasoning({
+              activation: "default",
+              visibility: "summary",
+              controls: { effort: true, summary: true },
+              effort_values: ["minimal", "low", "medium", "high"],
+              request_adapters: ["google_thinking"],
+              response_adapter: "ai_sdk_reasoning",
+              summary_values: ["auto", "none"],
+              native_summary: "supported",
+            }),
           }),
         ],
       ),
@@ -662,6 +835,11 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
           model("command-a-plus-05-2026", 128_000, {
             max_output_tokens: 64_000,
             vision: true,
+            reasoning: reasoning({
+              controls: { toggle: true, budget_tokens: true },
+              request_adapters: ["chat_cohere_thinking"],
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
           }),
           model("command-a-03-2025", 256_000),
         ],
@@ -673,8 +851,23 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "https://api.x.ai/v1",
         "chat_completions",
         [
-          model("grok-4.3", 1_000_000, { vision: true }),
-          model("grok-4.5", 500_000, { vision: true }),
+          model("grok-4.3", 1_000_000, {
+            vision: true,
+            reasoning: chatEffortReasoning(["none", "low", "medium", "high"], {
+              visibility: "none",
+              response_adapter: undefined,
+              replay: "none",
+            }),
+          }),
+          model("grok-4.5", 500_000, {
+            vision: true,
+            reasoning: chatEffortReasoning(["low", "medium", "high"], {
+              activation: "default",
+              visibility: "none",
+              response_adapter: undefined,
+              replay: "none",
+            }),
+          }),
           model("grok-build-0.1", 256_000, { vision: true }),
         ],
       ),
@@ -686,7 +879,13 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "chat_completions",
         [
           model("mistral-large-latest", 256_000, { vision: true }),
-          model("mistral-small-latest", 256_000, { vision: true }),
+          model("mistral-small-latest", 256_000, {
+            vision: true,
+            reasoning: chatEffortReasoning(["none", "high"], {
+              response_adapter: "mistral_content_chunks",
+              raw_trace_metadata: "mistral_think_chunk",
+            }),
+          }),
           model("codestral-latest", 128_000),
         ],
       ),
@@ -697,13 +896,36 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "https://api.groq.com/openai/v1",
         "chat_completions",
         [
-          model("openai/gpt-oss-120b", 131_072, { max_output_tokens: 65_536 }),
+          model("openai/gpt-oss-120b", 131_072, {
+            max_output_tokens: 65_536,
+            reasoning: chatEffortReasoning(["low", "medium", "high"], {
+              activation: "default",
+              request_adapters: [
+                "chat_reasoning_effort",
+                "chat_reasoning_format",
+              ],
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
+          }),
           model("qwen/qwen3.6-27b", 131_072, {
             max_output_tokens: 16_384,
             vision: true,
+            reasoning: chatEffortReasoning(["none", "default"], {
+              controls: { toggle: true },
+              request_adapters: [
+                "chat_reasoning_effort",
+                "chat_reasoning_format",
+              ],
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
           }),
           model("minimaxai/minimax-m2.7", 196_608, {
             max_output_tokens: 131_072,
+            reasoning: reasoning({
+              activation: "always",
+              request_adapters: ["chat_reasoning_format"],
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
           }),
         ],
       ),
@@ -715,9 +937,17 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "chat_completions",
         [
           model("openai/gpt-oss-120b", 131_072, {
-            reasoning: standard(["low", "medium", "high"]),
+            reasoning: chatEffortReasoning(["low", "medium", "high"], {
+              activation: "default",
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
           }),
-          model("openai/gpt-oss-20b", 131_072),
+          model("openai/gpt-oss-20b", 131_072, {
+            reasoning: chatEffortReasoning(["low", "medium", "high"], {
+              activation: "default",
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
+          }),
         ],
       ),
       provider(
@@ -736,7 +966,16 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "chat_completions",
         [
           model("sonar", 128_000, { vision: true }),
-          model("sonar-pro", 200_000, { vision: true }),
+          model("sonar-pro", 200_000, {
+            vision: true,
+            reasoning: reasoning({
+              activation: "default",
+              visibility: "service_steps",
+              response_adapter: "service_reasoning_steps",
+              raw_trace_metadata: "service_reasoning_steps",
+              replay: "none",
+            }),
+          }),
         ],
       ),
       provider(
@@ -745,7 +984,19 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "US",
         "https://api.cerebras.ai/v1",
         "chat_completions",
-        [model("gpt-oss-120b", 131_072, { max_output_tokens: 40_960 })],
+        [
+          model("gpt-oss-120b", 131_072, {
+            max_output_tokens: 40_960,
+            reasoning: chatEffortReasoning(["low", "medium", "high"], {
+              activation: "default",
+              request_adapters: [
+                "chat_reasoning_effort",
+                "chat_reasoning_format",
+              ],
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
+          }),
+        ],
       ),
       provider(
         "xiaomi_mimo",
@@ -765,7 +1016,12 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
               image_understanding: "native",
               transcription: "general",
             },
-            reasoning: standard(["none", "high"]),
+            reasoning: responsesReasoning(["none", "high"], {
+              visibility: "provider_trace",
+              controls: { summary: false },
+              raw_trace_metadata: "responses_reasoning_text",
+              native_summary: "not_observed",
+            }),
           }),
           model("mimo-v2.5-pro", 1_048_576, {
             max_output_tokens: 131_072,
@@ -773,7 +1029,12 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
               "XiaomiMiMo/MiMo-V2.5-Pro",
               "21d1ecfecd7bd70f31be25ca49d7edd21f003659",
             ),
-            reasoning: standard(["none", "high"]),
+            reasoning: responsesReasoning(["none", "high"], {
+              visibility: "provider_trace",
+              controls: { summary: false },
+              raw_trace_metadata: "responses_reasoning_text",
+              native_summary: "not_observed",
+            }),
           }),
           model("mimo-v2.5-asr", 8_192, {
             model_kind: "transcription",
@@ -822,14 +1083,28 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
               "deepseek-ai/DeepSeek-V4-Pro",
               "b5968e9190ef611bbf34a7229255be88a0e937c1",
             ),
-            reasoning: standard(["low", "high", "max"]),
+            reasoning: responsesReasoning(["low", "high", "max"], {
+              visibility: "provider_trace",
+              controls: { toggle: true, summary: false },
+              request_adapters: ["responses_reasoning", "responses_thinking"],
+              raw_trace_metadata: "responses_reasoning_text",
+              native_summary: "not_observed",
+              replay: "reasoning_item",
+            }),
           }),
           model("deepseek-v4-flash", 1_000_000, {
             input_token_counting: localTokenizerInputCounting(
               "deepseek-ai/DeepSeek-V4-Flash",
               "60d8d70770c6776ff598c94bb586a859a38244f1",
             ),
-            reasoning: standard(["low", "high", "max"]),
+            reasoning: responsesReasoning(["low", "high", "max"], {
+              visibility: "provider_trace",
+              controls: { toggle: true, summary: false },
+              request_adapters: ["responses_reasoning", "responses_thinking"],
+              raw_trace_metadata: "responses_reasoning_text",
+              native_summary: "not_observed",
+              replay: "reasoning_item",
+            }),
           }),
         ],
       ),
@@ -840,15 +1115,34 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "chat_completions",
         [
-          model("qwen3.8-max-preview", 1_000_000, {
+          model("qwen3.8-max", 1_000_000, {
             vision: true,
             input_token_counting: localTokenizerInputCounting(
               "Qwen/Qwen3.8-2.4T-A95B",
               "207bd685a7e3696cfaff12ded7c6a7ea0f88c996",
             ),
+            reasoning: reasoning({
+              controls: { toggle: true },
+              request_adapters: ["chat_enable_thinking"],
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
           }),
-          model("qwen3.7-max", 1_000_000, { vision: true }),
-          model("qwen3.7-plus", 1_000_000, { vision: true }),
+          model("qwen3.7-max", 1_000_000, {
+            vision: true,
+            reasoning: reasoning({
+              controls: { toggle: true },
+              request_adapters: ["chat_enable_thinking"],
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
+          }),
+          model("qwen3.7-plus", 1_000_000, {
+            vision: true,
+            reasoning: reasoning({
+              controls: { toggle: true },
+              request_adapters: ["chat_enable_thinking"],
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
+          }),
           model("qwen3.6-flash", 1_000_000, { vision: true }),
         ],
       ),
@@ -859,10 +1153,50 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "https://open.bigmodel.cn/api/paas/v4",
         "chat_completions",
         [
-          model("glm-5.2", 1_000_000, { max_output_tokens: 128_000 }),
-          model("glm-5.1", 200_000, { max_output_tokens: 128_000 }),
-          model("glm-5", 200_000, { max_output_tokens: 128_000 }),
-          model("glm-4.7", 200_000, { max_output_tokens: 128_000 }),
+          model("glm-5.2", 1_000_000, {
+            max_output_tokens: 128_000,
+            reasoning: chatEffortReasoning(
+              ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+              {
+                controls: { toggle: true },
+                request_adapters: ["chat_reasoning_effort", "chat_thinking"],
+                value_map: {
+                  none: "none",
+                  minimal: "minimal",
+                  low: "high",
+                  medium: "high",
+                  high: "high",
+                  xhigh: "max",
+                  max: "max",
+                },
+                raw_trace_metadata: "chat_reasoning_fields",
+              },
+            ),
+          }),
+          model("glm-5.1", 200_000, {
+            max_output_tokens: 128_000,
+            reasoning: reasoning({
+              controls: { toggle: true },
+              request_adapters: ["chat_thinking"],
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
+          }),
+          model("glm-5", 200_000, {
+            max_output_tokens: 128_000,
+            reasoning: reasoning({
+              controls: { toggle: true },
+              request_adapters: ["chat_thinking"],
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
+          }),
+          model("glm-4.7", 200_000, {
+            max_output_tokens: 128_000,
+            reasoning: reasoning({
+              controls: { toggle: true },
+              request_adapters: ["chat_thinking"],
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
+          }),
         ],
       ),
       provider(
@@ -872,9 +1206,29 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "https://api.moonshot.cn/v1",
         "chat_completions",
         [
-          model("kimi-k2.7-code", 262_144),
-          model("kimi-k2.6", 262_144, { vision: true }),
-          model("kimi-k2.5", 262_144, { vision: true }),
+          model("kimi-k2.7-code", 262_144, {
+            reasoning: reasoning({
+              activation: "always",
+              request_adapters: ["chat_kimi_thinking"],
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
+          }),
+          model("kimi-k2.6", 262_144, {
+            vision: true,
+            reasoning: reasoning({
+              controls: { toggle: true },
+              request_adapters: ["chat_kimi_thinking"],
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
+          }),
+          model("kimi-k2.5", 262_144, {
+            vision: true,
+            reasoning: reasoning({
+              controls: { toggle: true },
+              request_adapters: ["chat_kimi_thinking"],
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
+          }),
         ],
         {
           cn: {
@@ -896,7 +1250,16 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "https://ark.cn-beijing.volces.com/api/v3",
         "responses",
         [
-          model("doubao-seed-2-0-lite-260215", undefined, { vision: true }),
+          model("doubao-seed-2-0-lite-260215", undefined, {
+            vision: true,
+            reasoning: reasoning({
+              controls: { toggle: true },
+              request_adapters: ["responses_thinking"],
+              response_adapter: "responses_reasoning",
+              raw_trace_metadata: "responses_reasoning_text",
+              replay: "reasoning_item",
+            }),
+          }),
           model("ark-code-latest", undefined, { model_kind: "routing" }),
         ],
       ),
@@ -908,7 +1271,12 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "chat_completions",
         [
           model("ernie-4.5-turbo-128k", 128_000),
-          model("ernie-x1.1-preview", 64_000),
+          model("ernie-x1.1-preview", 64_000, {
+            reasoning: reasoning({
+              activation: "always",
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
+          }),
         ],
       ),
       provider(
@@ -921,6 +1289,12 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
           model("hunyuan-turbos-latest"),
           model("hunyuan-lite"),
           model("hunyuan-vision", undefined, { vision: true }),
+          model("hunyuan-t1-latest", undefined, {
+            reasoning: reasoning({
+              activation: "always",
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
+          }),
         ],
       ),
       provider(
@@ -930,9 +1304,27 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "https://api.minimaxi.com/v1",
         "chat_completions",
         [
-          model("MiniMax-M2.7", 204_800),
-          model("MiniMax-M2.5", 204_800),
-          model("MiniMax-M2.1", 204_800),
+          model("MiniMax-M2.7", 204_800, {
+            reasoning: reasoning({
+              activation: "always",
+              request_adapters: ["chat_reasoning_split"],
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
+          }),
+          model("MiniMax-M2.5", 204_800, {
+            reasoning: reasoning({
+              activation: "always",
+              request_adapters: ["chat_reasoning_split"],
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
+          }),
+          model("MiniMax-M2.1", 204_800, {
+            reasoning: reasoning({
+              activation: "always",
+              request_adapters: ["chat_reasoning_split"],
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
+          }),
         ],
       ),
       provider(
@@ -950,8 +1342,23 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "https://api.stepfun.com/v1",
         "chat_completions",
         [
-          model("step-3.5-flash", 262_144),
-          model("step-3.5-flash-2603", 262_144),
+          model("step-3.5-flash", 262_144, {
+            reasoning: reasoning({
+              activation: "default",
+              request_adapters: ["chat_deepseek_reasoning_format"],
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
+          }),
+          model("step-3.5-flash-2603", 262_144, {
+            reasoning: chatEffortReasoning(["low", "high"], {
+              activation: "default",
+              request_adapters: [
+                "chat_reasoning_effort",
+                "chat_deepseek_reasoning_format",
+              ],
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
+          }),
           model("step-router-v1", undefined, { model_kind: "routing" }),
         ],
       ),
@@ -982,7 +1389,12 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
             max_input_tokens: 32_768,
             max_output_tokens: 32_768,
           }),
-          model("spark-x"),
+          model("spark-x", undefined, {
+            reasoning: reasoning({
+              activation: "always",
+              raw_trace_metadata: "chat_reasoning_fields",
+            }),
+          }),
         ],
       ),
       provider(
@@ -1055,6 +1467,236 @@ function normalizedProviderModel(
         }
       : {}),
   };
+}
+
+const plainRecord = (value: unknown): Record<string, unknown> =>
+  value && typeof value === "object" && !Array.isArray(value)
+    ? { ...(value as Record<string, unknown>) }
+    : {};
+
+const nestedProviderOptions = (
+  providerData: Record<string, unknown>,
+  provider: string,
+) => {
+  const providerOptions = plainRecord(providerData.providerOptions);
+  const options = plainRecord(providerOptions[provider]);
+  providerOptions[provider] = options;
+  providerData.providerOptions = providerOptions;
+  return options;
+};
+
+/**
+ * Validate the Provider-independent reasoning controls and translate them to
+ * the exact wire options required by the selected model. Provider-specific
+ * options are carried through ModelSettings.providerData, which both the
+ * OpenAI-compatible and AI SDK adapters forward without changing their names.
+ */
+export function applyReasoningModelSettings(
+  rawSettings: Record<string, unknown>,
+  capability: ReasoningCapability,
+  modelId: string,
+): Record<string, unknown> {
+  const settings = { ...rawSettings };
+  const effort = settings.reasoning_effort;
+  const enabled = settings.reasoning_enabled;
+  const budget = settings.reasoning_budget_tokens;
+  const summary = settings.reasoning_summary;
+  const hasReasoningControl =
+    effort !== undefined ||
+    enabled !== undefined ||
+    budget !== undefined ||
+    summary !== undefined;
+
+  if (hasReasoningControl && !capability.supported)
+    throw new ValidationError(`model ${modelId} does not support reasoning`);
+  if (enabled !== undefined && typeof enabled !== "boolean")
+    throw new ValidationError("reasoning_enabled must be a boolean");
+  if (enabled !== undefined && !capability.controls.toggle)
+    throw new ValidationError(
+      `model ${modelId} does not support toggling reasoning`,
+    );
+  if (
+    effort !== undefined &&
+    (!capability.controls.effort ||
+      !capability.effort_values.includes(String(effort)))
+  )
+    throw new ValidationError(
+      `model ${modelId} does not support reasoning effort ${String(effort)}`,
+    );
+  if (
+    budget !== undefined &&
+    (!capability.controls.budget_tokens ||
+      !Number.isSafeInteger(budget) ||
+      Number(budget) < 1_024)
+  )
+    throw new ValidationError(
+      `model ${modelId} does not support reasoning budget ${String(budget)}`,
+    );
+  if (
+    summary !== undefined &&
+    (!capability.controls.summary ||
+      !capability.summary_values.includes(String(summary)))
+  )
+    throw new ValidationError(
+      `model ${modelId} does not support reasoning summary ${String(summary)}`,
+    );
+  if (capability.activation === "always" && enabled === false)
+    throw new ValidationError(`model ${modelId} cannot disable reasoning`);
+  if (enabled === true && String(effort) === "none")
+    throw new ValidationError(
+      "reasoning_enabled=true conflicts with reasoning_effort=none",
+    );
+  if (
+    enabled === false &&
+    ((effort !== undefined && String(effort) !== "none") ||
+      budget !== undefined ||
+      (summary !== undefined && summary !== "none"))
+  )
+    throw new ValidationError(
+      "reasoning_enabled=false conflicts with enabled reasoning controls",
+    );
+
+  const mappedEffort =
+    effort === undefined
+      ? undefined
+      : (capability.value_map?.[String(effort)] ?? String(effort));
+  const implicitEnabled =
+    capability.activation === "default" || capability.activation === "always"
+      ? true
+      : undefined;
+  const effectiveEnabled =
+    typeof enabled === "boolean"
+      ? enabled
+      : effort !== undefined
+        ? String(effort) !== "none"
+        : summary !== undefined && summary !== "none"
+          ? true
+          : implicitEnabled;
+  const providerData = plainRecord(settings.providerData);
+  const reasoningSettings = plainRecord(settings.reasoning);
+
+  for (const adapter of capability.request_adapters) {
+    if (adapter === "responses_reasoning") {
+      if (mappedEffort !== undefined) reasoningSettings.effort = mappedEffort;
+      else if (enabled === false && capability.effort_values.includes("none"))
+        reasoningSettings.effort = "none";
+      if (summary !== undefined && summary !== "none")
+        reasoningSettings.summary = summary;
+      else if (summary === "none") delete reasoningSettings.summary;
+      continue;
+    }
+    if (adapter === "chat_reasoning_effort") {
+      if (mappedEffort !== undefined) reasoningSettings.effort = mappedEffort;
+      else if (enabled === false && capability.effort_values.includes("none"))
+        reasoningSettings.effort = "none";
+      continue;
+    }
+    if (adapter === "responses_thinking" || adapter === "chat_thinking") {
+      if (effectiveEnabled !== undefined)
+        providerData.thinking = {
+          ...plainRecord(providerData.thinking),
+          type: effectiveEnabled ? "enabled" : "disabled",
+        };
+      continue;
+    }
+    if (adapter === "chat_kimi_thinking") {
+      if (effectiveEnabled !== undefined)
+        providerData.thinking = effectiveEnabled
+          ? {
+              ...plainRecord(providerData.thinking),
+              type: "enabled",
+              keep: "all",
+            }
+          : { type: "disabled" };
+      continue;
+    }
+    if (adapter === "chat_enable_thinking") {
+      if (effectiveEnabled !== undefined)
+        providerData.enable_thinking = effectiveEnabled;
+      continue;
+    }
+    if (adapter === "chat_reasoning_format") {
+      if (effectiveEnabled !== false) {
+        providerData.reasoning_format = "parsed";
+        providerData.include_reasoning = true;
+      } else {
+        providerData.reasoning_format = "hidden";
+        providerData.include_reasoning = false;
+      }
+      continue;
+    }
+    if (adapter === "chat_deepseek_reasoning_format") {
+      if (effectiveEnabled !== false)
+        providerData.reasoning_format = "deepseek-style";
+      continue;
+    }
+    if (adapter === "chat_reasoning_split") {
+      // Always split <think> from visible content so private reasoning cannot
+      // leak into model.output_delta or the durable assistant message.
+      providerData.reasoning_split = true;
+      continue;
+    }
+    if (adapter === "chat_cohere_thinking") {
+      if (effectiveEnabled !== undefined || budget !== undefined)
+        providerData.thinking =
+          effectiveEnabled === false
+            ? { type: "disabled" }
+            : {
+                type: "enabled",
+                ...(budget !== undefined
+                  ? { token_budget: Number(budget) }
+                  : {}),
+              };
+      continue;
+    }
+    if (adapter === "anthropic_adaptive_thinking") {
+      const anthropic = nestedProviderOptions(providerData, "anthropic");
+      if (effectiveEnabled !== undefined)
+        anthropic.thinking = effectiveEnabled
+          ? {
+              type: "adaptive",
+              display: summary === "none" ? "omitted" : "summarized",
+            }
+          : { type: "disabled" };
+      continue;
+    }
+    if (adapter === "anthropic_budget_thinking") {
+      const anthropic = nestedProviderOptions(providerData, "anthropic");
+      if (effectiveEnabled !== undefined || budget !== undefined)
+        anthropic.thinking =
+          effectiveEnabled === false
+            ? { type: "disabled" }
+            : {
+                type: "enabled",
+                budgetTokens: Number(
+                  budget ?? capability.default_budget_tokens ?? 2_048,
+                ),
+              };
+      continue;
+    }
+    if (adapter === "google_thinking") {
+      if (mappedEffort !== undefined) providerData.reasoning = mappedEffort;
+      const google = nestedProviderOptions(providerData, "google");
+      google.thinkingConfig = {
+        ...plainRecord(google.thinkingConfig),
+        ...(mappedEffort !== undefined && mappedEffort !== "none"
+          ? { thinkingLevel: mappedEffort }
+          : {}),
+        includeThoughts: summary === "none" ? false : true,
+      };
+    }
+  }
+
+  if (Object.keys(reasoningSettings).length)
+    settings.reasoning = reasoningSettings;
+  else delete settings.reasoning;
+  if (Object.keys(providerData).length) settings.providerData = providerData;
+  else delete settings.providerData;
+  delete settings.reasoning_effort;
+  delete settings.reasoning_enabled;
+  delete settings.reasoning_budget_tokens;
+  delete settings.reasoning_summary;
+  return settings;
 }
 
 interface DiscoveryResult {
@@ -1447,7 +2089,7 @@ export class ProviderService {
     const requestData = new InputCountingOpenAIResponsesModel(
       client,
       modelId,
-    ).buildCountRequest(request);
+    ).buildWireRequest(request);
     const supportedFields = new Set([
       "conversation",
       "input",
@@ -1645,11 +2287,30 @@ export class ProviderService {
       baseURL: connection.base_url,
       maxRetries: 0,
     });
+    const compiled = new InputCountingOpenAIResponsesModel(
+      client,
+      modelId,
+    ).buildWireRequest({
+      input: input as never,
+      systemInstructions: options.instructions ?? "",
+      modelSettings: {},
+      tools: [],
+      handoffs: [],
+      outputType: "text",
+      tracing: false,
+      signal: options.signal,
+    });
+    if (!Array.isArray(compiled.input))
+      throw new ValidationError(
+        "could not compile Agents SDK history for native Responses compaction",
+      );
     return (await client.responses.compact(
       {
         model: modelId,
-        input: input as never,
-        ...(options.instructions ? { instructions: options.instructions } : {}),
+        input: compiled.input as never,
+        ...(typeof compiled.instructions === "string" && compiled.instructions
+          ? { instructions: compiled.instructions }
+          : {}),
       },
       options.signal ? { signal: options.signal } : undefined,
     )) as unknown as Record<string, unknown>;
@@ -2571,17 +3232,36 @@ export class ProviderService {
           modelId,
         ),
       );
+    const reasoningContentReplayProviders = new Set([
+      "alibaba_qwen",
+      "zhipu_glm",
+      "moonshot_kimi",
+      "baidu_qianfan",
+      "tencent_hunyuan",
+      "minimax",
+      "stepfun",
+      "iflytek_spark",
+    ]);
+    const transportFetch = reasoningContentReplayProviders.has(
+      connection.provider,
+    )
+      ? withChatReasoningReplayField(globalThis.fetch, "reasoning_content")
+      : undefined;
     const openAIClient = new OpenAI({
       apiKey,
       baseURL: connection.base_url,
+      ...(transportFetch ? { fetch: transportFetch } : {}),
       // Retry decisions belong to the Agents SDK Runtime policy. Leaving the
       // transport default enabled would make ambiguous retries invisible.
       maxRetries: 0,
     });
-    return new OpenAIProvider({
+    const model = await new OpenAIProvider({
       openAIClient,
       useResponses: connection.protocol === "responses",
     }).getModel(modelId);
+    return connection.protocol === "chat_completions"
+      ? new ReasoningCompatibleModel(model)
+      : model;
   }
 
   async resolveConfig(config: Record<string, unknown>): Promise<
@@ -2619,28 +3299,11 @@ export class ProviderService {
       throw new ValidationError(
         `model ${modelId} is a dedicated ${capability.model_kind} model and cannot back an Agent deployment`,
       );
-    const settings = {
-      ...((config.model_settings as Record<string, unknown>) ?? {}),
-    };
-    const effort = settings.reasoning_effort;
-    if (
-      effort !== undefined &&
-      (!capability?.reasoning.supported ||
-        !capability.reasoning.effort_values.includes(String(effort)))
-    ) {
-      throw new ValidationError(
-        `model ${modelId} does not support reasoning effort ${String(effort)}`,
-      );
-    }
-    if (effort !== undefined) {
-      const mapped =
-        capability?.reasoning.value_map?.[String(effort)] ?? String(effort);
-      settings.reasoning = {
-        ...((settings.reasoning as Record<string, unknown> | undefined) ?? {}),
-        effort: mapped,
-      };
-      delete settings.reasoning_effort;
-    }
+    const settings = applyReasoningModelSettings(
+      { ...((config.model_settings as Record<string, unknown>) ?? {}) },
+      capability.reasoning,
+      modelId,
+    );
     if (settings.max_tokens !== undefined && settings.maxTokens === undefined) {
       settings.maxTokens = settings.max_tokens;
       delete settings.max_tokens;

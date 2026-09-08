@@ -3,23 +3,136 @@ import { z } from "zod";
 export const ReasoningCapabilitySchema = z
   .object({
     supported: z.boolean(),
+    activation: z.enum(["none", "optional", "default", "always"]),
+    visibility: z.enum(["none", "summary", "provider_trace", "service_steps"]),
+    controls: z
+      .object({
+        toggle: z.boolean(),
+        effort: z.boolean(),
+        budget_tokens: z.boolean(),
+        summary: z.boolean(),
+      })
+      .strict(),
     effort_values: z.array(z.string().trim().min(1)).max(32),
+    summary_values: z.array(z.string().trim().min(1)).max(16),
+    request_adapters: z
+      .array(
+        z.enum([
+          "responses_reasoning",
+          "responses_thinking",
+          "chat_reasoning_effort",
+          "chat_thinking",
+          "chat_kimi_thinking",
+          "chat_enable_thinking",
+          "chat_reasoning_format",
+          "chat_deepseek_reasoning_format",
+          "chat_reasoning_split",
+          "chat_cohere_thinking",
+          "anthropic_adaptive_thinking",
+          "anthropic_budget_thinking",
+          "google_thinking",
+        ]),
+      )
+      .max(8),
+    response_adapter: z
+      .enum([
+        "responses_reasoning",
+        "chat_reasoning_fields",
+        "mistral_content_chunks",
+        "ai_sdk_reasoning",
+        "service_reasoning_steps",
+      ])
+      .optional(),
+    replay: z.enum(["none", "provider_managed", "reasoning_item"]),
+    default_budget_tokens: z.number().int().min(1_024).optional(),
+    /** @deprecated Read request_adapters and controls.effort instead. */
     adapter: z.literal("reasoning_effort").optional(),
     value_map: z.record(z.string(), z.string()).optional(),
+    raw_trace_metadata: z
+      .enum([
+        "responses_reasoning_text",
+        "chat_reasoning_fields",
+        "mistral_think_chunk",
+        "ai_sdk_reasoning",
+        "service_reasoning_steps",
+      ])
+      .optional(),
+    native_summary: z.enum(["supported", "not_observed", "unknown"]).optional(),
   })
   .strict()
   .superRefine((value, context) => {
-    if (value.supported && !value.effort_values.length)
+    if (value.controls.effort && !value.effort_values.length)
       context.addIssue({
         code: "custom",
         path: ["effort_values"],
-        message: "supported reasoning requires at least one effort value",
+        message: "reasoning effort control requires at least one effort value",
       });
-    if (!value.supported && value.effort_values.length)
+    if (!value.controls.effort && value.effort_values.length)
       context.addIssue({
         code: "custom",
         path: ["effort_values"],
-        message: "unsupported reasoning cannot declare effort values",
+        message: "models without effort control cannot declare effort values",
+      });
+    if (value.controls.summary && !value.summary_values.length)
+      context.addIssue({
+        code: "custom",
+        path: ["summary_values"],
+        message: "reasoning summary control requires at least one value",
+      });
+    if (!value.controls.summary && value.summary_values.length)
+      context.addIssue({
+        code: "custom",
+        path: ["summary_values"],
+        message: "models without summary control cannot declare summary values",
+      });
+    if (value.supported === (value.activation === "none"))
+      context.addIssue({
+        code: "custom",
+        path: ["activation"],
+        message:
+          "supported reasoning requires a non-none activation and unsupported reasoning requires activation none",
+      });
+    if (!value.supported && value.visibility !== "none")
+      context.addIssue({
+        code: "custom",
+        path: ["visibility"],
+        message: "unsupported reasoning must have visibility none",
+      });
+    if (!value.supported && Object.values(value.controls).some(Boolean))
+      context.addIssue({
+        code: "custom",
+        path: ["controls"],
+        message: "unsupported reasoning cannot expose controls",
+      });
+    if (value.activation === "always" && value.controls.toggle)
+      context.addIssue({
+        code: "custom",
+        path: ["controls", "toggle"],
+        message: "always-on reasoning cannot expose a toggle",
+      });
+    if (!value.supported && value.request_adapters.length)
+      context.addIssue({
+        code: "custom",
+        path: ["request_adapters"],
+        message: "unsupported reasoning cannot declare request adapters",
+      });
+    if (!value.supported && value.response_adapter)
+      context.addIssue({
+        code: "custom",
+        path: ["response_adapter"],
+        message: "unsupported reasoning cannot declare a response adapter",
+      });
+    if (value.controls.summary && value.visibility !== "summary")
+      context.addIssue({
+        code: "custom",
+        path: ["controls", "summary"],
+        message: "reasoning summary control requires summary visibility",
+      });
+    if (value.raw_trace_metadata && value.visibility === "none")
+      context.addIssue({
+        code: "custom",
+        path: ["raw_trace_metadata"],
+        message: "trace metadata requires observable reasoning",
       });
   });
 
@@ -232,9 +345,70 @@ export const ModelCapabilityOverrideSchema = z
     reasoning: z
       .object({
         supported: z.boolean().optional(),
+        activation: z
+          .enum(["none", "optional", "default", "always"])
+          .optional(),
+        visibility: z
+          .enum(["none", "summary", "provider_trace", "service_steps"])
+          .optional(),
+        controls: z
+          .object({
+            toggle: z.boolean().optional(),
+            effort: z.boolean().optional(),
+            budget_tokens: z.boolean().optional(),
+            summary: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
         effort_values: z.array(z.string().trim().min(1)).max(32).optional(),
+        summary_values: z.array(z.string().trim().min(1)).max(16).optional(),
+        request_adapters: z
+          .array(
+            z.enum([
+              "responses_reasoning",
+              "responses_thinking",
+              "chat_reasoning_effort",
+              "chat_thinking",
+              "chat_kimi_thinking",
+              "chat_enable_thinking",
+              "chat_reasoning_format",
+              "chat_deepseek_reasoning_format",
+              "chat_reasoning_split",
+              "chat_cohere_thinking",
+              "anthropic_adaptive_thinking",
+              "anthropic_budget_thinking",
+              "google_thinking",
+            ]),
+          )
+          .max(8)
+          .optional(),
+        response_adapter: z
+          .enum([
+            "responses_reasoning",
+            "chat_reasoning_fields",
+            "mistral_content_chunks",
+            "ai_sdk_reasoning",
+            "service_reasoning_steps",
+          ])
+          .optional(),
+        replay: z
+          .enum(["none", "provider_managed", "reasoning_item"])
+          .optional(),
+        default_budget_tokens: z.number().int().min(1_024).optional(),
         adapter: z.literal("reasoning_effort").optional(),
         value_map: z.record(z.string(), z.string()).optional(),
+        raw_trace_metadata: z
+          .enum([
+            "responses_reasoning_text",
+            "chat_reasoning_fields",
+            "mistral_think_chunk",
+            "ai_sdk_reasoning",
+            "service_reasoning_steps",
+          ])
+          .optional(),
+        native_summary: z
+          .enum(["supported", "not_observed", "unknown"])
+          .optional(),
       })
       .strict()
       .optional(),
@@ -346,11 +520,59 @@ export function mergeModelCapabilities(
   const reasoning = {
     ...base.reasoning,
     ...(override.reasoning ?? {}),
+    controls: {
+      ...base.reasoning.controls,
+      ...(override.reasoning?.controls ?? {}),
+    },
   };
+  if (override.reasoning?.supported === true) {
+    const declaresBehavior = Boolean(
+      base.reasoning.supported ||
+      override.reasoning.activation ||
+      override.reasoning.effort_values?.length ||
+      override.reasoning.summary_values?.length ||
+      override.reasoning.adapter ||
+      override.reasoning.request_adapters?.length ||
+      override.reasoning.response_adapter,
+    );
+    if (reasoning.activation === "none" && declaresBehavior)
+      reasoning.activation = "optional";
+    if (
+      override.reasoning.effort_values?.length &&
+      override.reasoning.controls?.effort === undefined
+    )
+      reasoning.controls.effort = true;
+    if (
+      override.reasoning.summary_values?.length &&
+      override.reasoning.controls?.summary === undefined
+    )
+      reasoning.controls.summary = true;
+    if (
+      override.reasoning.adapter === "reasoning_effort" &&
+      override.reasoning.request_adapters === undefined &&
+      !reasoning.request_adapters.length
+    )
+      reasoning.request_adapters = ["chat_reasoning_effort"];
+  }
   if (override.reasoning?.supported === false) {
+    reasoning.activation = "none";
+    reasoning.visibility = "none";
+    reasoning.controls = {
+      toggle: false,
+      effort: false,
+      budget_tokens: false,
+      summary: false,
+    };
     reasoning.effort_values = override.reasoning.effort_values ?? [];
+    reasoning.summary_values = override.reasoning.summary_values ?? [];
+    reasoning.request_adapters = [];
+    reasoning.replay = "none";
     delete reasoning.adapter;
     delete reasoning.value_map;
+    delete reasoning.raw_trace_metadata;
+    delete reasoning.native_summary;
+    delete reasoning.response_adapter;
+    delete reasoning.default_budget_tokens;
   }
   const contextCompaction = {
     ...base.context_compaction,
@@ -386,6 +608,50 @@ export function normalizeModelCapabilities(rawValue: unknown): ModelCapability {
       : {};
   if (raw.input_token_counting === undefined)
     raw.input_token_counting = { status: "unavailable" };
+  const rawReasoning =
+    raw.reasoning &&
+    typeof raw.reasoning === "object" &&
+    !Array.isArray(raw.reasoning)
+      ? ({ ...(raw.reasoning as Record<string, unknown>) } as Record<
+          string,
+          unknown
+        >)
+      : { supported: false, effort_values: [] };
+  const reasoningSupported = rawReasoning.supported === true;
+  const effortValues = Array.isArray(rawReasoning.effort_values)
+    ? rawReasoning.effort_values
+    : [];
+  raw.reasoning = {
+    ...rawReasoning,
+    activation:
+      rawReasoning.activation ?? (reasoningSupported ? "optional" : "none"),
+    visibility:
+      rawReasoning.visibility ??
+      (rawReasoning.native_summary === "supported"
+        ? "summary"
+        : rawReasoning.raw_trace_metadata
+          ? "provider_trace"
+          : "none"),
+    controls: {
+      toggle: reasoningSupported,
+      effort: effortValues.length > 0,
+      budget_tokens: false,
+      summary: rawReasoning.native_summary === "supported",
+      ...((rawReasoning.controls as Record<string, unknown> | undefined) ?? {}),
+    },
+    effort_values: effortValues,
+    summary_values:
+      rawReasoning.summary_values ??
+      (rawReasoning.native_summary === "supported"
+        ? ["auto", "concise", "detailed", "none"]
+        : []),
+    request_adapters:
+      rawReasoning.request_adapters ??
+      (rawReasoning.adapter === "reasoning_effort"
+        ? ["responses_reasoning"]
+        : []),
+    replay: rawReasoning.replay ?? "none",
+  };
   const inputModalities = Array.isArray(raw.input_modalities)
     ? raw.input_modalities
     : legacyVision

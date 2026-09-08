@@ -82,6 +82,23 @@ export class EventStore {
     ).rows;
   }
 
+  async reasoningMetadata(runId: string) {
+    return (
+      await this.db.query<RunEvent>(
+        `SELECT * FROM run_events
+         WHERE run_id=$1 AND type IN (
+           'model.reasoning_metadata_started',
+           'model.reasoning_metadata_progress',
+           'model.reasoning_metadata_completed',
+           'model.reasoning_summary_delta',
+           'model.reasoning_summary_completed'
+         )
+         ORDER BY seq`,
+        [runId],
+      )
+    ).rows;
+  }
+
   revision(runId: string) {
     return this.revisions.get(runId) ?? 0;
   }

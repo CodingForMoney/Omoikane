@@ -899,6 +899,46 @@ export const RuntimeEventSchema = z
   })
   .strict();
 
+const ReasoningMetadataCompletionReasonSchema = z.enum([
+  "done",
+  "stream_ended",
+  "failed",
+  "cancelled",
+]);
+const ReasoningMetadataAggregateCompletionReasonSchema = z.enum([
+  ...ReasoningMetadataCompletionReasonSchema.options,
+  "incomplete",
+  "mixed",
+]);
+export const ReasoningMetadataAttemptSchema = z
+  .object({
+    execution_attempt: z.number().int().nonnegative(),
+    item_count: z.number().int().nonnegative(),
+    delta_count: z.number().int().nonnegative(),
+    unicode_character_count: z.number().int().nonnegative(),
+    utf8_byte_count: z.number().int().nonnegative(),
+    duration_ms: z.number().int().nonnegative(),
+    started_at: z.string().datetime(),
+    completed_at: z.string().datetime().nullable(),
+    completion_reason: ReasoningMetadataAggregateCompletionReasonSchema,
+    provider_reasoning_tokens: z.number().int().nonnegative().nullable(),
+    public_summary_observed: z.boolean(),
+    content_available: z.literal(false),
+    content_persisted: z.literal(false),
+  })
+  .strict();
+export const ReasoningMetadataResponseSchema = z
+  .object({
+    run_id: z.string(),
+    raw_reasoning_observed: z.boolean(),
+    public_summary_observed: z.boolean(),
+    provider_reasoning_tokens: z.number().int().nonnegative().nullable(),
+    content_available: z.literal(false),
+    content_persisted: z.literal(false),
+    attempts: z.array(ReasoningMetadataAttemptSchema),
+  })
+  .strict();
+
 export type ProviderConnectionCreate = z.infer<
   typeof ProviderConnectionCreateSchema
 >;
@@ -964,10 +1004,113 @@ export type McpCallResponse = z.infer<typeof McpCallResponseSchema>;
 export type McpInvocationResponse = z.infer<typeof McpInvocationResponseSchema>;
 export type ArtifactRecord = z.infer<typeof ArtifactRecordSchema>;
 export type CompactionResponse = z.infer<typeof CompactionResponseSchema>;
+export type ReasoningMetadataAttempt = z.infer<
+  typeof ReasoningMetadataAttemptSchema
+>;
+export type ReasoningMetadataResponse = z.infer<
+  typeof ReasoningMetadataResponseSchema
+>;
 export type RuntimeEvent<T = unknown> = Omit<
   z.infer<typeof RuntimeEventSchema>,
   "data"
 > & { data: T };
+
+export interface ModelReasoningSummaryCoordinates {
+  item_id: string | null;
+  output_index: number | null;
+  summary_index: number;
+}
+
+export interface ModelReasoningSummaryDeltaData extends ModelReasoningSummaryCoordinates {
+  delta: string;
+  execution_attempt: number;
+  provisional: boolean;
+  source_type: string;
+  buffered?: boolean;
+}
+
+export interface ModelReasoningSummaryCompletedData extends ModelReasoningSummaryCoordinates {
+  text: string;
+  execution_attempt: number;
+  provisional: boolean;
+  source: "stream" | "reasoning_item";
+  source_type: string;
+  buffered?: boolean;
+}
+
+export type ModelReasoningSummaryDeltaEvent =
+  RuntimeEvent<ModelReasoningSummaryDeltaData> & {
+    type: "model.reasoning_summary_delta";
+  };
+
+export type ModelReasoningSummaryCompletedEvent =
+  RuntimeEvent<ModelReasoningSummaryCompletedData> & {
+    type: "model.reasoning_summary_completed";
+  };
+
+export interface ModelReasoningMetadataCoordinates {
+  item_id: string | null;
+  output_index: number | null;
+  content_index: number | null;
+  execution_attempt: number;
+}
+
+export interface ModelReasoningMetadataBaseData extends ModelReasoningMetadataCoordinates {
+  source:
+    | "responses_reasoning_text"
+    | "chat_reasoning_fields"
+    | "mistral_think_chunk"
+    | "ai_sdk_reasoning"
+    | "service_reasoning_steps";
+  source_type: string;
+  started_at: string;
+  content_available: false;
+  content_persisted: false;
+}
+
+export interface ModelReasoningMetadataStartedData extends ModelReasoningMetadataBaseData {}
+
+export interface ModelReasoningMetadataProgressData extends ModelReasoningMetadataBaseData {
+  observed_at: string;
+  delta_count: number;
+  unicode_character_count: number;
+  utf8_byte_count: number;
+  duration_ms: number;
+  count_source: "delta_stream";
+}
+
+export interface ModelReasoningMetadataCompletedData extends ModelReasoningMetadataBaseData {
+  completed_at: string;
+  delta_count: number;
+  unicode_character_count: number;
+  utf8_byte_count: number;
+  duration_ms: number;
+  count_source: "delta_stream" | "done_fallback";
+  done_event_seen: boolean;
+  completion_reason: z.infer<typeof ReasoningMetadataCompletionReasonSchema>;
+  provider_reasoning_tokens: number | null;
+  public_summary_available: boolean;
+}
+
+export type ModelReasoningMetadataStartedEvent =
+  RuntimeEvent<ModelReasoningMetadataStartedData> & {
+    type: "model.reasoning_metadata_started";
+  };
+
+export type ModelReasoningMetadataProgressEvent =
+  RuntimeEvent<ModelReasoningMetadataProgressData> & {
+    type: "model.reasoning_metadata_progress";
+  };
+
+export type ModelReasoningMetadataCompletedEvent =
+  RuntimeEvent<ModelReasoningMetadataCompletedData> & {
+    type: "model.reasoning_metadata_completed";
+  };
+
+export type ModelReasoningMetadataEvent =
+  | ModelReasoningMetadataStartedEvent
+  | ModelReasoningMetadataProgressEvent
+  | ModelReasoningMetadataCompletedEvent;
 
 export interface ApiRouteContract {
   method: "get" | "post" | "patch" | "delete";
@@ -1191,6 +1334,13 @@ export const API_CONTRACTS = {
     summary: "Get a Run",
     params: runParams,
     response: RunRecordSchema,
+  },
+  getRunReasoningMetadata: {
+    method: "get",
+    path: "/v1/runs/:runId/reasoning-metadata",
+    summary: "Get metadata about raw reasoning observed during a Run",
+    params: runParams,
+    response: ReasoningMetadataResponseSchema,
   },
   cancelRun: {
     method: "post",

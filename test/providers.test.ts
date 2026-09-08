@@ -26,11 +26,31 @@ describe("provider registry", () => {
     cleanup = test.close;
     const catalog = container.providers.catalog();
     expect(catalog.length).toBeGreaterThanOrEqual(25);
+    const openai = catalog.find((item) => item.id === "openai")!;
+    expect(
+      openai.models.find((item) => item.id === "gpt-6-astra")!.capabilities,
+    ).toMatchObject({
+      context_window: 1_050_000,
+      max_output_tokens: 128_000,
+      vision: true,
+      structured_output: "native",
+      context_compaction: {
+        supported: true,
+        method: "responses_compact",
+      },
+      reasoning: {
+        effort_values: ["low", "medium", "high", "xhigh", "max"],
+      },
+    });
     const bridge = catalog.find((item) => item.id === "codex_bridge")!;
     expect(bridge.models[0]!.capabilities.context_window).toBe(258_400);
     expect(bridge.models[0]!.capabilities.context_compaction).toEqual({
       supported: true,
       method: "responses_compact",
+    });
+    expect(bridge.models[0]!.capabilities.reasoning).toMatchObject({
+      effort_values: ["none", "low", "medium", "high", "xhigh", "max"],
+      summary_values: ["auto"],
     });
     const mimo = catalog.find((item) => item.id === "xiaomi_mimo")!;
     expect(
@@ -97,6 +117,10 @@ describe("provider registry", () => {
     expect(capability("xiaomi_mimo", "mimo-v2.5")).toMatchObject({
       input_modalities: ["text", "image", "audio", "video"],
       tasks: { image_understanding: "native", transcription: "general" },
+      reasoning: {
+        raw_trace_metadata: "responses_reasoning_text",
+        native_summary: "not_observed",
+      },
     });
     expect(capability("xiaomi_mimo", "mimo-v2.5-pro")).toMatchObject({
       input_modalities: ["text"],
@@ -185,6 +209,90 @@ describe("provider registry", () => {
     ).rejects.toThrow("cannot back an Agent deployment");
   });
 
+  it("compiles Agents SDK tool history into Responses wire items before native compaction", async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "resp_compact_wire_test",
+          object: "response.compaction",
+          created_at: 1,
+          output: [
+            {
+              id: "cmp_wire_test",
+              type: "compaction",
+              encrypted_content: "opaque-test-checkpoint",
+            },
+          ],
+          usage: { input_tokens: 20, output_tokens: 5, total_tokens: 25 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetcher);
+    const test = await testContainer();
+    container = test.container;
+    cleanup = test.close;
+    const connection = await container.providers.create({
+      name: "Codex Bridge",
+      provider: "codex_bridge",
+      api_key: "test-only-key",
+    });
+    const resolved = await container.providers.resolveConfig({
+      provider: { connection_id: connection.id },
+      model: "gpt-5.6-sol",
+    });
+
+    await container.providers.compactResponses(
+      resolved._connection,
+      "gpt-5.6-sol",
+      [
+        { role: "user", content: "Fetch the next page" },
+        {
+          type: "function_call",
+          callId: "wire-call-1",
+          name: "fetch_page",
+          arguments: '{"page":1}',
+          status: "completed",
+        },
+        {
+          type: "function_call_result",
+          callId: "wire-call-1",
+          name: "fetch_page",
+          status: "completed",
+          output: { type: "text", text: '{"items":[]}' },
+        },
+      ],
+      { instructions: "Preserve exact identifiers." },
+    );
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    const [request, init] = fetcher.mock.calls[0]!;
+    const outgoing =
+      request instanceof Request ? request.clone() : new Request(request, init);
+    expect(outgoing.url).toBe("http://127.0.0.1:3456/v1/responses/compact");
+    const body = JSON.parse(await outgoing.text());
+    expect(body).toMatchObject({
+      model: "gpt-5.6-sol",
+      instructions: "Preserve exact identifiers.",
+      input: [
+        { role: "user", content: "Fetch the next page" },
+        {
+          type: "function_call",
+          call_id: "wire-call-1",
+          name: "fetch_page",
+          arguments: '{"page":1}',
+        },
+        {
+          type: "function_call_output",
+          call_id: "wire-call-1",
+          output: '{"items":[]}',
+        },
+      ],
+    });
+    expect(JSON.stringify(body)).not.toContain("function_call_result");
+    expect(JSON.stringify(body)).not.toContain('"callId"');
+  });
+
   it("deletes an unused connection together with its discovered models", async () => {
     const test = await testContainer();
     container = test.container;
@@ -195,9 +303,9 @@ describe("provider registry", () => {
       api_key: "test-only-key",
     });
     await container.providers.listModels(connection.id);
-    expect(await container.providers.listModels(connection.id)).not.toHaveLength(
-      0,
-    );
+    expect(
+      await container.providers.listModels(connection.id),
+    ).not.toHaveLength(0);
 
     await container.providers.delete(connection.id);
 
@@ -232,12 +340,14 @@ describe("provider registry", () => {
       },
     });
 
-    await expect(container.providers.delete(connection.id)).rejects.toBeInstanceOf(
-      ConflictError,
+    await expect(
+      container.providers.delete(connection.id),
+    ).rejects.toBeInstanceOf(ConflictError);
+    await expect(container.providers.get(connection.id)).resolves.toMatchObject(
+      {
+        id: connection.id,
+      },
     );
-    await expect(container.providers.get(connection.id)).resolves.toMatchObject({
-      id: connection.id,
-    });
   });
 
   it("invokes MiMo dedicated ASR and TTS without exposing credentials", async () => {

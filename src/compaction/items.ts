@@ -68,7 +68,13 @@ export function itemContainsAnchor(
 
 function callId(item: Record<string, unknown>): string {
   return String(
-    item.call_id ?? item.callId ?? item.tool_call_id ?? item.toolCallId ?? "",
+    item.call_id ??
+      item.callId ??
+      item.tool_call_id ??
+      item.toolCallId ??
+      item.tool_use_id ??
+      item.toolUseId ??
+      "",
   );
 }
 
@@ -109,6 +115,7 @@ function toolCallRecords(item: Record<string, unknown>): Array<{
 function isToolOutput(item: Record<string, unknown>): boolean {
   return (
     item.role === "tool" ||
+    item.type === "function_call_result" ||
     item.type === "function_call_output" ||
     item.type === "tool_result"
   );
@@ -122,9 +129,37 @@ function replaceToolOutput(
   item: Record<string, unknown>,
   replacement: string,
 ): AgentInputItem {
-  if (item.type === "function_call_output")
+  if (
+    item.type === "function_call_result" ||
+    item.type === "function_call_output"
+  ) {
+    const output = item.output;
+    if (Array.isArray(output))
+      return {
+        ...item,
+        output: [{ type: "input_text", text: replacement }],
+      } as AgentInputItem;
+    const structured = asRecord(output);
+    if (structured?.type === "text" || structured?.type === "input_text")
+      return {
+        ...item,
+        output: { ...structured, text: replacement },
+      } as AgentInputItem;
     return { ...item, output: replacement } as AgentInputItem;
-  return { ...item, content: replacement } as AgentInputItem;
+  }
+  const content = item.content;
+  if (Array.isArray(content))
+    return {
+      ...item,
+      content: [{ type: "text", text: replacement }],
+    } as unknown as AgentInputItem;
+  const structured = asRecord(content);
+  if (structured?.type === "text")
+    return {
+      ...item,
+      content: { ...structured, text: replacement },
+    } as unknown as AgentInputItem;
+  return { ...item, content: replacement } as unknown as AgentInputItem;
 }
 
 function concise(value: string, max = 320): string {
@@ -291,6 +326,77 @@ export interface UnitPlan {
 export function planCompactionUnits(items: AgentInputItem[]): UnitPlan {
   const units: CompactionUnit[] = [];
   const orphans: number[] = [];
+  const transactions = new Map<
+    string,
+    { call_indexes: number[]; result_indexes: number[] }
+  >();
+  const anonymousCalls = new Set<number>();
+  for (const [index, value] of items.entries()) {
+    const item = asRecord(value) ?? {};
+    const calls = toolCallRecords(item);
+    for (const call of calls) {
+      if (!call.id) {
+        anonymousCalls.add(index);
+        continue;
+      }
+      const entry = transactions.get(call.id) ?? {
+        call_indexes: [],
+        result_indexes: [],
+      };
+      entry.call_indexes.push(index);
+      transactions.set(call.id, entry);
+    }
+    if (!isToolOutput(item)) continue;
+    const id = callId(item);
+    if (!id) {
+      orphans.push(index);
+      continue;
+    }
+    const entry = transactions.get(id) ?? {
+      call_indexes: [],
+      result_indexes: [],
+    };
+    entry.result_indexes.push(index);
+    transactions.set(id, entry);
+  }
+  const intervals: Array<{
+    start: number;
+    end: number;
+    unresolved: boolean;
+  }> = [];
+  for (const entry of transactions.values()) {
+    if (!entry.call_indexes.length) {
+      orphans.push(...entry.result_indexes);
+      continue;
+    }
+    const start = Math.min(...entry.call_indexes);
+    const lastCall = Math.max(...entry.call_indexes);
+    const usableResults = entry.result_indexes.filter(
+      (resultIndex) => resultIndex >= lastCall,
+    );
+    const end = usableResults.length ? Math.max(...usableResults) : lastCall;
+    intervals.push({
+      start,
+      end,
+      unresolved:
+        usableResults.length === 0 ||
+        entry.result_indexes.some((resultIndex) => resultIndex < lastCall),
+    });
+  }
+  for (const index of anonymousCalls)
+    intervals.push({ start: index, end: index, unresolved: true });
+  intervals.sort(
+    (left, right) => left.start - right.start || left.end - right.end,
+  );
+  const merged: typeof intervals = [];
+  for (const interval of intervals) {
+    const previous = merged.at(-1);
+    if (previous && interval.start <= previous.end) {
+      previous.end = Math.max(previous.end, interval.end);
+      previous.unresolved ||= interval.unresolved;
+    } else merged.push({ ...interval });
+  }
+  const intervalByStart = new Map(merged.map((value) => [value.start, value]));
   let index = 0;
   while (index < items.length) {
     const item = asRecord(items[index]) ?? {};
@@ -308,33 +414,21 @@ export function planCompactionUnits(items: AgentInputItem[]): UnitPlan {
       index += 1;
       continue;
     }
-    const calls = toolCallRecords(item);
-    if (calls.length) {
-      const expected = new Set(calls.map((value) => value.id).filter(Boolean));
-      const found = new Set<string>();
-      let end = index;
-      while (end + 1 < items.length) {
-        const next = asRecord(items[end + 1]) ?? {};
-        if (!isToolOutput(next)) break;
-        const id = callId(next);
-        if (id) found.add(id);
-        end += 1;
-      }
-      const unresolved = [...expected].some((id) => !found.has(id));
-      const slice = items.slice(index, end + 1);
+    const transaction = intervalByStart.get(index);
+    if (transaction) {
+      const slice = items.slice(index, transaction.end + 1);
       units.push({
-        id: `unit-${index}-${end}`,
+        id: `unit-${index}-${transaction.end}`,
         kind: "tool_transaction",
         from_index: index,
-        to_index: end,
+        to_index: transaction.end,
         items: slice,
         estimated_tokens: estimateTokens(JSON.stringify(slice)),
-        unresolved_tool_call: unresolved,
+        unresolved_tool_call: transaction.unresolved,
       });
-      index = end + 1;
+      index = transaction.end + 1;
       continue;
     }
-    if (isToolOutput(item)) orphans.push(index);
     const role = itemRole(item);
     units.push({
       id: `unit-${index}`,
@@ -360,18 +454,37 @@ export function validateToolIntegrity(items: AgentInputItem[]): {
   orphan_results: string[];
   unresolved_calls: string[];
 } {
-  const calls = new Set<string>();
-  const outputs = new Set<string>();
-  for (const item of items) {
+  const calls = new Map<string, number>();
+  const outputs = new Map<string, number>();
+  const anonymousCalls: string[] = [];
+  const anonymousOutputs: string[] = [];
+  for (const [index, item] of items.entries()) {
     const record = asRecord(item) ?? {};
-    for (const call of toolCallRecords(record)) if (call.id) calls.add(call.id);
+    for (const call of toolCallRecords(record)) {
+      if (call.id)
+        calls.set(call.id, Math.min(calls.get(call.id) ?? index, index));
+      else anonymousCalls.push(`@index:${index}`);
+    }
     if (isToolOutput(record)) {
       const id = callId(record);
-      if (id) outputs.add(id);
+      if (id) outputs.set(id, Math.min(outputs.get(id) ?? index, index));
+      else anonymousOutputs.push(`@index:${index}`);
     }
   }
-  const orphanResults = [...outputs].filter((id) => !calls.has(id));
-  const unresolved = [...calls].filter((id) => !outputs.has(id));
+  const orphanResults = [
+    ...anonymousOutputs,
+    ...[...outputs].flatMap(([id, outputIndex]) => {
+      const callIndex = calls.get(id);
+      return callIndex === undefined || outputIndex < callIndex ? [id] : [];
+    }),
+  ];
+  const unresolved = [
+    ...anonymousCalls,
+    ...[...calls].flatMap(([id, callIndex]) => {
+      const outputIndex = outputs.get(id);
+      return outputIndex === undefined || outputIndex < callIndex ? [id] : [];
+    }),
+  ];
   return {
     valid: orphanResults.length === 0 && unresolved.length === 0,
     orphan_results: orphanResults,
@@ -517,11 +630,14 @@ export function buildToolLedger(
     };
     entry.result_digest = concise(output);
     entry.result_sha256 = hashJson(output);
-    entry.status = /\b(error|failed|exception|traceback|timeout)\b/i.test(
-      output,
-    )
-      ? "failed"
-      : "completed";
+    const declaredStatus = String(record.status ?? "");
+    entry.status =
+      declaredStatus === "in_progress"
+        ? "pending"
+        : declaredStatus === "incomplete" ||
+            /\b(error|failed|exception|traceback|timeout)\b/i.test(output)
+          ? "failed"
+          : "completed";
     if (!entry.source_refs.includes(source)) entry.source_refs.push(source);
     entries.set(id, entry);
   }

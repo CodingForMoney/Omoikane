@@ -154,7 +154,7 @@ curl -X POST 'http://127.0.0.1:8000/v1/provider-connections' \
   }'
 ```
 
-Creation validates the connection and synchronizes visible models unless `?sync_models=false` is supplied. The remote model list is merged with Omoikane's capability catalog because most `/models` responses do not include reliable input/output modalities, task support, context-window, output-limit, structured-output, or Reasoning Effort metadata. Synchronization is atomic, paginated and bounded; it reports `succeeded`, `empty`, `unsupported`, or `failed`, retains disappeared model records as unavailable, preserves explicit user overrides, and never silently replaces an unavailable default model. Each effective model record declares `model_kind`, `input_modalities`, `output_modalities`, and explicit image-understanding/STT/TTS task fields. See [Provider and model catalog](PROVIDERS.md#model-modalities-and-tasks).
+Creation validates the connection and synchronizes visible models unless `?sync_models=false` is supplied. The remote model list is merged with Omoikane's capability catalog because most `/models` responses do not include reliable input/output modalities, task support, context-window, output-limit, structured-output, or reasoning-control metadata. Synchronization is atomic, paginated and bounded; it reports `succeeded`, `empty`, `unsupported`, or `failed`, retains disappeared model records as unavailable, preserves explicit user overrides, and never silently replaces an unavailable default model. Each effective model record declares `model_kind`, `input_modalities`, `output_modalities`, and explicit image-understanding/STT/TTS task fields. See [Provider and model catalog](PROVIDERS.md#model-modalities-and-tasks).
 
 The npm client exposes `listProviders`, `getProvider`, `updateProvider`, `validateProvider`, `listProviderModels`, and `addProviderModel` in addition to `createProvider`. Arbitrary base URLs and protocols are accepted only for `custom_openai_compatible`; known Provider endpoint profiles cannot be rewritten through custom URL fields.
 
@@ -338,6 +338,7 @@ spec:
   mcp_servers: []
   skills: []
   model_settings:
+    reasoning_enabled: true
     reasoning_effort: high
 ---
 
@@ -351,7 +352,7 @@ npx omoikane deploy-agent ./agents/analyst/AGENT.md
 
 The resulting Deployment is immutable and has a canonical `config_hash`. Changing instructions, model, capability bindings, Guardrails, output schema, context settings, or limits creates a new Deployment. The business system controls which Deployment ID is active.
 
-Reasoning Effort is validated against the selected model. The Agent can override a known context-window default with `model_context_window`; this affects context planning and compaction but cannot make a Provider accept a larger request.
+Reasoning controls are validated independently against the selected model. `reasoning_enabled`, `reasoning_effort`, `reasoning_budget_tokens`, and `reasoning_summary` are accepted only when the Provider Model advertises the corresponding `reasoning.controls` flag and value list. A reasoning model without Effort support therefore remains usable without presenting a fictitious Effort selector. See [Provider and model catalog](PROVIDERS.md#reasoning) for the complete matrix. The Agent can override a known context-window default with `model_context_window`; this affects context planning and compaction but cannot make a Provider accept a larger request.
 
 ### Count a complete model input
 
@@ -452,7 +453,36 @@ SSE Event sequence numbers are ordered per Run and replayable through `Last-Even
 
 `run.started.data.execution_attempt` delimits provisional output. If a Worker lease expires, `run.requeued` invalidates provisional model/reasoning deltas from that attempt; the next `run.started` begins a new attempt. A process loss can repeat model work and Provider token usage, so Omoikane promises at-least-once Run execution, not exactly-once model calls.
 
+Public reasoning summaries have a Provider-independent Event contract. `model.reasoning_summary_delta` carries live fragments; `model.reasoning_summary_completed` carries the canonical full `text`. Both include `item_id`, `output_index`, `summary_index`, and `execution_attempt`. A client may render deltas immediately, then replace that summary buffer with the completed text rather than appending it. Omoikane prefers the Provider's streamed completed text, then accumulated streamed deltas, and uses an explicitly marked `summary_text` from `reasoning_item_created` only as a fallback. The tuple `(execution_attempt,item_id,summary_index)` is the normal deduplication identity. A `run.requeued` Event invalidates the preceding attempt's provisional summary Events. `omoikane/client` exports `isModelReasoningSummaryDeltaEvent` and `isModelReasoningSummaryCompletedEvent` type guards for consuming these Events without casting `data`.
+
+Only catalog-classified public summaries are normalized: OpenAI/Codex use explicit Responses `summary_text`, while the Anthropic and Gemini adapters use their documented summarized-thinking streams. `reasoning_text`, `reasoning_content`, `rawContent`, `encrypted_content`, and other Provider-private reasoning fields never become `model.reasoning_summary_*` Events. Before persistence or publication, `reasoning_item_created` and terminal `new_items` reasoning records are reduced to their ID plus explicitly public Responses `summary_text` parts; Raw CoT and encrypted Provider-private fields are removed. Applications should consume the normalized summary Events rather than treating the sanitized reasoning item as a display contract.
+
+Providers may expose a separate reasoning trace through Responses
+`response.reasoning_text.delta/done`, OpenAI-compatible
+`reasoning`/`reasoning_content`/`reasoning_details`, Mistral thinking chunks,
+AI SDK private reasoning parts, or allowlisted service reasoning steps.
+Omoikane never copies that text into its stable metadata Events. Instead,
+`model.reasoning_metadata_started`, throttled
+`model.reasoning_metadata_progress`, and
+`model.reasoning_metadata_completed` report the execution attempt, item/output
+coordinates, delta count, Unicode character count, UTF-8 byte count, elapsed
+time, completion reason, and Provider-reported Reasoning Tokens when available.
+The `done` body is counted only when no deltas arrived, preventing duplicate
+counts. Missing Reasoning Token Usage remains `null`.
+
+Use `GET /v1/runs/:runId/reasoning-metadata` or
+`OmoikaneClient.getReasoningMetadata(runId)` for a durable per-attempt
+aggregate. The client also exports `isModelReasoningMetadataEvent` and the
+three specific Event type guards. `content_available` and `content_persisted`
+are always `false` in this contract. An incomplete prior attempt remains
+visible as `completion_reason: incomplete` after Worker loss; the following
+`run.requeued` still invalidates its provisional execution attempt.
+
+`content_persisted: false` describes the public reasoning-metadata contract and terminal conversation records. If a Run pauses for Tool approval, its private local SDK checkpoint can temporarily retain Provider reasoning/signature data required to resume the exact tool turn. That checkpoint is not exposed by REST/SSE and is deleted at terminal completion.
+
 `GET /v1/runs/:runId/usage` returns one cumulative Usage snapshot for the Run, including per-request entries when the SDK adapter exposes them. Token values are copied from the Provider/SDK; Omoikane does not estimate monetary cost.
+
+Usage from completed model responses is retained even when a later model call, Tool continuation, or compaction attempt fails. Consumers must use `reporting_status`; an absent or `missing` count must not be interpreted as zero usage.
 
 `reporting_status` distinguishes the data contract:
 
@@ -504,7 +534,7 @@ A Run is `completed` only when local validation succeeds. Invalid JSON or a sche
 
 For a structured Run, `model.output_delta` Events are provisional; `message_output_created` and `agent.completed` store only a pending marker, not the unvalidated value. Treat only a `run.completed` Event with `structured_output_validated: true` and the terminal Run `output` as accepted. See [Provider and model catalog](PROVIDERS.md#structured-output) for capability rules.
 
-Use `npm run test:e2e:structured-output` for the opt-in live conformance check. It tests MiMo when `MIMO_API_KEY` is available and local Codex Bridge when `CODEX_BRIDGE_API_KEY` or its normal `~/.cb/config.json` credential is available. The test never prints either credential.
+Use `npm run test:e2e:structured-output` for the opt-in live conformance check. It tests MiMo when `MIMO_API_KEY` is available and GPT-6 Astra through local Codex Bridge v0.1.7 or later when `CODEX_BRIDGE_API_KEY` or its normal `~/.cb/config.json` credential is available. The test never prints either credential.
 
 Guardrails use the OpenAI Agents SDK Input/Output Guardrail lifecycle and an
 Omoikane-owned typed implementation registry. Configure one or more checks on
@@ -581,12 +611,13 @@ are trusted application data and must not contain content or secrets.
 
 Input checks are blocking and all finish before the first model request. When
 any reachable Agent has an Output Guardrail, Omoikane switches the whole Run to strict output
-delivery: it does not publish or store model text, reasoning deltas, final
+delivery: it does not publish or store model text, reasoning summaries, final
 message items, or `agent.completed` output before the SDK accepts the final
-output. Accepted text is then emitted as buffered `model.output_delta` Events in
-the same database transaction as `run.completed`; rejected text is never added
-to Run Events. Tool call arguments and Tool outputs have their own policy and
-approval contract and are not inspected by Output Guardrails.
+output. Accepted text and completed public reasoning summaries are then emitted
+with `buffered: true` and `provisional: false` in the same database transaction
+as `run.completed`; rejected text and summaries are never added to Run Events.
+Tool call arguments and Tool outputs have their own policy and approval contract
+and are not inspected by Output Guardrails.
 
 These hooks let the business system own PII or domain policy without embedding
 that policy in Omoikane. They do not replace business authorization, Tool input
@@ -598,6 +629,8 @@ policy callbacks are not part of the current contract.
 Automatic compaction evaluates the complete model request before the first and every subsequent model call: caller input, instructions, Tools, handoffs, output schema, output reserve, and safety margin. It produces a temporary Projection and small recoverable Run control state, but never writes long-term memory or changes the canonical transcript. The same transformation is available through `POST /v1/context/compact` for preview, dry run, or explicit use.
 
 Deployment `compaction.strategy` defaults to `auto`. Known OpenAI and Codex Bridge Responses models use Provider-native `POST /responses/compact`; unsupported models use Omoikane's portable evidence-bearing checkpoint. Choose `native` to require the native endpoint or `portable` to disable it. A native Projection contains an opaque encrypted `compaction` item and an issuer fingerprint; preserve it unchanged and replay it only through the compatible Provider endpoint/model.
+
+Canonical Agents SDK Function Tool results use `function_call_result`, `callId`, and `output`. Omoikane preserves that representation internally, pairs sequential or parallel transactions by call ID, and compiles it to Responses `function_call_output`/`call_id` only at the native Provider boundary. Compaction attempt, fallback, failure, and completion Events make the selected path observable.
 
 Projection v4 preserves semantic source references, exact anchors, bounded user excerpts, Tool ledger, repeated-compaction lineage, compatibility metadata, and validation results. New Projections expose `validation.semantic_risk` with explicit reasons, a Provider/model/strategy evaluation key, and a caller action; it is deliberately not a fabricated numeric confidence score. `POST /v1/context/compact` accepts either raw `items` or a prior `projection`; `POST /v1/runs` accepts either `conversation` or `projection`. Prefer the full Projection so compatibility and lineage are not discarded.
 
@@ -721,7 +754,7 @@ Run the supported optional integration suite when changing its area:
 npm run test:postgres:docker
 ```
 
-Live MiMo tests read `MIMO_API_KEY` only from ignored `.env` files or the process environment. The 100K compaction benchmark makes several paid calls and should be run deliberately.
+Live MiMo tests read `MIMO_API_KEY` only from ignored `.env` files or the process environment. `npm run test:mimo` verifies a real high-effort Run and its content-free Raw CoT metadata; the 100K compaction benchmark makes several paid calls and should be run deliberately.
 
 For release qualification of compaction semantics, run `npm run eval:compaction`. The Harness uses the versioned synthetic corpus, strict structured Probe batches, deterministic fact/constraint/false-state scoring, and optional multi-generation comparison. Use `OMOIKANE_COMPACTION_EVAL_GENERATIONS=3` for the qualified Portable envelope and select Codex Bridge through the environment variables documented in [Context compaction](CONTEXT_COMPACTION.md). Reports are local test artifacts, not Runtime state.
 

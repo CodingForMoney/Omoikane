@@ -4,6 +4,7 @@ import {
   ScriptedModel,
   assistantMessage,
   functionCall,
+  modelError,
   modelResponse,
 } from "@openai/agents/testing";
 import type { Container } from "../src/container.js";
@@ -232,6 +233,75 @@ describe("TypeScript runtime", () => {
     });
     expect(run.usage_json).not.toHaveProperty("estimated_cost");
     expect(run.usage_json).not.toHaveProperty("currency");
+  });
+
+  it("persists completed model Usage when a later model call fails", async () => {
+    const test = await testContainer();
+    container = test.container;
+    cleanup = test.close;
+    const implementationKey = `test.failure-usage.${crypto.randomUUID()}`;
+    const toolSlug = `failure-usage-${crypto.randomUUID().slice(0, 8)}`;
+    registerToolImplementation(implementationKey, async () => ({ ok: true }));
+    registeredToolKeys.add(implementationKey);
+    await container.tools.create({
+      slug: toolSlug,
+      name: "failure_usage_tool",
+      description: "Complete one Tool before a later model failure",
+      implementation_key: implementationKey,
+      schema: { type: "object", properties: {}, additionalProperties: false },
+      policy: { requires_approval: false, side_effecting: false },
+    });
+    const model = new ScriptedModel([
+      modelResponse({
+        output: [
+          functionCall("failure_usage_tool", {}, { callId: "usage-call-1" }),
+        ],
+        usage: new Usage({
+          requests: 1,
+          inputTokens: 140_162,
+          outputTokens: 38,
+          totalTokens: 140_200,
+        }),
+        rawUsage: {
+          input_tokens: 140_162,
+          output_tokens: 38,
+          total_tokens: 140_200,
+        },
+      }),
+      modelError(new Error("later model request failed")),
+    ]);
+    const fixture = await publishedAgent(container, {
+      model,
+      tools: [toolSlug],
+    });
+    const created = await container.runner.create({
+      deploymentId: fixture.version.id,
+      input: "Call the Tool and continue",
+    });
+
+    await container.runner.processNext();
+
+    const run = await container.runner.get(created.id);
+    expect(run.status).toBe("failed");
+    expect(run.usage_json).toMatchObject({
+      reporting_status: "reported",
+      requests: 1,
+      input_tokens: 140_162,
+      output_tokens: 38,
+      total_tokens: 140_200,
+    });
+    expect(await container.usage.forRun(created.id)).toHaveLength(1);
+    expect(model.calls).toHaveLength(2);
+    expect(model.calls[1]?.request.input).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "function_call_result",
+          callId: "usage-call-1",
+          name: "failure_usage_tool",
+          status: "completed",
+        }),
+      ]),
+    );
   });
 
   it("rejects monetary Run and Agent controls", async () => {

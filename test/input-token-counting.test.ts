@@ -74,7 +74,7 @@ describe("assembled input Token counting", () => {
   it("lists only qualified models with at least one million context Tokens", async () => {
     const { app, container } = await setup();
     const models = container.providers.inputTokenCountingModels();
-    expect(models).toHaveLength(16);
+    expect(models).toHaveLength(17);
     expect(
       models.every(
         (item) =>
@@ -85,6 +85,7 @@ describe("assembled input Token counting", () => {
     ).toBe(true);
     expect(models.map((item) => `${item.provider}/${item.model_id}`)).toEqual(
       expect.arrayContaining([
+        "openai/gpt-6-astra",
         "openai/gpt-5.4",
         "anthropic/claude-sonnet-5",
         "google_gemini/gemini-3.1-pro-preview",
@@ -92,7 +93,7 @@ describe("assembled input Token counting", () => {
         "xiaomi_mimo/mimo-v2.5-pro",
         "deepseek/deepseek-v4-pro",
         "deepseek/deepseek-v4-flash",
-        "alibaba_qwen/qwen3.8-max-preview",
+        "alibaba_qwen/qwen3.8-max",
       ]),
     );
     expect(

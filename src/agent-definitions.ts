@@ -177,8 +177,14 @@ export class AgentDefinitionService {
       throw new ValidationError("agent instructions are required");
     if (metadata.slug && !/^[a-z0-9][a-z0-9_-]{1,127}$/.test(metadata.slug))
       throw new ValidationError("invalid agent slug");
-    if (spec.reasoning_effort !== undefined)
-      throw new ValidationError("reasoning_effort belongs in model_settings");
+    for (const field of [
+      "reasoning_effort",
+      "reasoning_enabled",
+      "reasoning_budget_tokens",
+      "reasoning_summary",
+    ])
+      if (spec[field] !== undefined)
+        throw new ValidationError(`${field} belongs in model_settings`);
     if (Object.hasOwn(spec, "memory"))
       throw new ValidationError(
         "memory is not supported by the Runtime; provide business context through Run context, Function Tools, or MCP",

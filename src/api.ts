@@ -587,6 +587,10 @@ export async function createApp(
     const { runId } = requestParams(request, "getRun");
     return container.runner.publicRun(runId);
   });
+  app.get("/v1/runs/:runId/reasoning-metadata", async (request) => {
+    const { runId } = requestParams(request, "getRunReasoningMetadata");
+    return container.runner.reasoningMetadata(runId);
+  });
   app.post("/v1/runs/:runId/cancel", async (request) => {
     const { runId } = requestParams(request, "cancelRun");
     requestBody(request, "cancelRun");

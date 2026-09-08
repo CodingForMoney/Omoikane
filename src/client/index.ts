@@ -24,6 +24,18 @@ import type {
   McpServerRecord,
   McpServerUpdate,
   McpToolsResponse,
+  ModelReasoningMetadataCompletedData,
+  ModelReasoningMetadataCompletedEvent,
+  ModelReasoningMetadataEvent,
+  ModelReasoningMetadataProgressData,
+  ModelReasoningMetadataProgressEvent,
+  ModelReasoningMetadataStartedData,
+  ModelReasoningMetadataStartedEvent,
+  ModelReasoningSummaryCompletedData,
+  ModelReasoningSummaryCompletedEvent,
+  ModelReasoningSummaryCoordinates,
+  ModelReasoningSummaryDeltaData,
+  ModelReasoningSummaryDeltaEvent,
   ProviderConnection,
   ProviderConnectionCreate,
   ProviderConnectionUpdate,
@@ -32,6 +44,8 @@ import type {
   ProviderValidation,
   PageResponse,
   ResourceRecord,
+  ReasoningMetadataAttempt,
+  ReasoningMetadataResponse,
   RunCreate,
   RunLimits,
   RunRecord,
@@ -74,6 +88,18 @@ export type {
   McpServerRecord,
   McpServerUpdate,
   McpToolsResponse,
+  ModelReasoningMetadataCompletedData,
+  ModelReasoningMetadataCompletedEvent,
+  ModelReasoningMetadataEvent,
+  ModelReasoningMetadataProgressData,
+  ModelReasoningMetadataProgressEvent,
+  ModelReasoningMetadataStartedData,
+  ModelReasoningMetadataStartedEvent,
+  ModelReasoningSummaryCompletedData,
+  ModelReasoningSummaryCompletedEvent,
+  ModelReasoningSummaryCoordinates,
+  ModelReasoningSummaryDeltaData,
+  ModelReasoningSummaryDeltaEvent,
   ProviderConnection,
   ProviderConnectionCreate,
   ProviderConnectionUpdate,
@@ -82,6 +108,8 @@ export type {
   ProviderValidation,
   PageResponse,
   ResourceRecord,
+  ReasoningMetadataAttempt,
+  ReasoningMetadataResponse,
   RunCreate,
   RunLimits,
   RunRecord,
@@ -97,7 +125,41 @@ export type {
   VersionResponse,
 } from "../contracts.js";
 
+export { collectReasoningMetadata } from "../reasoning-metadata.js";
+
 export type UsageReportingStatus = "reported" | "partial" | "missing";
+
+export const isModelReasoningSummaryDeltaEvent = (
+  event: RuntimeEvent,
+): event is ModelReasoningSummaryDeltaEvent =>
+  event.type === "model.reasoning_summary_delta";
+
+export const isModelReasoningSummaryCompletedEvent = (
+  event: RuntimeEvent,
+): event is ModelReasoningSummaryCompletedEvent =>
+  event.type === "model.reasoning_summary_completed";
+
+export const isModelReasoningMetadataStartedEvent = (
+  event: RuntimeEvent,
+): event is ModelReasoningMetadataStartedEvent =>
+  event.type === "model.reasoning_metadata_started";
+
+export const isModelReasoningMetadataProgressEvent = (
+  event: RuntimeEvent,
+): event is ModelReasoningMetadataProgressEvent =>
+  event.type === "model.reasoning_metadata_progress";
+
+export const isModelReasoningMetadataCompletedEvent = (
+  event: RuntimeEvent,
+): event is ModelReasoningMetadataCompletedEvent =>
+  event.type === "model.reasoning_metadata_completed";
+
+export const isModelReasoningMetadataEvent = (
+  event: RuntimeEvent,
+): event is ModelReasoningMetadataEvent =>
+  isModelReasoningMetadataStartedEvent(event) ||
+  isModelReasoningMetadataProgressEvent(event) ||
+  isModelReasoningMetadataCompletedEvent(event);
 
 export interface UsageRecord {
   id: string;
@@ -592,6 +654,11 @@ export class OmoikaneClient {
   }
   getRun(runId: string) {
     return this.request<RunRecord>(`/v1/runs/${encodeURIComponent(runId)}`);
+  }
+  getReasoningMetadata(runId: string) {
+    return this.request<ReasoningMetadataResponse>(
+      `/v1/runs/${encodeURIComponent(runId)}/reasoning-metadata`,
+    );
   }
   countInputTokens(deploymentId: string, input: InputTokenCount) {
     return this.request<InputTokenCountResponse>(

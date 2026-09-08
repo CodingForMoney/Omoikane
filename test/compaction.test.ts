@@ -7,6 +7,10 @@ import {
 import type { Container } from "../src/container.js";
 import { ValidationError } from "../src/database.js";
 import { publishedAgent, testContainer } from "./helpers.js";
+import {
+  registerToolImplementation,
+  unregisterToolImplementation,
+} from "../src/tools.js";
 
 let container: Container | undefined;
 let cleanup: (() => Promise<void>) | undefined;
@@ -186,8 +190,29 @@ describe("external context compaction", () => {
         preserve_recent_tokens: 500,
       },
     });
+    const canonicalToolHistory = [
+      ...historyItems(4, 400),
+      {
+        type: "function_call",
+        callId: "canonical-fallback-call",
+        name: "fetch_page",
+        arguments: '{"page":7}',
+        status: "completed",
+      },
+      {
+        type: "function_call_result",
+        callId: "canonical-fallback-call",
+        name: "fetch_page",
+        status: "completed",
+        output: {
+          type: "text",
+          text: `page result ${"evidence ".repeat(2_000)}`,
+        },
+      },
+      ...historyItems(4, 400),
+    ];
     const compacted = await container.compaction.compact(
-      historyItems(8, 400) as never[],
+      canonicalToolHistory as never[],
       resolved,
       { force: true },
     );
@@ -200,6 +225,15 @@ describe("external context compaction", () => {
         native_fallback: "CODEX_COMPACTION_UNAVAILABLE",
       },
     });
+    expect(compacted.projection?.checkpoint?.tool_ledger).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          call_id: "canonical-fallback-call",
+          tool_name: "fetch_page",
+          status: "completed",
+        }),
+      ]),
+    );
   });
 
   it("rejects explicit native compaction for an unsupported Provider", async () => {
@@ -335,6 +369,100 @@ describe("external context compaction", () => {
       (await container.events.list(run.id)).map((event) => event.type),
     ).toContain("context.compacted");
   });
+
+  it("compacts a real Agents SDK function result and continues the Run", async () => {
+    const test = await testContainer();
+    container = test.container;
+    cleanup = test.close;
+    const implementationKey = `test.compaction-tool.${crypto.randomUUID()}`;
+    const toolSlug = `compaction-tool-${crypto.randomUUID().slice(0, 8)}`;
+    registerToolImplementation(implementationKey, async () => ({
+      items: "tool evidence ".repeat(1_900),
+      nextOffset: null,
+    }));
+    try {
+      await container.tools.create({
+        slug: toolSlug,
+        name: "load_compaction_evidence",
+        description: "Return enough evidence to trigger context compaction",
+        implementation_key: implementationKey,
+        schema: { type: "object", properties: {}, additionalProperties: false },
+        policy: { requires_approval: false, side_effecting: false },
+      });
+      const model = new ScriptedModel([
+        modelResponse([
+          {
+            type: "function_call",
+            name: "load_compaction_evidence",
+            callId: "real-sdk-compaction-call",
+            id: "real-sdk-compaction-call",
+            status: "completed",
+            arguments: "{}",
+          },
+        ]),
+        modelResponse([assistantMessage(JSON.stringify(validSummary))]),
+        modelResponse([assistantMessage("continued after Tool compaction")]),
+      ]);
+      const fixture = await publishedAgent(container, {
+        model,
+        tools: [toolSlug],
+        modelContextWindow: 50_000,
+        compaction: {
+          enabled: true,
+          strategy: "portable",
+          high_watermark_ratio: 0.15,
+          low_watermark_ratio: 0.1,
+          emergency_watermark_ratio: 0.95,
+          reserved_output_tokens: 1_000,
+          safety_margin_tokens: 100,
+          preserve_recent_tokens: 0,
+          max_checkpoint_tokens: 700,
+        },
+      });
+      const run = await container.runner.create({
+        deploymentId: fixture.version.id,
+        conversation: historyItems(4, 1) as never[],
+        input: "Load the evidence, then finish.",
+      });
+
+      await container.runner.processNext();
+
+      const completed = await container.runner.publicRun(run.id);
+      expect(completed.status, JSON.stringify(completed.error_json)).toBe(
+        "completed",
+      );
+      expect(completed.output).toBe("continued after Tool compaction");
+      expect(completed.projection).toMatchObject({
+        version: 4,
+        strategy: "portable",
+        checkpoint: {
+          tool_ledger: expect.arrayContaining([
+            expect.objectContaining({
+              call_id: "real-sdk-compaction-call",
+              tool_name: "load_compaction_evidence",
+              status: "completed",
+            }),
+          ]),
+        },
+      });
+      expect(model.calls).toHaveLength(3);
+      expect(model.calls[2]?.request.input).toEqual(
+        expect.arrayContaining([expect.objectContaining({ role: "user" })]),
+      );
+      const eventTypes = (await container.events.list(run.id)).map(
+        (event) => event.type,
+      );
+      expect(eventTypes).toEqual(
+        expect.arrayContaining([
+          "context.compaction_started",
+          "context.compacted",
+          "run.completed",
+        ]),
+      );
+    } finally {
+      unregisterToolImplementation(implementationKey);
+    }
+  }, 30_000);
 
   it("skips below the high watermark", async () => {
     const test = await testContainer();
