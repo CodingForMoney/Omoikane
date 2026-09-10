@@ -4,6 +4,7 @@ import { createApp } from "../src/api.js";
 import type { Container } from "../src/container.js";
 import {
   clearOfficialTokenizerCacheForTests,
+  deepseekV41ResponsesPromptBody,
   renderDeepseekV41Prompt,
   renderDeepseekV4Prompt,
 } from "../src/local-tokenizers.js";
@@ -473,6 +474,126 @@ This instruction must be visible to the model.
     );
     expect(toolPrompt).toContain("<tool_result>sunny</tool_result>");
     expect(toolPrompt).not.toContain("<｜DSML｜tool_calls>");
+  });
+
+  it("matches the official DeepSeek V4.1 multi-turn chat golden vector", () => {
+    expect(
+      renderDeepseekV41Prompt({
+        messages: [
+          { role: "system", content: "You are a helpful assistant." },
+          { role: "user", content: "Hello" },
+          {
+            role: "assistant",
+            reasoning_content: "The user said hello, I should greet back.",
+            content: "Hi there! How can I help you?",
+          },
+          { role: "user", content: "What is the capital of France?" },
+          {
+            role: "assistant",
+            reasoning_content:
+              "The user asks about the capital of France. It is Paris.",
+            content: "The capital of France is Paris.",
+          },
+        ],
+        reasoning_effort: "none",
+      }),
+    ).toBe(
+      "<｜begin▁of▁sentence｜><｜System｜>You are a helpful assistant.<｜User｜>Hello<｜Assistant｜></think>Hi there! How can I help you?<｜end▁of▁sentence｜><｜User｜>What is the capital of France?<｜Assistant｜></think>The capital of France is Paris.<｜end▁of▁sentence｜>",
+    );
+  });
+
+  it("normalizes the actual DeepSeek Responses request before tokenization", () => {
+    const body = deepseekV41ResponsesPromptBody({
+      instructions: "Use tools precisely.",
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "Weather?" }],
+        },
+        {
+          type: "reasoning",
+          content: [{ type: "reasoning_text", text: "I should check." }],
+        },
+        {
+          type: "function_call",
+          call_id: "call_1",
+          name: "weather",
+          arguments: '{"city":"Taipei"}',
+        },
+        {
+          type: "function_call_output",
+          call_id: "call_1",
+          output: "sunny",
+        },
+      ],
+      tools: [
+        {
+          type: "function",
+          name: "weather",
+          description: "Get weather",
+          parameters: {
+            type: "object",
+            properties: { city: { type: "string" } },
+            required: ["city"],
+          },
+          strict: true,
+        },
+      ],
+      reasoning: { effort: "max" },
+      text: {
+        format: {
+          type: "json_schema",
+          name: "weather_result",
+          strict: true,
+          schema: {
+            type: "object",
+            properties: { result: { type: "string" } },
+            required: ["result"],
+            additionalProperties: false,
+          },
+        },
+      },
+    });
+
+    expect(body).toMatchObject({
+      reasoning_effort: "max",
+      response_format: {
+        type: "object",
+        properties: { result: { type: "string" } },
+      },
+      tools: [
+        {
+          type: "function",
+          function: { name: "weather" },
+        },
+      ],
+    });
+    expect(
+      (body.tools as Array<{ function: Record<string, unknown> }>)[0]!.function,
+    ).not.toHaveProperty("strict");
+    const prompt = renderDeepseekV41Prompt(body);
+    expect(prompt).toContain("Reasoning Effort: 100 (range 1-100");
+    expect(prompt).toContain("I should check.</think>");
+    expect(prompt).toContain('<｜DSML｜ invoke name="weather">');
+    expect(prompt).toContain("<tool_result>sunny</tool_result>");
+    expect(prompt).toContain("## Response Format:");
+
+    expect(
+      deepseekV41ResponsesPromptBody({
+        input: "Do not call tools.",
+        tools: [{ type: "function", name: "unused", parameters: {} }],
+        tool_choice: "none",
+      }).tools,
+    ).toEqual([]);
+  });
+
+  it("fails closed for server-managed DeepSeek Responses input", () => {
+    expect(() =>
+      deepseekV41ResponsesPromptBody({
+        input: [{ type: "web_search_call", id: "search_1" }],
+      }),
+    ).toThrow("cannot exactly encode Responses input item web_search_call");
   });
 
   it("fails closed for a million-context model without a complete counter", async () => {

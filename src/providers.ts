@@ -30,6 +30,7 @@ import type { PageOptions } from "./pagination.js";
 import {
   countWithOfficialTokenizer,
   localTokenizerRequestHasMultimodalInput,
+  OfficialTokenizerUnsupportedRequestError,
 } from "./local-tokenizers.js";
 import {
   ReasoningCompatibleModel,
@@ -2101,6 +2102,21 @@ export class ProviderService {
     return captured;
   }
 
+  private buildOpenAiResponsesWireRequest(
+    modelId: string,
+    request: ModelRequest,
+  ): Record<string, unknown> {
+    const client = new OpenAI({
+      apiKey: "capture-only",
+      baseURL: "http://127.0.0.1:1/v1",
+      maxRetries: 0,
+    });
+    return new InputCountingOpenAIResponsesModel(
+      client,
+      modelId,
+    ).buildWireRequest({ ...request, signal: undefined });
+  }
+
   private async countOpenAiResponsesInput(
     connection: ConnectionData,
     modelId: string,
@@ -2235,13 +2251,20 @@ export class ProviderService {
         `model ${modelId} local Tokenizer supports text input only`,
         422,
       );
-    const wire = await this.captureOpenAiChatWireRequest(modelId, request);
+    const isDeepseekV41 = capability.tokenizer_id.startsWith(
+      "deepseek-ai/DeepSeek-V4.1-",
+    );
+    const body = isDeepseekV41
+      ? this.buildOpenAiResponsesWireRequest(modelId, request)
+      : (await this.captureOpenAiChatWireRequest(modelId, request)).body;
     try {
-      return await countWithOfficialTokenizer(wire.body, {
+      return await countWithOfficialTokenizer(body, {
         tokenizer_id: capability.tokenizer_id,
         tokenizer_revision: capability.tokenizer_revision,
       });
     } catch (error) {
+      if (error instanceof OfficialTokenizerUnsupportedRequestError)
+        throw new InputTokenCountingProviderError(error.message, 422);
       throw new InputTokenCountingProviderError(
         error instanceof Error
           ? `official local Tokenizer failed: ${error.message}`

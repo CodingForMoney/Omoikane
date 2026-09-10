@@ -7,6 +7,13 @@ export interface OfficialTokenizerDescriptor {
   tokenizer_revision: string;
 }
 
+export class OfficialTokenizerUnsupportedRequestError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OfficialTokenizerUnsupportedRequestError";
+  }
+}
+
 interface LoadedTokenizer {
   tokenizer: Tokenizer;
   config: Record<string, unknown>;
@@ -468,6 +475,202 @@ const DEEPSEEK_V41_EFFORT: Record<string, number> = {
   max: 100,
 };
 
+const unsupportedOfficialTokenizerInput = (message: string): never => {
+  throw new OfficialTokenizerUnsupportedRequestError(message);
+};
+
+function deepseekV41ResponsesText(value: unknown, field: string): string {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value))
+    return unsupportedOfficialTokenizerInput(
+      `DeepSeek V4.1 local Tokenizer cannot encode ${field}`,
+    );
+  return value
+    .map((part) => {
+      const block = asRecord(part);
+      if (
+        !block ||
+        !["input_text", "output_text", "reasoning_text", "text"].includes(
+          String(block.type),
+        ) ||
+        typeof block.text !== "string"
+      )
+        return unsupportedOfficialTokenizerInput(
+          `DeepSeek V4.1 local Tokenizer supports text-only ${field}`,
+        );
+      return block.text;
+    })
+    .join("");
+}
+
+function deepseekV41ResponsesTools(value: unknown): JsonRecord[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value))
+    return unsupportedOfficialTokenizerInput(
+      "DeepSeek V4.1 Responses tools must be an array",
+    );
+  return value.map((item) => {
+    const tool = asRecord(item);
+    if (!tool || tool.type !== "function" || typeof tool.name !== "string")
+      return unsupportedOfficialTokenizerInput(
+        `DeepSeek V4.1 local Tokenizer cannot exactly encode Responses tool type ${String(tool?.type ?? "unknown")}`,
+      );
+    const fn: JsonRecord = { name: tool.name };
+    for (const key of ["description", "parameters"])
+      if (tool[key] !== undefined) fn[key] = tool[key];
+    return { type: "function", function: fn };
+  });
+}
+
+const normalizedDeepseekV41Effort = (value: unknown): string | undefined => {
+  if (value === undefined || value === null) return undefined;
+  const effort = String(value);
+  if (effort === "none" || effort === "max") return effort;
+  if (["minimal", "low"].includes(effort)) return "low";
+  if (["medium", "high", "xhigh"].includes(effort)) return "high";
+  return unsupportedOfficialTokenizerInput(
+    `DeepSeek V4.1 local Tokenizer cannot encode reasoning effort ${effort}`,
+  );
+};
+
+/**
+ * Convert the public DeepSeek Responses request shape into the official V4.1
+ * Prompt Encoder input. Unsupported server-managed items fail closed rather
+ * than producing a plausible but incomplete count.
+ */
+export function deepseekV41ResponsesPromptBody(body: JsonRecord): JsonRecord {
+  const messages: JsonRecord[] = [];
+  if (body.instructions !== undefined && body.instructions !== null) {
+    const instructions = deepseekV41ResponsesText(
+      body.instructions,
+      "Responses instructions",
+    );
+    if (instructions) messages.push({ role: "system", content: instructions });
+  }
+
+  const input =
+    typeof body.input === "string"
+      ? [{ type: "message", role: "user", content: body.input }]
+      : body.input === undefined && messages.length
+        ? []
+        : body.input;
+  if (!Array.isArray(input))
+    return unsupportedOfficialTokenizerInput(
+      "DeepSeek V4.1 Responses request does not contain input items",
+    );
+
+  let pendingReasoning = "";
+  let openToolCallMessage: JsonRecord | undefined;
+  const flushPendingReasoning = () => {
+    if (pendingReasoning)
+      unsupportedOfficialTokenizerInput(
+        "DeepSeek V4.1 Responses reasoning item is not adjacent to an assistant output",
+      );
+  };
+
+  for (const value of input) {
+    const item = asRecord(value);
+    if (!item)
+      return unsupportedOfficialTokenizerInput(
+        "DeepSeek V4.1 Responses input contains a non-object item",
+      );
+    const type = String(item.type ?? (item.role ? "message" : ""));
+
+    if (type === "reasoning") {
+      openToolCallMessage = undefined;
+      const reasoning = deepseekV41ResponsesText(
+        item.content ?? [],
+        "Responses reasoning content",
+      );
+      pendingReasoning += reasoning;
+      continue;
+    }
+
+    if (type === "message") {
+      openToolCallMessage = undefined;
+      const role = String(item.role);
+      if (!["system", "developer", "user", "assistant"].includes(role))
+        return unsupportedOfficialTokenizerInput(
+          `DeepSeek V4.1 local Tokenizer cannot encode Responses message role ${role}`,
+        );
+      if (pendingReasoning && role !== "assistant") flushPendingReasoning();
+      const message: JsonRecord = {
+        role,
+        content: deepseekV41ResponsesText(
+          item.content ?? "",
+          "Responses message content",
+        ),
+      };
+      if (role === "assistant" && pendingReasoning) {
+        message.reasoning_content = pendingReasoning;
+        pendingReasoning = "";
+      }
+      messages.push(message);
+      continue;
+    }
+
+    if (type === "function_call") {
+      if (!openToolCallMessage) {
+        openToolCallMessage = {
+          role: "assistant",
+          content: "",
+          ...(pendingReasoning ? { reasoning_content: pendingReasoning } : {}),
+          tool_calls: [],
+        };
+        pendingReasoning = "";
+        messages.push(openToolCallMessage);
+      }
+      if (typeof item.name !== "string" || typeof item.arguments !== "string")
+        return unsupportedOfficialTokenizerInput(
+          "DeepSeek V4.1 Responses function_call is incomplete",
+        );
+      (openToolCallMessage.tool_calls as JsonRecord[]).push({
+        id: item.call_id ?? item.id ?? "",
+        type: "function",
+        function: { name: item.name, arguments: item.arguments },
+      });
+      continue;
+    }
+
+    if (type === "function_call_output") {
+      openToolCallMessage = undefined;
+      flushPendingReasoning();
+      messages.push({
+        role: "tool",
+        tool_call_id: item.call_id ?? "",
+        content: deepseekV41ResponsesText(
+          item.output ?? "",
+          "Responses function_call_output",
+        ),
+      });
+      continue;
+    }
+
+    return unsupportedOfficialTokenizerInput(
+      `DeepSeek V4.1 local Tokenizer cannot exactly encode Responses input item ${type || "unknown"}`,
+    );
+  }
+  flushPendingReasoning();
+
+  const reasoning = asRecord(body.reasoning);
+  const format = asRecord(asRecord(body.text)?.format);
+  let responseFormat: unknown;
+  if (format?.type === "json_schema") responseFormat = format.schema;
+  else if (format && format.type !== "text") responseFormat = format;
+
+  return {
+    messages,
+    tools:
+      body.tool_choice === "none"
+        ? []
+        : deepseekV41ResponsesTools(body.tools),
+    ...(responseFormat ? { response_format: responseFormat } : {}),
+    ...(reasoning?.effort !== undefined
+      ? { reasoning_effort: normalizedDeepseekV41Effort(reasoning.effort) }
+      : {}),
+  };
+}
+
 const deepseekV41Tools = (tools: JsonRecord[]): string => {
   const schemas = tools.map((tool) => pythonJson(tool)).join("\n");
   return `## Tools
@@ -685,7 +888,11 @@ export async function countWithOfficialTokenizer(
   const prompt = descriptor.tokenizer_id.startsWith(
     "deepseek-ai/DeepSeek-V4.1-",
   )
-    ? renderDeepseekV41Prompt(body)
+    ? renderDeepseekV41Prompt(
+        Array.isArray(body.messages)
+          ? body
+          : deepseekV41ResponsesPromptBody(body),
+      )
     : descriptor.tokenizer_id.startsWith("deepseek-ai/DeepSeek-V4-")
       ? renderDeepseekV4Prompt(body)
       : renderChatTemplate(loaded.config, body);
@@ -706,7 +913,9 @@ export function localTokenizerRequestHasMultimodalInput(
         const block = asRecord(part);
         return (
           block &&
-          !["input_text", "output_text", "text"].includes(String(block.type))
+          !["input_text", "output_text", "reasoning_text", "text"].includes(
+            String(block.type),
+          )
         );
       })
     );
