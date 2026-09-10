@@ -53,6 +53,8 @@ export interface ProviderModelDefinition {
   display_name: string;
   capabilities: ModelCapability;
   capability_reviewed_at: string;
+  /** Canonical replacement used when a Provider stops listing this alias. */
+  replacement_model?: string;
 }
 export interface ProviderDefinition {
   id: string;
@@ -92,7 +94,7 @@ interface ProviderOperationError {
   message: string;
 }
 
-const CATALOG_REVIEWED_AT = "2026-09-05";
+const CATALOG_REVIEWED_AT = "2026-09-10";
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 15_000;
 const DEFAULT_DISCOVERY_MAX_RETRIES = 2;
 const MAX_DISCOVERY_PAGES = 100;
@@ -392,6 +394,16 @@ const responsesReasoning = (
     ...rest,
   });
 };
+const deepseekResponsesReasoning = (): ReasoningCapability =>
+  responsesReasoning(["none", "low", "high", "max"], {
+    activation: "default",
+    visibility: "provider_trace",
+    controls: { toggle: true, summary: false },
+    request_adapters: ["responses_reasoning"],
+    raw_trace_metadata: "responses_reasoning_text",
+    native_summary: "not_observed",
+    replay: "reasoning_item",
+  });
 const chatEffortReasoning = (
   effort_values: string[],
   options: ReasoningOptions = {},
@@ -1078,34 +1090,47 @@ export const PROVIDER_CATALOG: Record<string, ProviderDefinition> =
         "https://api.deepseek.com",
         "responses",
         [
+          model("deepseek-flash", 1_000_000, {
+            max_output_tokens: 384_000,
+            input_token_counting: localTokenizerInputCounting(
+              "deepseek-ai/DeepSeek-V4.1-Flash",
+              "dba1be0a40aa45a94ad051997016db3960a90277",
+            ),
+            vision: true,
+            structured_output: "native",
+            reasoning: deepseekResponsesReasoning(),
+          }),
           model("deepseek-v4-pro", 1_000_000, {
-            input_token_counting: localTokenizerInputCounting(
-              "deepseek-ai/DeepSeek-V4-Pro",
-              "b5968e9190ef611bbf34a7229255be88a0e937c1",
-            ),
-            reasoning: responsesReasoning(["low", "high", "max"], {
-              visibility: "provider_trace",
-              controls: { toggle: true, summary: false },
-              request_adapters: ["responses_reasoning", "responses_thinking"],
-              raw_trace_metadata: "responses_reasoning_text",
-              native_summary: "not_observed",
-              replay: "reasoning_item",
-            }),
+            max_output_tokens: 384_000,
+            structured_output: "native",
+            reasoning: deepseekResponsesReasoning(),
           }),
-          model("deepseek-v4-flash", 1_000_000, {
-            input_token_counting: localTokenizerInputCounting(
-              "deepseek-ai/DeepSeek-V4-Flash",
-              "60d8d70770c6776ff598c94bb586a859a38244f1",
-            ),
-            reasoning: responsesReasoning(["low", "high", "max"], {
-              visibility: "provider_trace",
-              controls: { toggle: true, summary: false },
-              request_adapters: ["responses_reasoning", "responses_thinking"],
-              raw_trace_metadata: "responses_reasoning_text",
-              native_summary: "not_observed",
-              replay: "reasoning_item",
+          {
+            ...model("deepseek-v4-flash", 1_000_000, {
+              max_output_tokens: 384_000,
+              input_token_counting: localTokenizerInputCounting(
+                "deepseek-ai/DeepSeek-V4.1-Flash",
+                "dba1be0a40aa45a94ad051997016db3960a90277",
+              ),
+              vision: true,
+              structured_output: "native",
+              reasoning: deepseekResponsesReasoning(),
             }),
-          }),
+            replacement_model: "deepseek-flash",
+          },
+          {
+            ...model("deepseek-v4-flash-vision-exp", 1_000_000, {
+              max_output_tokens: 384_000,
+              input_token_counting: localTokenizerInputCounting(
+                "deepseek-ai/DeepSeek-V4.1-Flash",
+                "dba1be0a40aa45a94ad051997016db3960a90277",
+              ),
+              vision: true,
+              structured_output: "native",
+              reasoning: deepseekResponsesReasoning(),
+            }),
+            replacement_model: "deepseek-flash",
+          },
         ],
       ),
       provider(
@@ -2906,7 +2931,17 @@ export class ProviderService {
         tx,
       );
       const activeIds = new Set(active.map((item) => item.model_id));
+      const replacementDefault = connection.default_model
+        ? definition.models.find(
+            (item) =>
+              item.id === connection.default_model &&
+              !activeIds.has(connection.default_model!) &&
+              item.replacement_model &&
+              activeIds.has(item.replacement_model),
+          )?.replacement_model
+        : undefined;
       const defaultModel =
+        replacementDefault ??
         connection.default_model ??
         definition.models.find((item) => activeIds.has(item.id))?.id ??
         active[0]?.model_id;
@@ -3286,23 +3321,31 @@ export class ProviderService {
     const modelId = String(config.model ?? connection.default_model ?? "");
     if (!modelId) throw new ValidationError("agent config requires a model");
     const models = await this.listModels(connectionId);
-    const selectedModel = models.find((item) => item.model_id === modelId);
+    const replacementModelId = this.definition(connection.provider).models.find(
+      (item) => item.id === modelId,
+    )?.replacement_model;
+    const selectedModel =
+      models.find((item) => item.model_id === modelId) ??
+      (replacementModelId
+        ? models.find((item) => item.model_id === replacementModelId)
+        : undefined);
     if (!selectedModel)
       throw new ValidationError(
         `model ${modelId} is not active for Provider connection ${connectionId}; synchronize models or add it explicitly`,
       );
+    const effectiveModelId = selectedModel.model_id;
     const capability = selectedModel.capabilities as ModelCapability;
     if (
       capability.model_kind === "transcription" ||
       capability.model_kind === "speech_synthesis"
     )
       throw new ValidationError(
-        `model ${modelId} is a dedicated ${capability.model_kind} model and cannot back an Agent deployment`,
+        `model ${effectiveModelId} is a dedicated ${capability.model_kind} model and cannot back an Agent deployment`,
       );
     const settings = applyReasoningModelSettings(
       { ...((config.model_settings as Record<string, unknown>) ?? {}) },
       capability.reasoning,
-      modelId,
+      effectiveModelId,
     );
     if (settings.max_tokens !== undefined && settings.maxTokens === undefined) {
       settings.maxTokens = settings.max_tokens;
@@ -3316,7 +3359,7 @@ export class ProviderService {
     }
     return {
       ...config,
-      model: modelId,
+      model: effectiveModelId,
       model_settings: settings,
       provider: {
         connection_id: connectionId,

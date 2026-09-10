@@ -1,6 +1,6 @@
 # Provider and model catalog
 
-> Implementation source of truth: `src/providers.ts`. Catalog last reviewed: 2026-09-05.
+> Implementation source of truth: `src/providers.ts`. Catalog last reviewed: 2026-09-10.
 
 This document describes Provider definitions, protocols, model discovery, reasoning capabilities, structured output, context defaults, and credentials. For the creation workflow, see [Configure a Provider first](DEVELOPER_GUIDE.md#2-configure-a-provider-first).
 
@@ -34,6 +34,8 @@ The catalog currently contains 28 Provider definitions. They cover OpenAI, Anthr
 
 Catalog presence means Omoikane knows how to configure the endpoint. It does not guarantee that every model or optional capability has been live-tested.
 
+DeepSeek V4.1 Flash uses the canonical API model ID `deepseek-flash`. It is a 1M-context, text-and-image-input model with a 384K maximum output and native Responses, JSON/structured-output, Tool-call, and reasoning support. DeepSeek has retired V4 Flash and V4 Flash Vision Exp; the legacy IDs `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` are retained as temporary Provider aliases and point to V4.1 Flash. Omoikane keeps those IDs for compatibility but selects `deepseek-flash` by default. DeepSeek also announced that `deepseek-v4-pro` will route to V4.1 Flash after 2026-09-14 12:00 Beijing time until V4.1 Pro is released. Sources: [official release](https://deepseek.com/news/deepseek-v4-1-flash/), [API model table](https://api-docs.deepseek.com/quick_start/pricing/), and [open model/Prompt Encoder](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash).
+
 ## Model synchronization
 
 On connection creation or an explicit sync request, Omoikane discovers models through the protocol-specific endpoint:
@@ -57,7 +59,7 @@ Discovery is bounded and read-only: the default request timeout is 15 seconds, s
 }
 ```
 
-The complete result is committed in one database transaction. Models absent from a successful non-empty remote result become `unavailable` and disappear from the active selection list, but their historical records are retained. An explicitly added model remains active and is marked `remote_presence: not_listed`. A missing default model is not silently replaced: the Connection reports `default_model_status: unavailable`, and new resolution fails until the caller selects another active model.
+The complete result is committed in one database transaction. Models absent from a successful non-empty remote result become `unavailable` and disappear from the active selection list, but their historical records are retained. An explicitly added model remains active and is marked `remote_presence: not_listed`. A missing default model is not silently replaced: the Connection reports `default_model_status: unavailable`, and new resolution fails until the caller selects another active model. The sole exception is a catalog-declared Provider alias replacement; synchronization migrates that stale default to the active canonical ID.
 
 Newly discovered unknown models receive conservative capabilities (text input/output only; Tools, legacy `vision`, and Streaming are false; all task capabilities are `none`; `capability_status` is `unknown`) until they are cataloged or explicitly overridden. User overrides are stored separately and survive later synchronization. Capability input is Schema-validated, including modalities, task consistency, nested Reasoning, and native-compaction contracts.
 
@@ -125,8 +127,10 @@ The current catalog includes dedicated MiMo V2.5 ASR and TTS models backed by ex
 | Xiaomi MiMo             | `mimo-v2.5-pro`               | `agent`            | text                      | text   | —                   | —         | —         |
 | Xiaomi MiMo             | `mimo-v2.5-asr`               | `transcription`    | audio                     | text   | —                   | dedicated | —         |
 | Xiaomi MiMo             | `mimo-v2.5-tts`               | `speech_synthesis` | text                      | audio  | —                   | —         | dedicated |
+| DeepSeek                | `deepseek-flash`              | `agent`            | text, image               | text   | native              | —         | —         |
 | DeepSeek                | `deepseek-v4-pro`             | `agent`            | text                      | text   | —                   | —         | —         |
-| DeepSeek                | `deepseek-v4-flash`           | `agent`            | text                      | text   | —                   | —         | —         |
+| DeepSeek                | `deepseek-v4-flash`           | `agent`            | text, image               | text   | native              | —         | —         |
+| DeepSeek                | `deepseek-v4-flash-vision-exp` | `agent`           | text, image               | text   | native              | —         | —         |
 | Alibaba Qwen            | `qwen3.8-max`                 | `agent`            | text, image               | text   | native              | —         | —         |
 | Alibaba Qwen            | `qwen3.7-max`                 | `agent`            | text, image               | text   | native              | —         | —         |
 | Alibaba Qwen            | `qwen3.7-plus`                | `agent`            | text, image               | text   | native              | —         | —         |
@@ -212,11 +216,11 @@ Specify only controls advertised by the chosen model. Before execution, Omoikane
 | Output semantics                                   | Providers/models in the fixed catalog                                                                                                                                                                                             |
 | -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Public summary                                     | OpenAI GPT-6 Astra and GPT-5.4/5.6; Codex Bridge GPT-6 Astra and GPT-5.6; all cataloged Claude models; all cataloged Gemini models                                                                                                |
-| Content-free metadata for a Provider-visible trace | Cohere Command A+; Mistral Small; Groq reasoning models; Together GPT-OSS; Cerebras GPT-OSS; MiMo 2.5/Pro; DeepSeek V4; Qwen 3.7/3.8; GLM; Kimi; Doubao Seed 2.0 Lite; ERNIE X1.1; Hunyuan T1; MiniMax M2.x; StepFun 3.5; Spark-X |
+| Content-free metadata for a Provider-visible trace | Cohere Command A+; Mistral Small; Groq reasoning models; Together GPT-OSS; Cerebras GPT-OSS; MiMo 2.5/Pro; DeepSeek V4/V4.1; Qwen 3.7/3.8; GLM; Kimi; Doubao Seed 2.0 Lite; ERNIE X1.1; Hunyuan T1; MiniMax M2.x; StepFun 3.5; Spark-X |
 | Private reasoning, controls only                   | xAI Grok 4.3 and 4.5                                                                                                                                                                                                              |
 | Service reasoning steps                            | Perplexity Sonar Pro                                                                                                                                                                                                              |
 
-The Effort selector is available only for OpenAI/Codex, Gemini, xAI Grok 4.3/4.5, Mistral Small, Groq GPT-OSS/Qwen, Together GPT-OSS, Cerebras GPT-OSS, MiMo 2.5/Pro, DeepSeek V4, GLM 5.2, and StepFun 3.5 Flash 2603. Direct OpenAI GPT-6 Astra accepts `low`, `medium`, `high`, `xhigh`, and `max`; the Codex Bridge profile additionally accepts `none`. Codex Bridge exposes only the `auto` public-summary setting. Models such as Claude, Qwen's direct API, Kimi, MiniMax, ERNIE X1.1, and Spark-X still have reasoning support but deliberately expose no fake Effort choices.
+The Effort selector is available only for OpenAI/Codex, Gemini, xAI Grok 4.3/4.5, Mistral Small, Groq GPT-OSS/Qwen, Together GPT-OSS, Cerebras GPT-OSS, MiMo 2.5/Pro, DeepSeek V4/V4.1, GLM 5.2, and StepFun 3.5 Flash 2603. DeepSeek exposes `none`, `low`, `high`, and `max`; thinking is enabled by default. Direct OpenAI GPT-6 Astra accepts `low`, `medium`, `high`, `xhigh`, and `max`; the Codex Bridge profile additionally accepts `none`. Codex Bridge exposes only the `auto` public-summary setting. Models such as Claude, Qwen's direct API, Kimi, MiniMax, ERNIE X1.1, and Spark-X still have reasoning support but deliberately expose no fake Effort choices.
 
 Reasoning capability records may additionally declare
 `raw_trace_metadata` and `native_summary` as
@@ -273,12 +277,12 @@ The qualified set uses either a Provider count endpoint or an immutable official
 | Anthropic    | `claude-opus-5`, `claude-sonnet-5`, `claude-opus-4-6`, `claude-sonnet-4-6`  | Anthropic Messages count Tokens                     | Provider estimate   | model       |
 | Google       | `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-3.1-flash-lite` | Gemini count Tokens                                 | Provider estimate   | model       |
 | Xiaomi MiMo  | `mimo-v2.5`, `mimo-v2.5-pro`                                                | pinned official chat template and Tokenizer         | verified local      | text only   |
-| DeepSeek     | `deepseek-v4-pro`, `deepseek-v4-flash`                                      | pinned official V4 Prompt Encoder and Tokenizer     | verified local      | text only   |
+| DeepSeek     | `deepseek-flash` and temporary V4 Flash aliases                             | pinned official V4.1 Prompt Encoder and Tokenizer   | verified local      | text only   |
 | Alibaba Qwen | `qwen3.8-max`                                                               | pinned official Qwen3.8 chat template and Tokenizer | verified local      | text only   |
 
 For local counting, Omoikane first asks the OpenAI Agents SDK to compile the complete logical input into OpenAI-compatible messages and Tools. It then serializes system instructions, history, current input, Tool/Handoff schemas, Tool calls/results, and prompt-based structured-output instructions with the official model template before tokenization. Tokenizer repositories and Git revisions are returned in the capability and count response. Assets are downloaded from Hugging Face by immutable revision on first use and cached in memory; download or template failure is closed. These paths are `verified_local`, not Provider billing authority. Multimodal input is rejected because an open text Tokenizer cannot reproduce Provider-side image, audio, or video accounting.
 
-GLM `glm-5.2`, xAI `grok-4.3`, the older Qwen catalog IDs, and other models remain unavailable until their exact model has a complete request counter or immutable public serialization. Z.AI's published `/tokenizer` contract currently names older GLM versions, while xAI's public Tokenizer accepts bare text rather than messages and Tools. Codex Bridge exposes only a conservative compatibility estimate and its 258,400-Token context is below this list's threshold. Omoikane never substitutes `UTF-8 bytes / 3` or a bare-text Tokenizer for a complete request count.
+DeepSeek V4 Pro counting is no longer advertised because its API ID enters a time-dependent retirement/routing transition on 2026-09-14; Omoikane will not claim one immutable serializer for two possible serving models. GLM `glm-5.2`, xAI `grok-4.3`, the older Qwen catalog IDs, and other models remain unavailable until their exact model has a complete request counter or immutable public serialization. Z.AI's published `/tokenizer` contract currently names older GLM versions, while xAI's public Tokenizer accepts bare text rather than messages and Tools. Codex Bridge exposes only a conservative compatibility estimate and its 258,400-Token context is below this list's threshold. Omoikane never substitutes `UTF-8 bytes / 3` or a bare-text Tokenizer for a complete request count.
 
 `GET /v1/input-token-counting/models` returns only qualified catalog models with `context_window >= 1,000,000`. It is a support catalog, not proof that a Provider Connection has been configured or that the model is visible to a particular key. Use the connection-specific model list for availability.
 
@@ -301,7 +305,7 @@ Known values initialize Agent configuration and context-compaction thresholds. A
 | xAI           | `grok-4.5`                                                    |                500,000 | catalog default                        |
 | Mistral       | large/small latest                                            |                256,000 | catalog default                        |
 | Groq          | `openai/gpt-oss-120b` and related                             |                131,072 | output limits vary                     |
-| DeepSeek      | cataloged v4 models                                           |              1,000,000 | catalog default                        |
+| DeepSeek      | `deepseek-flash` (V4.1), V4 aliases and V4 Pro                |              1,000,000 | maximum output stored as 384,000       |
 | Alibaba Qwen  | cataloged Qwen 3 models                                       |              1,000,000 | catalog default                        |
 | Zhipu         | `glm-5.2`                                                     |              1,000,000 | other cataloged GLM models may be 200K |
 | Moonshot/Kimi | cataloged K2 models                                           |                262,144 | catalog default                        |

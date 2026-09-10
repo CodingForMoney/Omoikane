@@ -174,6 +174,7 @@ const THINK_END = "</think>";
 const DSML = "｜DSML｜";
 const USER = "<｜User｜>";
 const ASSISTANT = "<｜Assistant｜>";
+const SYSTEM = "<｜System｜>";
 
 const DEEPSEEK_REASONING_MAX =
   "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n" +
@@ -461,14 +462,233 @@ export function renderDeepseekV4Prompt(body: JsonRecord): string {
   );
 }
 
+const DEEPSEEK_V41_EFFORT: Record<string, number> = {
+  low: 50,
+  high: 75,
+  max: 100,
+};
+
+const deepseekV41Tools = (tools: JsonRecord[]): string => {
+  const schemas = tools.map((tool) => pythonJson(tool)).join("\n");
+  return `## Tools
+
+You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<${DSML} calls>" block like the following:
+
+<${DSML} calls>
+<${DSML} invoke name="$TOOL_NAME">
+<${DSML} parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</${DSML} parameter>
+...
+</${DSML} invoke>
+<${DSML} invoke name="$TOOL_NAME2">
+...
+</${DSML} invoke>
+</${DSML} calls>
+
+String parameters should be specified as is and set \`string="true"\`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set \`string="false"\`.
+
+If thinking_mode is enabled (triggered by ${THINK_START}), you MUST output your complete reasoning inside ${THINK_START}...${THINK_END} BEFORE any tool calls or final response.
+
+Otherwise, output directly after ${THINK_END} with tool calls or final response.
+
+### Available Tool Schemas
+
+${schemas}
+
+You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
+`;
+};
+
+function deepseekV41Arguments(toolCall: JsonRecord): string {
+  const fn = asRecord(toolCall.function) ?? toolCall;
+  const raw = typeof fn.arguments === "string" ? fn.arguments : "{}";
+  let argumentsValue: JsonRecord;
+  try {
+    argumentsValue = asRecord(JSON.parse(raw)) ?? { arguments: raw };
+  } catch {
+    argumentsValue = { arguments: raw };
+  }
+  return Object.entries(argumentsValue)
+    .map(
+      ([key, value]) =>
+        `<${DSML} parameter name="${key}" string="${typeof value === "string"}">${typeof value === "string" ? value : pythonJson(value)}</${DSML} parameter>`,
+    )
+    .join("\n");
+}
+
+const lastDeepseekV41User = (messages: JsonRecord[]) => {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const role = String(messages[index]!.role);
+    if (
+      ["user", "developer"].includes(role) ||
+      (role === "system" && index > 0)
+    )
+      return index;
+  }
+  return -1;
+};
+
+function droppedDeepseekV41Thinking(messages: JsonRecord[]): JsonRecord[] {
+  const lastUser = lastDeepseekV41User(messages);
+  const keepRoles = new Set([
+    "user",
+    "developer",
+    "system",
+    "tool",
+    "latest_reminder",
+    "direct_search_results",
+  ]);
+  return messages.flatMap((message, index) => {
+    if (keepRoles.has(String(message.role)) || index >= lastUser)
+      return [message];
+    if (message.role === "assistant") {
+      const copy = { ...message };
+      delete copy.reasoning_content;
+      return [copy];
+    }
+    return [];
+  });
+}
+
+function renderDeepseekV41Message(
+  index: number,
+  messages: JsonRecord[],
+  thinking: boolean,
+  dropThinking: boolean,
+  reasoningEffort: string | undefined,
+): string {
+  const message = messages[index]!;
+  const role = String(message.role);
+  const lastUser = lastDeepseekV41User(messages);
+  const effort = DEEPSEEK_V41_EFFORT[reasoningEffort ?? "high"] ?? 75;
+  let prompt = index === 0 && (thinking || role === "system") ? SYSTEM : "";
+  if (index === 0 && thinking)
+    prompt += `Reasoning Effort: ${effort} (range 1-100, the higher the value, the more thorough the reasoning)\n\n`;
+  const tools = Array.isArray(message.tools)
+    ? (message.tools
+        .map(asRecord)
+        .filter(Boolean)
+        .map((tool) => asRecord(tool!.function) ?? tool!) as JsonRecord[])
+    : [];
+  const responseFormat = message.response_format;
+  const additions = [
+    tools.length ? deepseekV41Tools(tools) : "",
+    responseFormat
+      ? `## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n${pythonJson(responseFormat)}`
+      : "",
+  ].filter(Boolean);
+
+  if (role === "system") {
+    if (index > 0) prompt += SYSTEM;
+    prompt += [textContent(message.content), ...additions].join("\n\n");
+  } else if (role === "developer") {
+    prompt += USER + [textContent(message.content), ...additions].join("\n\n");
+  } else if (role === "user") {
+    prompt += USER + deepseekContentBlocks(message);
+  } else if (role === "latest_reminder") {
+    prompt += `<｜latest_reminder｜>${textContent(message.content)}`;
+  } else if (role === "assistant") {
+    const previousHasTask = messages[index - 1]?.task !== undefined;
+    const reasoning =
+      thinking && !previousHasTask && (!dropThinking || index > lastUser)
+        ? String(message.reasoning_content ?? "") + THINK_END
+        : "";
+    let toolCalls = "";
+    if (Array.isArray(message.tool_calls) && message.tool_calls.length) {
+      const rendered = message.tool_calls
+        .map(asRecord)
+        .filter(Boolean)
+        .map((call) => {
+          const fn = asRecord(call!.function) ?? call!;
+          return `<${DSML} invoke name="${String(fn.name ?? "")}">\n${deepseekV41Arguments(call!)}\n</${DSML} invoke>`;
+        })
+        .join("\n");
+      toolCalls = `\n\n<${DSML} calls>\n${rendered}\n</${DSML} calls>`;
+    }
+    prompt +=
+      reasoning +
+      textContent(message.content) +
+      toolCalls +
+      (message.wo_eos ? "" : EOS);
+  } else {
+    throw new Error(`DeepSeek V4.1 local Tokenizer cannot encode role ${role}`);
+  }
+
+  if (
+    index + 1 < messages.length &&
+    !["assistant", "latest_reminder"].includes(
+      String(messages[index + 1]!.role),
+    )
+  )
+    return prompt;
+  if (["user", "developer"].includes(role) || (role === "system" && index > 0))
+    prompt +=
+      ASSISTANT +
+      (thinking && (!dropThinking || index >= lastUser)
+        ? THINK_START
+        : THINK_END);
+  return prompt;
+}
+
+/** Render the official DeepSeek V4.1 text-only prompt format. */
+export function renderDeepseekV41Prompt(body: JsonRecord): string {
+  let messages = normalizedTextMessages(body.messages);
+  const tools = Array.isArray(body.tools)
+    ? body.tools
+        .map(asRecord)
+        .filter(Boolean)
+        .map((tool) => asRecord(tool!.function) ?? tool!)
+    : [];
+  const wireResponseFormat = asRecord(body.response_format);
+  const responseFormat =
+    asRecord(wireResponseFormat?.json_schema)?.schema ?? wireResponseFormat;
+  if (tools.length || responseFormat) {
+    if (!["system", "developer"].includes(String(messages[0]?.role)))
+      messages.unshift({ role: "system", content: "" });
+    messages[0] = {
+      ...messages[0],
+      ...(tools.length ? { tools } : {}),
+      ...(responseFormat ? { response_format: responseFormat } : {}),
+    };
+  }
+  messages = sortDeepseekToolResults(mergeDeepseekToolMessages(messages));
+  const reasoningEffort =
+    typeof body.reasoning_effort === "string"
+      ? body.reasoning_effort
+      : undefined;
+  const thinking = reasoningEffort !== "none";
+  let dropThinking = !messages.some(
+    (message) => Array.isArray(message.tools) && message.tools.length,
+  );
+  if (thinking && dropThinking) messages = droppedDeepseekV41Thinking(messages);
+  if (!thinking) dropThinking = true;
+  return (
+    BOS +
+    messages
+      .map((_, index) =>
+        renderDeepseekV41Message(
+          index,
+          messages,
+          thinking,
+          dropThinking,
+          reasoningEffort,
+        ),
+      )
+      .join("")
+  );
+}
+
 export async function countWithOfficialTokenizer(
   body: JsonRecord,
   descriptor: OfficialTokenizerDescriptor,
 ): Promise<number> {
   const loaded = await loadTokenizer(descriptor);
-  const prompt = descriptor.tokenizer_id.startsWith("deepseek-ai/DeepSeek-V4-")
-    ? renderDeepseekV4Prompt(body)
-    : renderChatTemplate(loaded.config, body);
+  const prompt = descriptor.tokenizer_id.startsWith(
+    "deepseek-ai/DeepSeek-V4.1-",
+  )
+    ? renderDeepseekV41Prompt(body)
+    : descriptor.tokenizer_id.startsWith("deepseek-ai/DeepSeek-V4-")
+      ? renderDeepseekV4Prompt(body)
+      : renderChatTemplate(loaded.config, body);
   return loaded.tokenizer.encode(prompt, { add_special_tokens: false }).ids
     .length;
 }

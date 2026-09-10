@@ -59,6 +59,21 @@ describe("provider registry", () => {
       context_window: 1_048_576,
       context_compaction: { supported: false },
     });
+    const deepseek = catalog.find((item) => item.id === "deepseek")!;
+    expect(deepseek.models[0]).toMatchObject({
+      id: "deepseek-flash",
+      capabilities: {
+        context_window: 1_000_000,
+        max_output_tokens: 384_000,
+        input_modalities: ["text", "image"],
+        structured_output: "native",
+        reasoning: {
+          activation: "default",
+          effort_values: ["none", "low", "high", "max"],
+          request_adapters: ["responses_reasoning"],
+        },
+      },
+    });
   });
 
   it("declares coherent modalities and task capabilities for every catalog model", async () => {
@@ -125,6 +140,16 @@ describe("provider registry", () => {
     expect(capability("xiaomi_mimo", "mimo-v2.5-pro")).toMatchObject({
       input_modalities: ["text"],
       tasks: { image_understanding: "none", transcription: "none" },
+    });
+    expect(capability("deepseek", "deepseek-flash")).toMatchObject({
+      model_kind: "agent",
+      input_modalities: ["text", "image"],
+      output_modalities: ["text"],
+      tasks: {
+        image_understanding: "native",
+        transcription: "none",
+        speech_synthesis: "none",
+      },
     });
     expect(capability("xiaomi_mimo", "mimo-v2.5-asr")).toMatchObject({
       model_kind: "transcription",
@@ -615,6 +640,56 @@ describe("provider registry", () => {
         provider: { connection_id: connection.id },
       }),
     ).rejects.toThrow("is not active");
+  });
+
+  it("migrates a retired catalog alias to its active canonical model", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            data: [{ id: "deepseek-flash" }, { id: "deepseek-v4-pro" }],
+            has_more: false,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+    const test = await testContainer();
+    container = test.container;
+    cleanup = test.close;
+    const connection = await container.providers.create({
+      name: "DeepSeek",
+      provider: "deepseek",
+      api_key: "test-only-key",
+    });
+
+    await container.providers.listModels(connection.id);
+    await container.providers.update(connection.id, {
+      default_model: "deepseek-v4-flash",
+    });
+    await container.providers.syncModels(connection.id);
+
+    expect(await container.providers.get(connection.id)).toMatchObject({
+      default_model: "deepseek-flash",
+      default_model_status: "available",
+    });
+    const activeIds = (await container.providers.listModels(connection.id)).map(
+      (item) => item.model_id,
+    );
+    expect(activeIds).toHaveLength(2);
+    expect(activeIds).toEqual(
+      expect.arrayContaining(["deepseek-flash", "deepseek-v4-pro"]),
+    );
+    await expect(
+      container.providers.resolveConfig({
+        provider: { connection_id: connection.id },
+        model: "deepseek-v4-flash",
+      }),
+    ).resolves.toMatchObject({
+      model: "deepseek-flash",
+      model_context_window: 1_000_000,
+    });
   });
 
   it("keeps explicit user models and capability overrides across synchronization", async () => {

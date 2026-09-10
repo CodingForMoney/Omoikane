@@ -4,6 +4,7 @@ import { createApp } from "../src/api.js";
 import type { Container } from "../src/container.js";
 import {
   clearOfficialTokenizerCacheForTests,
+  renderDeepseekV41Prompt,
   renderDeepseekV4Prompt,
 } from "../src/local-tokenizers.js";
 import { publishedAgent, testContainer } from "./helpers.js";
@@ -74,7 +75,7 @@ describe("assembled input Token counting", () => {
   it("lists only qualified models with at least one million context Tokens", async () => {
     const { app, container } = await setup();
     const models = container.providers.inputTokenCountingModels();
-    expect(models).toHaveLength(17);
+    expect(models).toHaveLength(18);
     expect(
       models.every(
         (item) =>
@@ -91,8 +92,9 @@ describe("assembled input Token counting", () => {
         "google_gemini/gemini-3.1-pro-preview",
         "xiaomi_mimo/mimo-v2.5",
         "xiaomi_mimo/mimo-v2.5-pro",
-        "deepseek/deepseek-v4-pro",
+        "deepseek/deepseek-flash",
         "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-flash-vision-exp",
         "alibaba_qwen/qwen3.8-max",
       ]),
     );
@@ -346,6 +348,55 @@ This instruction must be visible to the model.
     );
   });
 
+  it("uses the pinned DeepSeek V4.1 Prompt Encoder and Tokenizer", async () => {
+    const { app, container } = await setup();
+    const fixture = await publishedAgent(container, {
+      provider: "deepseek",
+      modelId: "deepseek-flash",
+      tools: ["artifact-create"],
+    });
+    const requestedUrls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        requestedUrls.push(url);
+        return jsonResponse(
+          url.endsWith("tokenizer_config.json")
+            ? testTokenizerConfig
+            : testTokenizer,
+        );
+      }),
+    );
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/deployments/${fixture.version.id}/input-token-count`,
+      payload: { input: "COUNTED_DEEPSEEK_V41_INPUT" },
+    });
+
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.json()).toMatchObject({
+      provider: "deepseek",
+      model_id: "deepseek-flash",
+      method: "official_local_tokenizer",
+      accuracy: "verified_local",
+      tokenizer_id: "deepseek-ai/DeepSeek-V4.1-Flash",
+      tokenizer_revision: "dba1be0a40aa45a94ad051997016db3960a90277",
+    });
+    expect(response.json().input_tokens).toBeGreaterThan(0);
+    expect(requestedUrls).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining(
+          "deepseek-ai/DeepSeek-V4.1-Flash/resolve/dba1be0a40aa45a94ad051997016db3960a90277/tokenizer.json",
+        ),
+        expect.stringContaining(
+          "deepseek-ai/DeepSeek-V4.1-Flash/resolve/dba1be0a40aa45a94ad051997016db3960a90277/tokenizer_config.json",
+        ),
+      ]),
+    );
+  });
+
   it("matches the DeepSeek V4 Prompt Encoder for a text turn", () => {
     expect(
       renderDeepseekV4Prompt({
@@ -358,6 +409,70 @@ This instruction must be visible to the model.
     ).toBe(
       "<｜begin▁of▁sentence｜>Be exact.<｜User｜>Hello<｜Assistant｜><think>",
     );
+  });
+
+  it("matches the DeepSeek V4.1 Prompt Encoder for default and disabled reasoning", () => {
+    expect(
+      renderDeepseekV41Prompt({
+        messages: [
+          { role: "system", content: "Be exact." },
+          { role: "user", content: "Hello" },
+        ],
+      }),
+    ).toBe(
+      "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nBe exact.<｜User｜>Hello<｜Assistant｜><think>",
+    );
+    expect(
+      renderDeepseekV41Prompt({
+        messages: [{ role: "user", content: "Hello" }],
+        reasoning_effort: "none",
+      }),
+    ).toBe("<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>");
+
+    const toolPrompt = renderDeepseekV41Prompt({
+      messages: [
+        { role: "system", content: "Use tools." },
+        { role: "user", content: "Weather?" },
+        {
+          role: "assistant",
+          content: "",
+          reasoning_content: "I should look it up.",
+          tool_calls: [
+            {
+              id: "call_1",
+              type: "function",
+              function: {
+                name: "weather",
+                arguments: '{"city":"Taipei"}',
+              },
+            },
+          ],
+        },
+        { role: "tool", tool_call_id: "call_1", content: "sunny" },
+      ],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "weather",
+            parameters: {
+              type: "object",
+              properties: { city: { type: "string" } },
+              required: ["city"],
+            },
+          },
+        },
+      ],
+      reasoning_effort: "max",
+    });
+    expect(toolPrompt).toContain("Reasoning Effort: 100 (range 1-100");
+    expect(toolPrompt).toContain("<｜DSML｜ calls>");
+    expect(toolPrompt).toContain('<｜DSML｜ invoke name="weather">');
+    expect(toolPrompt).toContain(
+      '<｜DSML｜ parameter name="city" string="true">Taipei</｜DSML｜ parameter>',
+    );
+    expect(toolPrompt).toContain("<tool_result>sunny</tool_result>");
+    expect(toolPrompt).not.toContain("<｜DSML｜tool_calls>");
   });
 
   it("fails closed for a million-context model without a complete counter", async () => {

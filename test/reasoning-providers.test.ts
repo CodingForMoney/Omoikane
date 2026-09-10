@@ -55,8 +55,10 @@ describe("Provider reasoning capabilities", () => {
       "cerebras/gpt-oss-120b",
       "xiaomi_mimo/mimo-v2.5",
       "xiaomi_mimo/mimo-v2.5-pro",
+      "deepseek/deepseek-flash",
       "deepseek/deepseek-v4-pro",
       "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-v4-flash-vision-exp",
       "alibaba_qwen/qwen3.8-max",
       "alibaba_qwen/qwen3.7-max",
       "alibaba_qwen/qwen3.7-plus",
@@ -136,13 +138,18 @@ describe("Provider reasoning capabilities", () => {
     expect(
       applyReasoningModelSettings(
         { reasoning_effort: "max" },
-        capability("deepseek", "deepseek-v4-pro"),
-        "deepseek-v4-pro",
+        capability("deepseek", "deepseek-flash"),
+        "deepseek-flash",
       ),
-    ).toMatchObject({
-      reasoning: { effort: "max" },
-      providerData: { thinking: { type: "enabled" } },
-    });
+    ).toEqual({ reasoning: { effort: "max" } });
+
+    expect(
+      applyReasoningModelSettings(
+        { reasoning_enabled: false },
+        capability("deepseek", "deepseek-flash"),
+        "deepseek-flash",
+      ),
+    ).toEqual({ reasoning: { effort: "none" } });
 
     expect(
       applyReasoningModelSettings(
@@ -476,7 +483,7 @@ describe("reasoning protocol normalization", () => {
 
   it("normalizes Provider traces as metadata and AI SDK summaries as public text", () => {
     const trace = new ModelStreamEventNormalizer(1, {
-      reasoning: capability("deepseek", "deepseek-v4-pro"),
+      reasoning: capability("deepseek", "deepseek-flash"),
     });
     const privateText = "PRIVATE_TRACE";
     const traceEvents = trace.consume({
